@@ -3892,6 +3892,7 @@ function auditionCurrentTrackInModal() {
   const ctx = state.migrateModalContext;
   if (!ctx || !ctx.track) return;
   ctx.auditioningIdx = null;
+  ctx.auditionedCandidate = null;
   mountOrLoadYouTubeVideo(ctx.track.video_id, ctx.track.start_seconds, ctx.track.end_seconds);
   const auditionBar = document.getElementById('migrate-modal-audition-bar');
   if (auditionBar) {
@@ -3909,6 +3910,7 @@ function auditionMigrateCandidate(candidateIdx) {
   if (!chosen) return;
   if (state.migrateModalContext) {
     state.migrateModalContext.auditioningIdx = candidateIdx;
+    state.migrateModalContext.auditionedCandidate = { ...chosen };
   }
   mountOrLoadYouTubeVideo(chosen.video_id);
   const auditionBar = document.getElementById('migrate-modal-audition-bar');
@@ -3920,11 +3922,24 @@ function auditionMigrateCandidate(candidateIdx) {
       </div>
       <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
         <button type="button" class="btn-tiny btn-secondary" onclick="auditionCurrentTrackInModal()">↺ Hear Current</button>
-        <button type="button" class="btn-tiny btn-secondary" onclick="addMigrateModalCandidateToPlaylist(${candidateIdx})" title="Add this version as a new track in the current playlist">+ Add to Playlist</button>
-        <button type="button" class="btn-tiny btn-primary" onclick="applyMigrateModalCandidate(${candidateIdx})">✓ Swap to This Version</button>
+        <button type="button" class="btn-tiny btn-secondary" id="migrate-audition-add-btn" onclick="addAuditionedMigrateCandidateToPlaylist()" title="Add this version as a new track in the current playlist">+ Add to Playlist</button>
+        <button type="button" class="btn-tiny btn-primary" onclick="applyAuditionedMigrateCandidate()">✓ Swap to This Version</button>
       </div>
     `;
   }
+}
+
+async function addAuditionedMigrateCandidateToPlaylist() {
+  const chosen = state.migrateModalContext?.auditionedCandidate;
+  if (!chosen) return;
+  const btn = document.getElementById('migrate-audition-add-btn');
+  await performAddTrackFromMigrateModal(chosen.video_id, chosen.title, btn, true);
+}
+
+async function applyAuditionedMigrateCandidate() {
+  const chosen = state.migrateModalContext?.auditionedCandidate;
+  if (!chosen) return;
+  await performPlaylistTrackMigration(chosen.video_id, chosen.title);
 }
 
 async function handleMigrateModalSearch(e) {
@@ -4017,20 +4032,25 @@ async function addMigrateModalCandidateToPlaylist(candidateIdx) {
   const chosen = items[candidateIdx];
   if (!chosen) return;
   const btn = document.getElementById(`migrate-add-btn-${candidateIdx}`);
-  await performAddTrackFromMigrateModal(chosen.video_id, chosen.title, btn);
+  await performAddTrackFromMigrateModal(chosen.video_id, chosen.title, btn, true);
 }
 
 async function addCustomMigrateModalUrlToPlaylist() {
   const customInput = document.getElementById('migrate-modal-custom-url');
   const customUrl = customInput?.value.trim();
   if (!customUrl) return;
-  const ok = await performAddTrackFromMigrateModal(customUrl, null, null);
+  const ok = await performAddTrackFromMigrateModal(customUrl, null, null, false);
   if (ok && customInput) {
     customInput.value = '';
   }
 }
 
-async function performAddTrackFromMigrateModal(videoUrlOrId, customTitle = null, buttonEl = null) {
+async function performAddTrackFromMigrateModal(
+  videoUrlOrId,
+  customTitle = null,
+  buttonEl = null,
+  isVerifiedEmbed = false
+) {
   const pid = Number(document.getElementById('migrate-modal-playlist-id')?.value);
   if (!pid) return false;
 
@@ -4039,9 +4059,13 @@ async function performAddTrackFromMigrateModal(videoUrlOrId, customTitle = null,
     buttonEl.textContent = 'Adding…';
   }
 
+  const undoLenBefore = state.undoStack.length;
+  await capturePlaylistSnapshot(pid, `Added track "${customTitle || videoUrlOrId}"`);
+  const pushedUndo = state.undoStack.length > undoLenBefore;
+
+  let res;
   try {
-    await capturePlaylistSnapshot(pid, `Added track "${customTitle || videoUrlOrId}"`);
-    const res = await api(`/api/playlists/${pid}/tracks`, {
+    res = await api(`/api/playlists/${pid}/tracks`, {
       method: 'POST',
       body: JSON.stringify({
         user_id: state.currentUserId,
@@ -4049,33 +4073,10 @@ async function performAddTrackFromMigrateModal(videoUrlOrId, customTitle = null,
         custom_title: customTitle,
       }),
     });
-    const added = (res.results && res.results[0]) || null;
-    if (added && added.video_id) {
-      state.embedAuditByVideoId[added.video_id] = { embeddable: true, status: 'OK', reason: null };
-    }
-
-    delete playlistCache[pid];
-    await syncQueueWithPlaylistIfActive(pid);
-    await refreshBootstrapSilently();
-    await renderCurrentRoute();
-    notifyBadges(res.new_badges);
-
-    const trackTitle = (added && added.title) || customTitle || videoUrlOrId;
-    showToast(
-      `+ Added "${esc(trackTitle)}" to playlist! <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
-    );
-
-    if (buttonEl) {
-      buttonEl.textContent = '✓ Added!';
-      setTimeout(() => {
-        if (buttonEl) {
-          buttonEl.disabled = false;
-          buttonEl.textContent = '+ Add to Playlist';
-        }
-      }, 1600);
-    }
-    return true;
   } catch (err) {
+    if (pushedUndo) {
+      state.undoStack.pop();
+    }
     showToast(esc(err.message));
     if (buttonEl) {
       buttonEl.disabled = false;
@@ -4083,6 +4084,37 @@ async function performAddTrackFromMigrateModal(videoUrlOrId, customTitle = null,
     }
     return false;
   }
+
+  const added = (res.results && res.results[0]) || null;
+  if (isVerifiedEmbed && added && added.video_id) {
+    state.embedAuditByVideoId[added.video_id] = { embeddable: true, status: 'OK', reason: null };
+  }
+
+  delete playlistCache[pid];
+  notifyBadges(res.new_badges);
+
+  const trackTitle = (added && added.title) || customTitle || videoUrlOrId;
+  showToast(
+    `+ Added "${esc(trackTitle)}" to playlist! <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+  );
+
+  if (buttonEl) {
+    buttonEl.textContent = '✓ Added!';
+    setTimeout(() => {
+      if (buttonEl) {
+        buttonEl.disabled = false;
+        buttonEl.textContent = '+ Add to Playlist';
+      }
+    }, 1600);
+  }
+
+  try {
+    await syncQueueWithPlaylistIfActive(pid);
+    await refreshBootstrapSilently();
+    await renderCurrentRoute();
+  } catch (_) {}
+
+  return true;
 }
 
 async function applyMigrateModalCandidate(candidateIdx) {
