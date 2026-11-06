@@ -119,13 +119,31 @@
     <aside class="player-column">
       <div class="player-card">
         <div class="player-header">
-          <div class="player-status-dot" id="player-status-dot"></div>
-          <span class="player-header-title" id="player-header-title">Webjam Deck — Ready</span>
+          <div class="player-header-left">
+            <div class="player-status-dot" id="player-status-dot"></div>
+            <span class="player-header-title" id="player-header-title">Webjam Deck — Ready</span>
+          </div>
+          <button
+            type="button"
+            class="btn-audio-mode"
+            id="audio-mode-toggle-btn"
+            onclick="toggleAudioOnlyMode()"
+            title="Low-Bandwidth Audio Mode: shrinks the YouTube viewport and requests the lowest resolution stream (144p tiny) to save bandwidth"
+          >🎧 Audio / Low-Data: Off</button>
         </div>
 
-        <!-- Official YouTube IFrame API Mount Point (Unobstructed 16:9 container) -->
-        <div class="yt-viewport-wrapper">
+        <!-- Official YouTube IFrame API Mount Point -->
+        <div class="yt-viewport-wrapper" id="yt-viewport-wrapper">
           <div id="yt-player-mount"></div>
+          <div id="audio-mode-deck-info" class="audio-mode-deck-info hidden">
+            <div class="audio-mode-deck-main">
+              <span class="audio-mode-badge">🎧 LOW-DATA AUDIO DECK</span>
+              <span class="audio-mode-quality-pill" id="audio-mode-quality-pill">144p mini stream</span>
+            </div>
+            <div class="audio-mode-deck-sub">
+              Mini viewport triggers YouTube's lowest bitrate stream (~144p) while keeping native audio &amp; transport controls active.
+            </div>
+          </div>
           <div id="yt-placeholder" class="yt-placeholder">
             <div class="yt-placeholder-inner">
               <div class="yt-placeholder-icon">▶</div>
