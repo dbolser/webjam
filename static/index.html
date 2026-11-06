@@ -128,7 +128,7 @@
             class="btn-audio-mode"
             id="audio-mode-toggle-btn"
             onclick="toggleAudioOnlyMode()"
-            title="Low-Bandwidth Audio Mode: shrinks the YouTube viewport and requests the lowest resolution stream (144p tiny) to save bandwidth"
+            title="Low-Bandwidth Audio Mode: shrinks the YouTube viewport to YouTube's minimum 200×200 size so adaptive streaming favors low-bitrate video"
           >🎧 Audio / Low-Data: Off</button>
         </div>
 
@@ -137,11 +137,11 @@
           <div id="yt-player-mount"></div>
           <div id="audio-mode-deck-info" class="audio-mode-deck-info hidden">
             <div class="audio-mode-deck-main">
-              <span class="audio-mode-badge">🎧 LOW-DATA AUDIO DECK</span>
-              <span class="audio-mode-quality-pill" id="audio-mode-quality-pill">144p mini stream</span>
+              <span class="audio-mode-badge">🎧 COMPACT AUDIO DECK</span>
+              <span class="audio-mode-quality-pill" id="audio-mode-quality-pill">compact · auto</span>
             </div>
             <div class="audio-mode-deck-sub">
-              Mini viewport triggers YouTube's lowest bitrate stream (~144p) while keeping native audio &amp; transport controls active.
+              200×200 compliant mini-viewport nudges YouTube's adaptive stream toward low video bitrates while keeping native audio &amp; controls usable.
             </div>
           </div>
           <div id="yt-placeholder" class="yt-placeholder">

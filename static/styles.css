@@ -717,7 +717,7 @@ a:hover {
 
 .yt-viewport-wrapper.audio-only-mode {
   aspect-ratio: auto;
-  min-height: 78px;
+  min-height: 216px;
   padding: 8px 10px;
   display: flex;
   align-items: center;
@@ -728,8 +728,8 @@ a:hover {
 
 .yt-viewport-wrapper.audio-only-mode #yt-player-mount,
 .yt-viewport-wrapper.audio-only-mode iframe {
-  width: 120px !important;
-  height: 68px !important;
+  width: 200px !important;
+  height: 200px !important;
   flex-shrink: 0;
   border-radius: 3px;
   border: 1px solid #344b49;

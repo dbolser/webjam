@@ -1,3 +1,11 @@
+function readAudioOnlyModePreference() {
+  try {
+    return localStorage.getItem('webjam_audio_only_mode') === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
 // Webjam Frontend Application
 const state = {
   currentUserId: Number(localStorage.getItem('webjam_user_id')) || 1,
@@ -21,7 +29,7 @@ const state = {
   queuePlaylistMyLikes: 0,
   queuePlaylistLikeCount: 0,
   repeatTrack: false,
-  audioOnlyMode: localStorage.getItem('webjam_audio_only_mode') === '1',
+  audioOnlyMode: readAudioOnlyModePreference(),
   superloveSyncTimer: null,
   // Undo & Drag-and-Drop state
   undoStack: [],
@@ -356,12 +364,15 @@ const YT_QUALITY_LABELS = {
 function updateAudioModeQualityPill(qualityCode = null) {
   const pill = document.getElementById('audio-mode-quality-pill');
   if (!pill) return;
-  const q =
-    qualityCode ||
-    (state.ytPlayer && typeof state.ytPlayer.getPlaybackQuality === 'function'
-      ? state.ytPlayer.getPlaybackQuality()
-      : null);
-  const label = (q && YT_QUALITY_LABELS[q]) || '144p mini stream';
+  let q = qualityCode;
+  if (!q && state.ytPlayer && typeof state.ytPlayer.getPlaybackQuality === 'function') {
+    try {
+      q = state.ytPlayer.getPlaybackQuality();
+    } catch (_) {
+      q = null;
+    }
+  }
+  const label = (q && YT_QUALITY_LABELS[q]) || 'compact · auto';
   pill.textContent = label;
 }
 
@@ -370,22 +381,14 @@ function enforceAudioModePlayerConstraints() {
   try {
     if (typeof state.ytPlayer.setSize === 'function') {
       if (state.audioOnlyMode) {
-        state.ytPlayer.setSize(120, 68);
+        // YouTube's Required Minimum Functionality mandates at least 200x200 for embedded players.
+        state.ytPlayer.setSize(200, 200);
       } else {
         const wrapper = document.getElementById('yt-viewport-wrapper');
         const w = wrapper && wrapper.clientWidth ? wrapper.clientWidth : 400;
         const h = Math.round((w * 9) / 16);
         state.ytPlayer.setSize(w, h);
       }
-    }
-  } catch (_) {}
-
-  try {
-    if (typeof state.ytPlayer.setPlaybackQuality === 'function') {
-      state.ytPlayer.setPlaybackQuality(state.audioOnlyMode ? 'tiny' : 'default');
-    }
-    if (state.audioOnlyMode && typeof state.ytPlayer.setPlaybackQualityRange === 'function') {
-      state.ytPlayer.setPlaybackQualityRange('tiny', 'small');
     }
   } catch (_) {}
 
@@ -413,12 +416,18 @@ function applyAudioOnlyModeUI() {
 
 function toggleAudioOnlyMode() {
   state.audioOnlyMode = !state.audioOnlyMode;
-  localStorage.setItem('webjam_audio_only_mode', state.audioOnlyMode ? '1' : '0');
+  let saved = true;
+  try {
+    localStorage.setItem('webjam_audio_only_mode', state.audioOnlyMode ? '1' : '0');
+  } catch (_) {
+    saved = false;
+  }
   applyAudioOnlyModeUI();
+  const storageNotice = saved ? '' : ' (preference not saved in browser storage)';
   showToast(
     state.audioOnlyMode
-      ? '🎧 Low-Bandwidth Audio Mode ON — compact 120×68 viewport forces YouTube’s lowest bitrate (~144p) stream.'
-      : '🎬 Standard Video Mode restored (16:9 viewport).'
+      ? `🎧 Low-Bandwidth Audio Mode ON — compact 200×200 viewport nudges YouTube adaptive streaming toward low video bitrates.${storageNotice}`
+      : `🎬 Standard Video Mode restored (16:9 viewport).${storageNotice}`
   );
 }
 
@@ -436,10 +445,7 @@ function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null
   }
 
   if (state.ytPlayer && typeof state.ytPlayer.loadVideoById === 'function') {
-    const loadSpec = {
-      videoId,
-      suggestedQuality: state.audioOnlyMode ? 'tiny' : 'default',
-    };
+    const loadSpec = { videoId };
     if (hasStart) loadSpec.startSeconds = Number(startSeconds);
     if (hasEnd) loadSpec.endSeconds = Number(endSeconds);
     state.ytPlayer.loadVideoById(loadSpec);
@@ -458,8 +464,8 @@ function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null
   if (hasEnd) playerVars.end = Number(endSeconds);
 
   state.ytPlayer = new window.YT.Player('yt-player-mount', {
-    width: state.audioOnlyMode ? '120' : '100%',
-    height: state.audioOnlyMode ? '68' : '100%',
+    width: state.audioOnlyMode ? '200' : '100%',
+    height: state.audioOnlyMode ? '200' : '100%',
     videoId: videoId,
     playerVars,
     events: {
