@@ -638,12 +638,52 @@ a:hover {
 .player-header {
   background: #192424;
   color: #e9f0ef;
-  padding: 8px 12px;
+  padding: 7px 10px 7px 12px;
   font-family: var(--font-mono);
   font-size: 12px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
+}
+
+.player-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.player-header-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-audio-mode {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: #263535;
+  color: #c2d1d0;
+  border: 1px solid #3e5453;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.14s ease;
+}
+
+.btn-audio-mode:hover {
+  background: #314545;
+  color: #ffffff;
+}
+
+.btn-audio-mode.active {
+  background: #184a38;
+  color: #9df3c4;
+  border-color: #36c275;
+  font-weight: 600;
+  box-shadow: 0 0 8px rgba(54, 194, 117, 0.25);
 }
 
 .player-status-dot {
@@ -651,6 +691,7 @@ a:hover {
   height: 8px;
   border-radius: 50%;
   background: #6c7a79;
+  flex-shrink: 0;
 }
 
 .player-status-dot.live {
@@ -663,6 +704,7 @@ a:hover {
   width: 100%;
   aspect-ratio: 16 / 9;
   background: #0d1111;
+  transition: aspect-ratio 0.2s ease, padding 0.2s ease;
 }
 
 #yt-player-mount,
@@ -671,6 +713,66 @@ a:hover {
   height: 100%;
   border: 0;
   display: block;
+}
+
+.yt-viewport-wrapper.audio-only-mode {
+  aspect-ratio: auto;
+  min-height: 216px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: linear-gradient(135deg, #111919 0%, #182625 100%);
+  border-bottom: 1px solid #283a39;
+}
+
+.yt-viewport-wrapper.audio-only-mode #yt-player-mount,
+.yt-viewport-wrapper.audio-only-mode iframe {
+  width: 200px !important;
+  height: 200px !important;
+  flex-shrink: 0;
+  border-radius: 3px;
+  border: 1px solid #344b49;
+}
+
+.audio-mode-deck-info {
+  flex: 1;
+  min-width: 0;
+  color: #d6e4e2;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.audio-mode-deck-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.audio-mode-badge {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: #9df3c4;
+}
+
+.audio-mode-quality-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(54, 194, 117, 0.16);
+  color: #a7f3d0;
+  border: 1px solid rgba(54, 194, 117, 0.4);
+}
+
+.audio-mode-deck-sub {
+  font-size: 11px;
+  line-height: 1.35;
+  color: #8fa3a1;
 }
 
 .yt-placeholder {

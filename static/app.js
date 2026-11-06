@@ -1,3 +1,11 @@
+function readAudioOnlyModePreference() {
+  try {
+    return localStorage.getItem('webjam_audio_only_mode') === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
 // Webjam Frontend Application
 const state = {
   currentUserId: Number(localStorage.getItem('webjam_user_id')) || 1,
@@ -21,6 +29,7 @@ const state = {
   queuePlaylistMyLikes: 0,
   queuePlaylistLikeCount: 0,
   repeatTrack: false,
+  audioOnlyMode: readAudioOnlyModePreference(),
   superloveSyncTimer: null,
   // Undo & Drag-and-Drop state
   undoStack: [],
@@ -341,6 +350,87 @@ function toggleRepeatTrack() {
   );
 }
 
+const YT_QUALITY_LABELS = {
+  tiny: '144p tiny',
+  small: '240p low',
+  medium: '360p',
+  large: '480p',
+  hd720: '720p',
+  hd1080: '1080p',
+  highres: 'HD+',
+  default: 'auto',
+};
+
+function updateAudioModeQualityPill(qualityCode = null) {
+  const pill = document.getElementById('audio-mode-quality-pill');
+  if (!pill) return;
+  let q = qualityCode;
+  if (!q && state.ytPlayer && typeof state.ytPlayer.getPlaybackQuality === 'function') {
+    try {
+      q = state.ytPlayer.getPlaybackQuality();
+    } catch (_) {
+      q = null;
+    }
+  }
+  const label = (q && YT_QUALITY_LABELS[q]) || 'compact · auto';
+  pill.textContent = label;
+}
+
+function enforceAudioModePlayerConstraints() {
+  if (!state.ytPlayer) return;
+  try {
+    if (typeof state.ytPlayer.setSize === 'function') {
+      if (state.audioOnlyMode) {
+        // YouTube's Required Minimum Functionality mandates at least 200x200 for embedded players.
+        state.ytPlayer.setSize(200, 200);
+      } else {
+        const wrapper = document.getElementById('yt-viewport-wrapper');
+        const w = wrapper && wrapper.clientWidth ? wrapper.clientWidth : 400;
+        const h = Math.round((w * 9) / 16);
+        state.ytPlayer.setSize(w, h);
+      }
+    }
+  } catch (_) {}
+
+  updateAudioModeQualityPill();
+}
+
+function applyAudioOnlyModeUI() {
+  const btn = document.getElementById('audio-mode-toggle-btn');
+  const wrapper = document.getElementById('yt-viewport-wrapper');
+  const infoBox = document.getElementById('audio-mode-deck-info');
+
+  if (btn) {
+    btn.textContent = state.audioOnlyMode ? '🎧 Audio / Low-Data: ON' : '🎧 Audio / Low-Data: Off';
+    btn.classList.toggle('active', state.audioOnlyMode);
+  }
+  if (wrapper) {
+    wrapper.classList.toggle('audio-only-mode', state.audioOnlyMode);
+  }
+  if (infoBox) {
+    infoBox.classList.toggle('hidden', !state.audioOnlyMode);
+  }
+
+  enforceAudioModePlayerConstraints();
+}
+
+function toggleAudioOnlyMode() {
+  state.audioOnlyMode = !state.audioOnlyMode;
+  let saved = true;
+  try {
+    localStorage.setItem('webjam_audio_only_mode', state.audioOnlyMode ? '1' : '0');
+  } catch (_) {
+    saved = false;
+  }
+  applyAudioOnlyModeUI();
+  const storageNotice = saved ? '' : ' (preference not saved in browser storage)';
+  showToast(
+    state.audioOnlyMode
+      ? `🎧 Low-Bandwidth Audio Mode ON — compact 200×200 viewport nudges YouTube adaptive streaming toward low video bitrates.${storageNotice}`
+      : `🎬 Standard Video Mode restored (16:9 viewport).${storageNotice}`
+  );
+}
+
 function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null) {
   const placeholder = document.getElementById('yt-placeholder');
   if (placeholder) placeholder.classList.add('hidden');
@@ -359,6 +449,7 @@ function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null
     if (hasStart) loadSpec.startSeconds = Number(startSeconds);
     if (hasEnd) loadSpec.endSeconds = Number(endSeconds);
     state.ytPlayer.loadVideoById(loadSpec);
+    enforceAudioModePlayerConstraints();
     return;
   }
 
@@ -373,15 +464,24 @@ function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null
   if (hasEnd) playerVars.end = Number(endSeconds);
 
   state.ytPlayer = new window.YT.Player('yt-player-mount', {
-    width: '100%',
-    height: '100%',
+    width: state.audioOnlyMode ? '200' : '100%',
+    height: state.audioOnlyMode ? '200' : '100%',
     videoId: videoId,
     playerVars,
     events: {
+      onReady: () => {
+        enforceAudioModePlayerConstraints();
+      },
+      onPlaybackQualityChange: (event) => {
+        updateAudioModeQualityPill(event?.data);
+      },
       onStateChange: (event) => {
         const dot = document.getElementById('player-status-dot');
         if (event.data === window.YT.PlayerState.PLAYING) {
           if (dot) dot.classList.add('live');
+          if (state.audioOnlyMode) {
+            enforceAudioModePlayerConstraints();
+          }
           startClipMonitor();
         } else if (event.data === window.YT.PlayerState.ENDED) {
           if (dot) dot.classList.remove('live');
@@ -3972,6 +4072,7 @@ async function initApp() {
     return;
   }
 
+  applyAudioOnlyModeUI();
   state.currentRoute = parseHashRoute();
   updateNavHighlight(state.currentRoute.view);
   await refreshBootstrapSilently();
