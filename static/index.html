@@ -406,9 +406,10 @@
         <div id="migrate-modal-results" class="import-candidates-list" style="margin-top:10px; max-height:280px; overflow-y:auto;"></div>
 
         <div style="margin-top:12px; padding-top:10px; border-top:1px dashed var(--border-color); display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-          <span class="muted" style="font-size:12px;">Or paste a replacement YouTube URL / Video ID directly:</span>
+          <span class="muted" style="font-size:12px;">Or paste a YouTube URL / Video ID directly:</span>
           <input type="text" id="migrate-modal-custom-url" class="input-text mono-input flex-grow" placeholder="https://www.youtube.com/watch?v=..." />
-          <button type="button" class="btn-secondary btn-tiny" onclick="applyCustomMigrateModalUrl()">Swap to Custom URL</button>
+          <button type="button" class="btn-secondary btn-tiny" onclick="addCustomMigrateModalUrlToPlaylist()" title="Add this custom URL as a new track in the current playlist">+ Add to Playlist</button>
+          <button type="button" class="btn-secondary btn-tiny" onclick="applyCustomMigrateModalUrl()" title="Replace the current track with this custom URL">⇄ Swap to Custom URL</button>
         </div>
 
         <div class="modal-actions">
