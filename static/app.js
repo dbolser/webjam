@@ -3920,6 +3920,7 @@ function auditionMigrateCandidate(candidateIdx) {
       </div>
       <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
         <button type="button" class="btn-tiny btn-secondary" onclick="auditionCurrentTrackInModal()">↺ Hear Current</button>
+        <button type="button" class="btn-tiny btn-secondary" onclick="addMigrateModalCandidateToPlaylist(${candidateIdx})" title="Add this version as a new track in the current playlist">+ Add to Playlist</button>
         <button type="button" class="btn-tiny btn-primary" onclick="applyMigrateModalCandidate(${candidateIdx})">✓ Swap to This Version</button>
       </div>
     `;
@@ -3983,8 +3984,16 @@ async function executeMigrateModalSearch(query, excludeVideoId = null) {
                 >▶ Audition</button>
                 <button
                   type="button"
+                  class="btn-tiny btn-secondary"
+                  id="migrate-add-btn-${cIdx}"
+                  onclick="addMigrateModalCandidateToPlaylist(${cIdx})"
+                  title="Add this track to the current playlist (keeps your existing track)"
+                >+ Add to Playlist</button>
+                <button
+                  type="button"
                   class="btn-tiny btn-primary"
                   onclick="applyMigrateModalCandidate(${cIdx})"
+                  title="Replace the current track with this version"
                 >✓ Swap to This Version</button>
               </div>
             </li>
@@ -4000,6 +4009,79 @@ async function executeMigrateModalSearch(query, excludeVideoId = null) {
       btn.disabled = false;
       btn.textContent = '🔍 Search Versions';
     }
+  }
+}
+
+async function addMigrateModalCandidateToPlaylist(candidateIdx) {
+  const items = state.migrateModalCandidates || [];
+  const chosen = items[candidateIdx];
+  if (!chosen) return;
+  const btn = document.getElementById(`migrate-add-btn-${candidateIdx}`);
+  await performAddTrackFromMigrateModal(chosen.video_id, chosen.title, btn);
+}
+
+async function addCustomMigrateModalUrlToPlaylist() {
+  const customInput = document.getElementById('migrate-modal-custom-url');
+  const customUrl = customInput?.value.trim();
+  if (!customUrl) return;
+  const ok = await performAddTrackFromMigrateModal(customUrl, null, null);
+  if (ok && customInput) {
+    customInput.value = '';
+  }
+}
+
+async function performAddTrackFromMigrateModal(videoUrlOrId, customTitle = null, buttonEl = null) {
+  const pid = Number(document.getElementById('migrate-modal-playlist-id')?.value);
+  if (!pid) return false;
+
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = 'Adding…';
+  }
+
+  try {
+    await capturePlaylistSnapshot(pid, `Added track "${customTitle || videoUrlOrId}"`);
+    const res = await api(`/api/playlists/${pid}/tracks`, {
+      method: 'POST',
+      body: JSON.stringify({
+        user_id: state.currentUserId,
+        urls_or_ids: videoUrlOrId,
+        custom_title: customTitle,
+      }),
+    });
+    const added = (res.results && res.results[0]) || null;
+    if (added && added.video_id) {
+      state.embedAuditByVideoId[added.video_id] = { embeddable: true, status: 'OK', reason: null };
+    }
+
+    delete playlistCache[pid];
+    await syncQueueWithPlaylistIfActive(pid);
+    await refreshBootstrapSilently();
+    await renderCurrentRoute();
+    notifyBadges(res.new_badges);
+
+    const trackTitle = (added && added.title) || customTitle || videoUrlOrId;
+    showToast(
+      `+ Added "${esc(trackTitle)}" to playlist! <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+    );
+
+    if (buttonEl) {
+      buttonEl.textContent = '✓ Added!';
+      setTimeout(() => {
+        if (buttonEl) {
+          buttonEl.disabled = false;
+          buttonEl.textContent = '+ Add to Playlist';
+        }
+      }, 1600);
+    }
+    return true;
+  } catch (err) {
+    showToast(esc(err.message));
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = '+ Add to Playlist';
+    }
+    return false;
   }
 }
 
