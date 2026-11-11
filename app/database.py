@@ -42,6 +42,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS google_accounts (
+    google_sub TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT DEFAULT '',
+    access_token TEXT,
+    refresh_token TEXT,
+    token_expires_at INTEGER DEFAULT 0,
+    scope TEXT DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS songs (
     video_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,

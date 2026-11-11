@@ -1,4 +1,6 @@
 import asyncio
+import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,10 +8,13 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+from app.auth import auth_enabled, base_url, resolve_actor, resolve_viewer, router as auth_router
 
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
 from app.database import get_db, hash_password, init_db
@@ -35,10 +40,44 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Webjam — Social YouTube Playlist Curation", lifespan=lifespan)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("WEBJAM_SESSION_SECRET") or secrets.token_urlsafe(32),
+    session_cookie="webjam_session",
+    max_age=60 * 60 * 24 * 30,
+    same_site="lax",
+    https_only=os.environ.get("WEBJAM_BASE_URL", "").startswith("https://"),
+)
+app.include_router(auth_router)
 
 
 def now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def require_playlist_owner(conn: sqlite3.Connection, playlist_id: int, user_id: int) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,))
+    pl = cur.fetchone()
+    if not pl:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if pl["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Only the playlist creator can change this playlist")
+    return pl
+
+
+GUEST_USER = {
+    "id": 0,
+    "username": "guest",
+    "display_name": "Guest",
+    "bio": "",
+    "avatar_color": "#888888",
+    "created_at": "",
+    "playlist_count": 0,
+    "songs_discovered": 0,
+    "badge_count": 0,
+    "times_grabbed": 0,
+}
 
 
 # --- Pydantic Schemas ---
@@ -56,20 +95,20 @@ class UpdateProfileRequest(BaseModel):
 
 
 class CreatePlaylistRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     title: str
     description: Optional[str] = ""
     initial_urls: Optional[str] = ""
 
 
 class UpdatePlaylistRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     title: str
     description: str
 
 
 class AddTracksRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     urls_or_ids: str
     track_note: Optional[str] = ""
     custom_title: Optional[str] = None
@@ -80,7 +119,7 @@ class AddTracksRequest(BaseModel):
 
 
 class UpdateTrackRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     track_note: Optional[str] = None
     start_time: Optional[Any] = None
     end_time: Optional[Any] = None
@@ -106,7 +145,7 @@ class CommitImportedTrackItem(BaseModel):
 
 
 class CommitPlaylistImportRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     title: str
     description: Optional[str] = ""
     target_playlist_id: Optional[int] = None
@@ -114,7 +153,7 @@ class CommitPlaylistImportRequest(BaseModel):
 
 
 class ReorderTracksRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     track_ids: List[int]
 
 
@@ -134,7 +173,7 @@ class SnapshotTrackItem(BaseModel):
 
 
 class RestorePlaylistSnapshotRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     title: str
     description: Optional[str] = ""
     tracks: List[SnapshotTrackItem]
@@ -142,7 +181,7 @@ class RestorePlaylistSnapshotRequest(BaseModel):
 
 
 class ToggleLikeRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     count: int = 1
     reset: bool = False
 
@@ -153,7 +192,7 @@ class RecordPlayRequest(BaseModel):
 
 
 class CreateCommentRequest(BaseModel):
-    author_user_id: int
+    author_user_id: Optional[int] = None
     target_type: str  # 'playlist' | 'song' | 'profile'
     target_id: str
     body: str
@@ -342,12 +381,16 @@ async def add_single_video_to_playlist(
 # --- API Endpoints ---
 
 @app.get("/api/bootstrap")
-def get_bootstrap(user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
+def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
     users = fetch_all_users_summary(conn)
     if not users:
         raise HTTPException(status_code=404, detail="No users found")
 
-    current_user = next((u for u in users if u["id"] == user_id), users[0])
+    viewer_id = resolve_viewer(request, user_id)
+    if auth_enabled():
+        current_user = next((u for u in users if u["id"] == viewer_id), dict(GUEST_USER))
+    else:
+        current_user = next((u for u in users if u["id"] == viewer_id), users[0])
     actual_uid = current_user["id"]
 
     badge_info = get_user_badge_progress(conn, actual_uid)
@@ -374,11 +417,17 @@ def get_bootstrap(user_id: int = Query(1), conn: sqlite3.Connection = Depends(ge
             "playlists": my_playlists,
         },
         "badge_catalog": BADGE_CATALOG,
+        "auth": {
+            "mode": "google" if auth_enabled() else "demo",
+            "signed_in": bool(auth_enabled() and current_user["id"]),
+        },
     }
 
 
 @app.post("/api/auth/login")
 def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_db)):
+    if auth_enabled():
+        raise HTTPException(status_code=404, detail="Use Google sign-in")
     clean_uname = req.username.strip().lower().lstrip("@")
     if not clean_uname:
         raise HTTPException(status_code=400, detail="Username cannot be empty")
@@ -416,8 +465,10 @@ def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_
 
 @app.put("/api/users/{user_id}")
 def update_user_profile(
-    user_id: int, req: UpdateProfileRequest, conn: sqlite3.Connection = Depends(get_db)
+    user_id: int, req: UpdateProfileRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    if resolve_actor(request, user_id) != user_id:
+        raise HTTPException(status_code=403, detail="You can only edit your own profile")
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET display_name = ?, bio = ? WHERE id = ?",
@@ -428,7 +479,8 @@ def update_user_profile(
 
 
 @app.get("/api/feed")
-def get_community_feed(user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
+def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
+    user_id = resolve_viewer(request, user_id)
     cur = conn.cursor()
 
     # 1. All playlists with curator info, track count, likes, grabs
@@ -555,8 +607,9 @@ def get_community_feed(user_id: int = Query(1), conn: sqlite3.Connection = Depen
 
 @app.get("/api/playlists/{playlist_id}")
 def get_playlist_detail(
-    playlist_id: int, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
 ):
+    user_id = resolve_viewer(request, user_id)
     cur = conn.cursor()
     cur.execute(
         """
@@ -647,7 +700,8 @@ def get_playlist_detail(
 
 
 @app.post("/api/playlists")
-async def create_playlist(req: CreatePlaylistRequest, conn: sqlite3.Connection = Depends(get_db)):
+async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    req.user_id = resolve_actor(request, req.user_id)
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Playlist title is required")
@@ -696,8 +750,9 @@ async def create_playlist(req: CreatePlaylistRequest, conn: sqlite3.Connection =
 
 @app.put("/api/playlists/{playlist_id}")
 def update_playlist(
-    playlist_id: int, req: UpdatePlaylistRequest, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, req: UpdatePlaylistRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM playlists WHERE id = ?", (playlist_id,))
     row = cur.fetchone()
@@ -717,13 +772,11 @@ def update_playlist(
 
 @app.post("/api/playlists/{playlist_id}/tracks")
 async def add_tracks_to_playlist(
-    playlist_id: int, req: AddTracksRequest, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, req: AddTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+    pl = require_playlist_owner(conn, playlist_id, req.user_id)
 
     entries = extract_video_entries(req.urls_or_ids)
     if not entries:
@@ -779,8 +832,11 @@ async def update_playlist_track(
     playlist_id: int,
     track_id: int,
     req: UpdateTrackRequest,
+    request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
+    req.user_id = resolve_actor(request, req.user_id)
+    require_playlist_owner(conn, playlist_id, req.user_id)
     cur = conn.cursor()
     cur.execute(
         """
@@ -929,7 +985,9 @@ async def update_playlist_track(
 
 
 @app.post("/api/playlists/import/inspect")
-async def inspect_playlist_import(req: InspectPlaylistImportRequest):
+async def inspect_playlist_import(req: InspectPlaylistImportRequest, request: Request):
+    if auth_enabled():
+        resolve_actor(request, None)
     try:
         report = await inspect_youtube_playlist_or_urls(
             req.source_input,
@@ -943,8 +1001,12 @@ async def inspect_playlist_import(req: InspectPlaylistImportRequest):
 @app.post("/api/playlists/import/commit")
 async def commit_playlist_import(
     req: CommitPlaylistImportRequest,
+    request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
+    req.user_id = resolve_actor(request, req.user_id)
+    if req.target_playlist_id:
+        require_playlist_owner(conn, req.target_playlist_id, req.user_id)
     if not req.tracks:
         raise HTTPException(status_code=400, detail="Select at least one track to import.")
 
@@ -1073,8 +1135,13 @@ async def audit_playlist_embeds(
 
 @app.delete("/api/playlists/{playlist_id}/tracks/{track_id}")
 def delete_playlist_track(
-    playlist_id: int, track_id: int, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int,
+    track_id: int,
+    request: Request,
+    user_id: Optional[int] = Query(None),
+    conn: sqlite3.Connection = Depends(get_db),
 ):
+    require_playlist_owner(conn, playlist_id, resolve_actor(request, user_id))
     cur = conn.cursor()
     cur.execute(
         "DELETE FROM playlist_tracks WHERE id = ? AND playlist_id = ?",
@@ -1093,13 +1160,11 @@ def delete_playlist_track(
 
 @app.put("/api/playlists/{playlist_id}/reorder")
 def reorder_playlist_tracks(
-    playlist_id: int, req: ReorderTracksRequest, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, req: ReorderTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    req.user_id = resolve_actor(request, req.user_id)
+    require_playlist_owner(conn, playlist_id, req.user_id)
     cur = conn.cursor()
-    cur.execute("SELECT id, user_id FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
 
     cur.execute(
         "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC",
@@ -1133,13 +1198,12 @@ def reorder_playlist_tracks(
 def restore_playlist_snapshot(
     playlist_id: int,
     req: RestorePlaylistSnapshotRequest,
+    request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
+    req.user_id = resolve_actor(request, req.user_id)
+    pl = require_playlist_owner(conn, playlist_id, req.user_id)
     cur = conn.cursor()
-    cur.execute("SELECT id, user_id FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
 
     ts = now_str()
     cur.execute(
@@ -1210,8 +1274,9 @@ def restore_playlist_snapshot(
 
 @app.post("/api/playlists/{playlist_id}/like")
 def toggle_playlist_like(
-    playlist_id: int, req: ToggleLikeRequest, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, req: ToggleLikeRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
     cur.execute("SELECT id, user_id, title FROM playlists WHERE id = ?", (playlist_id,))
     pl = cur.fetchone()
@@ -1305,8 +1370,9 @@ def toggle_playlist_like(
 
 @app.post("/api/songs/{video_id}/like")
 def toggle_song_like(
-    video_id: str, req: ToggleLikeRequest, conn: sqlite3.Connection = Depends(get_db)
+    video_id: str, req: ToggleLikeRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
     cur.execute("SELECT video_id, title, first_added_by_user_id FROM songs WHERE video_id = ?", (video_id,))
     song = cur.fetchone()
@@ -1431,8 +1497,9 @@ def record_playlist_play(
 
 @app.get("/api/songs/{video_id}")
 def get_song_page(
-    video_id: str, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
+    video_id: str, request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
 ):
+    user_id = resolve_viewer(request, user_id)
     cur = conn.cursor()
     cur.execute(
         """
@@ -1496,8 +1563,9 @@ def get_song_page(
 
 @app.get("/api/users/{profile_user_id}")
 def get_user_profile(
-    profile_user_id: int, viewer_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
+    profile_user_id: int, request: Request, viewer_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
 ):
+    viewer_id = resolve_viewer(request, viewer_id)
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id = ?", (profile_user_id,))
     urow = cur.fetchone()
@@ -1678,7 +1746,8 @@ def get_user_profile(
 
 
 @app.post("/api/comments")
-def create_comment(req: CreateCommentRequest, conn: sqlite3.Connection = Depends(get_db)):
+def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    req.author_user_id = resolve_actor(request, req.author_user_id)
     if req.target_type not in ("playlist", "song", "profile"):
         raise HTTPException(status_code=400, detail="Invalid comment target_type")
     body = req.body.strip()

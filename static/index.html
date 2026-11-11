@@ -30,7 +30,7 @@
       <div class="persona-bar">
         <span class="persona-label" title="Switch active user instantly to test track-grabbing, comments, and badges">Curating as:</span>
         <div id="persona-pills" class="persona-pills"></div>
-        <button class="btn-tiny btn-outline" onclick="openNewUserModal()" title="Create or log into another account">+ User</button>
+        <button id="new-user-btn" class="btn-tiny btn-outline" onclick="openNewUserModal()" title="Create or log into another account">+ User</button>
       </div>
     </div>
   </header>
@@ -317,6 +317,16 @@
       <!-- Step 1: Source Input -->
       <div id="import-step-source">
         <form onsubmit="handleInspectPlaylistImport(event)">
+          <div id="import-my-youtube" class="hidden" style="margin-bottom:10px;">
+            <label class="form-label" style="margin-top:0;">From your YouTube account</label>
+            <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+              <select id="import-my-youtube-select" class="input-text" style="flex:1; min-width:200px;">
+                <option value="">Loading your playlists…</option>
+              </select>
+              <button type="button" class="btn-secondary" onclick="useMyYouTubePlaylist()">Use this playlist ↓</button>
+            </div>
+            <span class="muted" style="font-size:11.5px;">Includes private playlists. Webjam only has read-only access to YouTube.</span>
+          </div>
           <label class="form-label" style="margin-top:0;">Paste a YouTube Playlist URL, Playlist ID, or Batch of Video Links</label>
           <textarea
             id="import-source-input"

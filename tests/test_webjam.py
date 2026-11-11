@@ -3,9 +3,14 @@ import tempfile
 from fastapi.testclient import TestClient
 
 
-def test_full_webjam_workflow():
+def test_full_webjam_workflow(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        os.environ["WEBJAM_DB_PATH"] = os.path.join(tmpdir, "test_webjam.db")
+        import app.database
+        from pathlib import Path
+
+        monkeypatch.setattr(app.database, "DB_PATH", Path(tmpdir) / "test_webjam.db")
+        for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
+            monkeypatch.delenv(var, raising=False)
         from app.database import init_db
         from app.main import app
 

@@ -11,6 +11,7 @@ const state = {
   currentUserId: Number(localStorage.getItem('webjam_user_id')) || 1,
   users: [],
   currentUser: null,
+  auth: { mode: 'demo', signed_in: false },
   badgeCatalog: [],
   feedData: null,
   currentRoute: { view: 'feed', param: null },
@@ -821,7 +822,8 @@ async function refreshBootstrapSilently() {
   state.currentUser = data.current_user;
   state.currentUserId = data.current_user.id;
   state.badgeCatalog = data.badge_catalog;
-  localStorage.setItem('webjam_user_id', String(state.currentUserId));
+  state.auth = data.auth || { mode: 'demo', signed_in: false };
+  if (state.auth.mode === 'demo') localStorage.setItem('webjam_user_id', String(state.currentUserId));
   renderPersonaBar();
   renderQuickDropSelector();
   renderSidebarUserCard();
@@ -847,9 +849,37 @@ async function switchPersona(userId) {
   renderCurrentRoute();
 }
 
+function isGoogleAuthMode() {
+  return state.auth && state.auth.mode === 'google';
+}
+
+async function signOut() {
+  try {
+    await api('/auth/logout', { method: 'POST' });
+  } catch (_) {}
+  window.location.href = '/';
+}
+
 function renderPersonaBar() {
   const container = document.getElementById('persona-pills');
   if (!container) return;
+  const newUserBtn = document.getElementById('new-user-btn');
+  const label = document.querySelector('.persona-label');
+  if (isGoogleAuthMode()) {
+    if (newUserBtn) newUserBtn.classList.add('hidden');
+    if (label) {
+      label.textContent = state.auth.signed_in ? 'Signed in as:' : '';
+      label.title = '';
+    }
+    const u = state.currentUser;
+    container.innerHTML = state.auth.signed_in
+      ? `<a href="#user/${u.id}" class="persona-pill active" onclick="navigate('user', ${u.id}); return false;">
+           <span class="persona-dot" style="background:${esc(u.avatar_color)}"></span>@${esc(u.username)}
+         </a>
+         <button type="button" class="btn-tiny btn-outline" onclick="signOut()">Sign out</button>`
+      : `<a href="/auth/google/login" class="btn-tiny btn-primary" style="text-decoration:none;">Sign in with Google</a>`;
+    return;
+  }
   container.innerHTML = state.users
     .map(
       (u) => `
@@ -2861,7 +2891,7 @@ async function removeTrack(playlistId, trackId) {
       playlistId,
       `Removed "${removedTrack ? removedTrack.title : 'track'}"`
     );
-    await api(`/api/playlists/${playlistId}/tracks/${trackId}`, {
+    await api(`/api/playlists/${playlistId}/tracks/${trackId}?user_id=${state.currentUserId}`, {
       method: 'DELETE',
     });
     showToast('Removed track from playlist. <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>');
@@ -3110,6 +3140,46 @@ function openImportPlaylistModal(defaultTargetPlaylistId = null) {
   };
   document.getElementById('import-playlist-modal')?.classList.remove('hidden');
   document.getElementById('import-source-input')?.focus();
+  loadMyYouTubePlaylists();
+}
+
+async function loadMyYouTubePlaylists() {
+  const wrap = document.getElementById('import-my-youtube');
+  const sel = document.getElementById('import-my-youtube-select');
+  if (!wrap || !sel) return;
+  const show = isGoogleAuthMode() && state.auth.signed_in;
+  wrap.classList.toggle('hidden', !show);
+  if (!show) return;
+  sel.innerHTML = '<option value="">Loading your playlists…</option>';
+  try {
+    const data = await api('/api/youtube/my-playlists');
+    sel.innerHTML = data.playlists.length
+      ? data.playlists
+          .map((p) => `<option value="${esc(p.id)}">${esc(p.title)} (${Number(p.item_count)} videos${p.privacy ? ', ' + esc(p.privacy) : ''})</option>`)
+          .join('')
+      : '<option value="">No playlists on your YouTube account</option>';
+  } catch (err) {
+    sel.innerHTML = `<option value="">${esc(err.message)}</option>`;
+  }
+}
+
+async function useMyYouTubePlaylist() {
+  const sel = document.getElementById('import-my-youtube-select');
+  const input = document.getElementById('import-source-input');
+  if (!sel || !sel.value || !input) return;
+  const maxTracks = Number(document.getElementById('import-max-tracks')?.value || 25);
+  try {
+    const data = await api(`/api/youtube/my-playlists/${encodeURIComponent(sel.value)}/videos?limit=${maxTracks}`);
+    if (!data.video_ids.length) {
+      showToast('That playlist has no videos.');
+      return;
+    }
+    input.value = data.video_ids.map((id) => `https://www.youtube.com/watch?v=${id}`).join('\n');
+    const titleEl = document.getElementById('import-playlist-title');
+    if (titleEl && !titleEl.value) titleEl.value = sel.options[sel.selectedIndex].text.replace(/ \(\d+ videos.*\)$/, '');
+  } catch (err) {
+    showToast(esc(err.message));
+  }
 }
 
 function resetImportWizardToSource() {
