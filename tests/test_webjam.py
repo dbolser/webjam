@@ -3,19 +3,43 @@ import tempfile
 from fastapi.testclient import TestClient
 
 
+def app_database_conn():
+    from app.database import get_connection
+
+    return get_connection()
+
+
 def test_full_webjam_workflow(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
         import app.database
         from pathlib import Path
 
         monkeypatch.setattr(app.database, "DB_PATH", Path(tmpdir) / "test_webjam.db")
-        for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
+        for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "WEBJAM_DEMO_MODE", "WEBJAM_BASE_URL"):
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("WEBJAM_AUTH_MODE", "demo")
         from app.database import init_db
+        import app.main as app_main
         from app.main import app
 
+        # A failed YouTube lookup now rejects the add instead of storing a placeholder song,
+        # so don't let a network blip fail this workflow test: answer metadata lookups locally.
+        async def fake_metadata(video_id, custom_title=None):
+            return {
+                "video_id": video_id,
+                "title": f"Test Track {video_id}",
+                "channel_title": "Test Channel",
+                "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                "embeddable": True,
+                "status": "OK",
+                "reason": None,
+            }
+
+        monkeypatch.setattr(app_main, "fetch_youtube_metadata", fake_metadata)
+
         init_db()
-        with TestClient(app) as client:
+        # X-Webjam: 1 is the CSRF header the SPA sends on every unsafe request.
+        with TestClient(app, headers={"X-Webjam": "1"}) as client:
             # 1. Bootstrap & seeded data check
             boot = client.get("/api/bootstrap?user_id=1").json()
             assert len(boot["users"]) >= 4
@@ -67,6 +91,12 @@ def test_full_webjam_workflow(monkeypatch):
             assert "crate_borrower_1" in grab_badge_keys
 
             # 5. Now Elena's playlist (which has a track taken from Lucas) gets 5 plays -> earns 'Crate Alchemist' (alchemist_remix)!
+            # A play request counts exactly once now (count=5 used to add 5, which was the
+            # play-inflation bug), so seed 4 earlier plays and record the 5th.
+            conn = app_database_conn()
+            conn.execute("UPDATE playlists SET plays = 4 WHERE id = ?", (elena_pl_id,))
+            conn.commit()
+            conn.close()
             play_res = client.post(
                 f"/api/playlists/{elena_pl_id}/play",
                 json={"video_id": "0PsOJ_fRckg", "count": 5},
@@ -256,8 +286,8 @@ def test_full_webjam_workflow(monkeypatch):
             assert imported_pl["tracks"][0]["migrated_from_video_id"] == "Z5NoQg8LdDk"
             assert imported_pl["tracks"][0]["migrated_from_title"] == "Polyphia - Playing God (Official Music Video)"
 
-            # Test audit-embeds on the imported playlist
-            audit_res = client.get(f"/api/playlists/{imported_pl_id}/audit-embeds")
+            # Test audit-embeds on the imported playlist (owner-only now, so name the owner)
+            audit_res = client.get(f"/api/playlists/{imported_pl_id}/audit-embeds?user_id={elena_id}")
             assert audit_res.status_code == 200
             audit_data = audit_res.json()
             assert audit_data["total_tracks"] == 2

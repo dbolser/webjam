@@ -15,11 +15,26 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(f"webjam-salt::{password}".encode("utf-8")).hexdigest()
 
 
+def _ensure_private_db_file(path: Path) -> None:
+    """Create the data dir (0700) and the DB file (0600) before SQLite opens it.
+
+    SQLite creates its -wal/-shm files with the same permissions as the DB file,
+    so the whole database stays readable only by the service user.
+    """
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.exists():
+        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        os.chmod(str(path), 0o600)
+
+
 def get_connection() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    _ensure_private_db_file(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
@@ -39,6 +54,13 @@ CREATE TABLE IF NOT EXISTS users (
     bio TEXT DEFAULT '',
     avatar_color TEXT DEFAULT '#2b5b84',
     password_hash TEXT DEFAULT '',
+    session_epoch INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS invites (
+    email TEXT PRIMARY KEY,  -- always stored lowercased
+    invited_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL
 );
 
@@ -85,10 +107,20 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     end_seconds INTEGER DEFAULT NULL,
     migrated_from_video_id TEXT DEFAULT NULL,
     migrated_from_title TEXT DEFAULT NULL,
+    display_title TEXT DEFAULT NULL,  -- per-row title override; songs.title stays YouTube's
     source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
     source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS play_events (
+    viewer_key TEXT NOT NULL,
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    video_id TEXT NOT NULL DEFAULT '',
+    at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_play_events_lookup ON play_events (viewer_key, playlist_id, video_id, at);
+CREATE INDEX IF NOT EXISTS idx_play_events_at ON play_events (at);
 
 CREATE TABLE IF NOT EXISTS playlist_likes (
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
@@ -260,6 +292,16 @@ def ensure_playlist_track_clip_columns(conn: sqlite3.Connection) -> None:
             )
             changed = True
 
+    # Columns added in Phase 0 (fresh DBs get them from SCHEMA_SQL; this keeps old dev DBs opening)
+    cur.execute("PRAGMA table_info(playlist_tracks)")
+    if "display_title" not in {row["name"] for row in cur.fetchall()}:
+        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN display_title TEXT DEFAULT NULL")
+        changed = True
+    cur.execute("PRAGMA table_info(users)")
+    if "session_epoch" not in {row["name"] for row in cur.fetchall()}:
+        cur.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
+        changed = True
+
     cur.execute("PRAGMA table_info(playlist_likes)")
     pl_like_cols = {row["name"] for row in cur.fetchall()}
     if "count" not in pl_like_cols:
@@ -362,6 +404,7 @@ def migrate_legacy_seed_videos(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     conn = get_connection()
     try:
+        conn.execute("PRAGMA journal_mode = WAL;")  # persistent; concurrent readers + one writer
         conn.executescript(SCHEMA_SQL)
         conn.commit()
         ensure_playlist_track_clip_columns(conn)
