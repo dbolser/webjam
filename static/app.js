@@ -898,8 +898,8 @@ function renderPersonaBar() {
     }
     const u = state.currentUser;
     container.innerHTML = state.auth.signed_in
-      ? `<a href="#user/${u.id}" class="persona-pill active" onclick="navigate('user', ${u.id}); return false;">
-           <span class="persona-dot" style="background:${esc(u.avatar_color)}"></span>@${esc(u.username)}
+      ? `<a href="#user/${Number(u.id)}" class="persona-pill active" onclick="navigate('user', ${Number(u.id)}); return false;">
+           <span class="persona-dot" style="background:${esc(safeColor(u.avatar_color))}"></span>@${esc(u.username)}
          </a>
          <button type="button" class="btn-tiny btn-outline" onclick="signOut()">Sign out</button>`
       : `<a href="/auth/google/login" class="btn-tiny btn-primary" style="text-decoration:none;">Sign in with Google</a>`;
@@ -3732,7 +3732,7 @@ async function auditPlaylistEmbeds(playlistId) {
   }
 
   try {
-    const audit = await api(`/api/playlists/${pid}/audit-embeds`);
+    const audit = await api(`/api/playlists/${Number(pid)}/audit-embeds?user_id=${Number(state.currentUserId)}`);
     (audit.tracks || []).forEach((t) => {
       state.embedAuditByVideoId[t.video_id] = {
         embeddable: Boolean(t.embeddable),
@@ -4283,6 +4283,15 @@ async function initApp() {
   state.currentRoute = parseHashRoute();
   updateNavHighlight(state.currentRoute.view);
   await refreshBootstrapSilently();
+  if (window.location.hash === '#not-invited') {
+    history.replaceState(null, '', '#feed');
+    state.currentRoute = parseHashRoute();
+    showToast('That Google account is not on the Webjam invite list yet. Ask a friend to invite you.');
+  } else if (window.location.hash === '#auth-error') {
+    history.replaceState(null, '', '#feed');
+    state.currentRoute = parseHashRoute();
+    showToast('Google sign-in was cancelled or failed. Please try again.');
+  }
   await renderCurrentRoute();
 }
 

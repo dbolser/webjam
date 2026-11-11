@@ -232,3 +232,6 @@ data/*.sqlite3
 # AI Agent Workspaces
 .agents/
 .gemini/
+
+# Claude Code worktrees
+.claude/worktrees/
