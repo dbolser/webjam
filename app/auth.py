@@ -12,8 +12,15 @@ when the app starts (it is never re-read per request):
 * ``demo`` -- the original persona switcher for local development. The client
   chooses the user and the password field is ignored entirely: anyone can act
   as anyone. Demo mode is only the default when WEBJAM_AUTH_MODE is unset AND no
-  Google variables are set, and it refuses to start on a database that already
-  holds Google-linked accounts.
+  Google, session-secret or base-URL variables are set. It refuses to start on a
+  database that already holds Google-linked accounts or with a WEBJAM_BASE_URL
+  that is not localhost, and it only answers requests from the loopback interface
+  (set WEBJAM_DEMO_ALLOW_REMOTE=1 to serve a trusted LAN on purpose).
+
+Sessions are bound to the database they were issued for (a random install id kept
+in the ``meta`` table), so wiping the database invalidates every old cookie. When
+restoring an older *backup*, also rotate WEBJAM_SESSION_SECRET: the backup's
+session epochs are older than the cookies that were revoked after it was taken.
 """
 
 import base64
@@ -79,24 +86,35 @@ def _client_secret() -> str:
     return os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 
 
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
 def load_config_from_env() -> AuthConfig:
     """Read and validate the auth environment. Raises AuthConfigError (fail closed)."""
     raw_mode = os.environ.get("WEBJAM_AUTH_MODE", "").strip().lower()
     has_google_vars = bool(_client_id() or _client_secret())
+    secret = os.environ.get("WEBJAM_SESSION_SECRET", "").strip()
+    base = os.environ.get("WEBJAM_BASE_URL", "").strip().rstrip("/")
     if not raw_mode:
         if os.environ.get("WEBJAM_DEMO_MODE", "").strip():
             raise AuthConfigError(
                 "WEBJAM_DEMO_MODE is no longer supported. Set WEBJAM_AUTH_MODE=demo or WEBJAM_AUTH_MODE=google."
             )
-        # Never fall back to demo just because one Google variable went missing.
-        mode = "google" if has_google_vars else "demo"
+        if has_google_vars:
+            # Never fall back to demo just because one Google variable went missing.
+            mode = "google"
+        elif secret or base:
+            # A session secret or public base URL means a real deployment: make the operator choose.
+            raise AuthConfigError(
+                "WEBJAM_SESSION_SECRET/WEBJAM_BASE_URL are set but WEBJAM_AUTH_MODE is not. "
+                "Set WEBJAM_AUTH_MODE=google (or WEBJAM_AUTH_MODE=demo for local development)."
+            )
+        else:
+            mode = "demo"
     elif raw_mode in ("google", "demo"):
         mode = raw_mode
     else:
         raise AuthConfigError(f"WEBJAM_AUTH_MODE must be 'google' or 'demo', not {raw_mode!r}.")
-
-    secret = os.environ.get("WEBJAM_SESSION_SECRET", "").strip()
-    base = os.environ.get("WEBJAM_BASE_URL", "").strip().rstrip("/")
 
     if mode == "google":
         missing = [
@@ -119,6 +137,11 @@ def load_config_from_env() -> AuthConfig:
             raise AuthConfigError("WEBJAM_BASE_URL must be an https:// URL (http:// is allowed only for localhost).")
         return AuthConfig(mode="google", session_secret=secret, base_url=base, https_only=True)
 
+    if base and urllib.parse.urlparse(base).hostname not in LOOPBACK_HOSTS:
+        raise AuthConfigError(
+            "Refusing demo mode with a non-localhost WEBJAM_BASE_URL: demo mode lets anyone act as anyone. "
+            "Use WEBJAM_AUTH_MODE=google for a public deployment."
+        )
     return AuthConfig(
         mode="demo",
         session_secret=secret or secrets.token_urlsafe(32),
@@ -146,6 +169,10 @@ def auth_mode() -> str:
 
 def auth_enabled() -> bool:
     return auth_mode() == "google"
+
+
+def demo_allows_remote() -> bool:
+    return os.environ.get("WEBJAM_DEMO_ALLOW_REMOTE", "").strip() == "1"
 
 
 def check_demo_mode_allowed(conn: sqlite3.Connection) -> None:
@@ -187,19 +214,44 @@ def session_user_id(request: Request) -> Optional[int]:
         epoch = int(epoch_val) if epoch_val is not None else -1
     except (TypeError, ValueError):
         uid, epoch = 0, -1
-    if uid > 0 and epoch >= 0:
+    install_val = request.session.get("db")
+    if uid > 0 and epoch >= 0 and isinstance(install_val, str) and install_val:
         conn = get_connection()
         try:
-            row = conn.execute("SELECT session_epoch FROM users WHERE id = ?", (uid,)).fetchone()
+            # One query: the user exists, the epoch is current, the cookie was issued by
+            # this database (not one that was wiped), and their Google email is still invited.
+            row = conn.execute(
+                """
+                SELECT u.session_epoch,
+                       (SELECT value FROM meta WHERE key = 'install_id') AS install_id,
+                       EXISTS (
+                           SELECT 1 FROM google_accounts ga JOIN invites i ON i.email = ga.email
+                           WHERE ga.user_id = u.id
+                       ) AS invited
+                FROM users u WHERE u.id = ?
+                """,
+                (uid,),
+            ).fetchone()
         finally:
             conn.close()
-        if row is not None and int(row["session_epoch"] or 0) == epoch:
+        if (
+            row is not None
+            and int(row["session_epoch"] or 0) == epoch
+            and row["install_id"] == install_val
+            and row["invited"]
+        ):
             result = uid
     if result is None and (uid_val is not None or epoch_val is not None):
         request.session.pop("uid", None)
         request.session.pop("ep", None)
+        request.session.pop("db", None)
     request.state.webjam_session_uid = result
     return result
+
+
+def install_id(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'install_id'").fetchone()
+    return row["value"] if row else ""
 
 
 def start_session(request: Request, conn: sqlite3.Connection, uid: int) -> None:
@@ -207,6 +259,7 @@ def start_session(request: Request, conn: sqlite3.Connection, uid: int) -> None:
     request.session.clear()
     request.session["uid"] = uid
     request.session["ep"] = int(row["session_epoch"] or 0) if row else 0
+    request.session["db"] = install_id(conn)
     request.state.webjam_session_uid = uid
 
 
@@ -219,6 +272,15 @@ def resolve_actor(request: Request, claimed_user_id: Optional[int]) -> int:
         return uid
     if not claimed_user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
+    conn = get_connection()
+    try:
+        exists = conn.execute("SELECT 1 FROM users WHERE id = ?", (int(claimed_user_id),)).fetchone()
+    except OverflowError:
+        exists = None
+    finally:
+        conn.close()
+    if not exists:
+        raise HTTPException(status_code=404, detail="User not found")
     return int(claimed_user_id)
 
 
@@ -239,11 +301,26 @@ def slugify_handle(text: str) -> str:
 
 
 def handle_taken(cur: sqlite3.Cursor, handle: str, exclude_user_id: Optional[int] = None) -> bool:
+    """In use by someone else, or released by someone else (old feed lines still say
+    '@handle', so a freed handle is never handed to a different user)."""
     cur.execute(
-        "SELECT id FROM users WHERE LOWER(username) = ? AND id != ?",
-        (handle.lower(), exclude_user_id or 0),
+        """
+        SELECT 1 FROM users WHERE LOWER(username) = ? AND id != ?
+        UNION ALL
+        SELECT 1 FROM handle_history WHERE handle = ? AND user_id != ?
+        LIMIT 1
+        """,
+        (handle.lower(), exclude_user_id or 0, handle.lower(), exclude_user_id or 0),
     )
     return cur.fetchone() is not None
+
+
+def release_handle(cur: sqlite3.Cursor, handle: str, user_id: int, now: str) -> None:
+    """Reserve a handle someone is giving up, so only they can take it back."""
+    cur.execute(
+        "INSERT OR IGNORE INTO handle_history (handle, user_id, released_at) VALUES (?, ?, ?)",
+        ((handle or "").lower(), user_id, now),
+    )
 
 
 def unique_handle(cur: sqlite3.Cursor, display_name: str) -> str:
@@ -315,6 +392,48 @@ def upsert_google_user(conn: sqlite3.Connection, info: Dict[str, Any], granted_s
     )
     conn.commit()
     return uid
+
+
+def _legacy_email_handle(email: str) -> str:
+    """The handle the pre-Phase 0 sign-in code derived from the email local part."""
+    return re.sub(r"[^a-z0-9_]", "", (email or "").split("@")[0].lower())[:20]
+
+
+def migrate_legacy_google_accounts(conn: sqlite3.Connection) -> int:
+    """One-time cleanup of accounts created by the first Google sign-in code.
+
+    * Drops any stored Google access/refresh tokens: sign-in no longer asks for
+      YouTube access, and nothing should keep using the old youtube.readonly grant.
+    * Renames handles that were derived from the email local part (they leak the
+      address) to a handle derived from the display name. Runs once per database.
+    Returns how many handles were renamed.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE google_accounts SET access_token = NULL, refresh_token = NULL, token_expires_at = 0 "
+        "WHERE access_token IS NOT NULL OR refresh_token IS NOT NULL"
+    )
+    if cur.execute("SELECT 1 FROM meta WHERE key = 'legacy_handles_migrated'").fetchone():
+        conn.commit()
+        return 0
+    renamed = 0
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    rows = cur.execute(
+        "SELECT u.id, u.username, u.display_name, ga.email FROM users u JOIN google_accounts ga ON ga.user_id = u.id"
+    ).fetchall()
+    for row in rows:
+        legacy = _legacy_email_handle(row["email"])
+        uname = (row["username"] or "").lower()
+        if legacy and (uname == legacy or re.fullmatch(re.escape(legacy) + r"\d+", uname)):
+            new_handle = unique_handle(cur, row["display_name"] or "")
+            release_handle(cur, uname, row["id"], now)
+            cur.execute("UPDATE users SET username = ? WHERE id = ?", (new_handle, row["id"]))
+            renamed += 1
+    cur.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('legacy_handles_migrated', ?)", (now,))
+    conn.commit()
+    if renamed:
+        logger.warning("Renamed %d handle(s) that were derived from email addresses", renamed)
+    return renamed
 
 
 def has_youtube_access(acct: Optional[sqlite3.Row]) -> bool:
@@ -409,27 +528,34 @@ async def google_callback(
     if not code or not verifier:
         raise HTTPException(status_code=400, detail="Invalid or expired sign-in attempt. Please try again.")
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        tok_resp = await client.post(
-            GOOGLE_TOKEN_URL,
-            data={
-                "client_id": _client_id(),
-                "client_secret": _client_secret(),
-                "code": code,
-                "code_verifier": verifier,
-                "grant_type": "authorization_code",
-                "redirect_uri": redirect_uri(request),
-            },
-        )
-        if tok_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Google sign-in failed while exchanging the code.")
-        tokens = tok_resp.json()
-        info_resp = await client.get(
-            GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {tokens['access_token']}"}
-        )
-        if info_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Could not read your Google profile.")
-        info = info_resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            tok_resp = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "client_id": _client_id(),
+                    "client_secret": _client_secret(),
+                    "code": code,
+                    "code_verifier": verifier,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri(request),
+                },
+            )
+            if tok_resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Google sign-in failed while exchanging the code.")
+            tokens = tok_resp.json()
+            access_token = tokens.get("access_token") if isinstance(tokens, dict) else None
+            if not access_token:
+                raise HTTPException(status_code=400, detail="Google sign-in failed while exchanging the code.")
+            info_resp = await client.get(GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
+            if info_resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Could not read your Google profile.")
+            info = info_resp.json()
+            if not isinstance(info, dict):
+                raise ValueError("unexpected userinfo payload")
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Google sign-in failed talking to Google: %s", type(exc).__name__)
+        return RedirectResponse("/#auth-error", status_code=303)
 
     email = (info.get("email") or "").strip().lower()
     verified = info.get("email_verified") in (True, "true")
@@ -438,7 +564,7 @@ async def google_callback(
         request.session.clear()
         return RedirectResponse("/#not-invited", status_code=303)
 
-    uid = upsert_google_user(conn, info, tokens.get("scope", ""))
+    uid = upsert_google_user(conn, info, str(tokens.get("scope", "") or ""))
     start_session(request, conn, uid)
     return RedirectResponse("/", status_code=303)
 

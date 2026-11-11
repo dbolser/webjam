@@ -1,9 +1,11 @@
 import asyncio
+import ipaddress
 import logging
 import re
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,13 +21,18 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import (
+    LOOPBACK_HOSTS,
     SESSION_MAX_AGE,
     auth_enabled,
     auth_mode,
     check_demo_mode_allowed,
     configure_from_env,
+    demo_allows_remote,
     get_config,
     handle_taken,
+    has_youtube_access,
+    migrate_legacy_google_accounts,
+    release_handle,
     resolve_actor,
     resolve_viewer,
     router as auth_router,
@@ -35,8 +42,11 @@ from app.auth import (
 
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
 from app.database import get_connection, get_db, init_db
-from app.invite import seed_invites_from_env
+from app.invite import list_invites, seed_invites_from_env
 from app.youtube import (
+    MAX_CLIP_SECONDS,
+    SearchBudgetExceeded,
+    cached_search_results,
     check_video_embeddability,
     clean_migration_query,
     extract_video_entries,
@@ -69,7 +79,8 @@ COMMENTS_PAGE_SIZE = 50
 
 # --- Rate limits: bucket -> (burst capacity, tokens refilled per second) ---
 RATE_LIMITS: Dict[str, Tuple[float, float]] = {
-    "search": (20, 20 / 60),
+    # Only searches that miss the cache are charged (auto-migrate repeats queries).
+    "search": (30, 30 / 60),
     "inspect": (6, 6 / 60),
     "add": (30, 30 / 60),
     "comment": (10, 5 / 60),
@@ -83,24 +94,29 @@ TRUSTED_PROXIES = {"127.0.0.1", "::1"}
 
 
 class TokenBucketLimiter:
-    """Small in-process token bucket. Good enough for one uvicorn worker."""
+    """Small in-process token bucket. Good enough for one uvicorn worker.
 
-    def __init__(self) -> None:
-        self._buckets: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    Buckets live in an LRU of at most `max_buckets` keys, so memory is bounded and
+    eviction is O(1). An evicted key just starts again with a full bucket.
+    """
+
+    def __init__(self, max_buckets: int = 50_000) -> None:
+        self._buckets: "OrderedDict[Tuple[str, str], Tuple[float, float]]" = OrderedDict()
         self._lock = threading.Lock()
+        self.max_buckets = max_buckets
 
     def allow(self, key: Tuple[str, str], capacity: float, refill_per_sec: float) -> Tuple[bool, float]:
         now = time.monotonic()
         with self._lock:
-            if len(self._buckets) > 50_000:
-                cutoff = now - 3600
-                self._buckets = {k: v for k, v in self._buckets.items() if v[1] > cutoff}
             tokens, last = self._buckets.get(key, (capacity, now))
             tokens = min(capacity, tokens + (now - last) * refill_per_sec)
-            if tokens >= 1:
-                self._buckets[key] = (tokens - 1, now)
+            allowed = tokens >= 1
+            self._buckets[key] = (tokens - 1 if allowed else tokens, now)
+            self._buckets.move_to_end(key)
+            while len(self._buckets) > self.max_buckets:
+                self._buckets.popitem(last=False)
+            if allowed:
                 return True, 0.0
-            self._buckets[key] = (tokens, now)
             return False, (1 - tokens) / refill_per_sec
 
     def reset(self) -> None:
@@ -130,6 +146,19 @@ def client_ip(request: Request) -> str:
     return peer or "unknown"
 
 
+def ip_key(ip: str) -> str:
+    """IPv4 addresses as-is; IPv6 by /64, since one client usually owns a whole /64."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
 def viewer_key(request: Request) -> str:
     """Who is calling, for rate limits and play dedupe: the signed-in user, else the client IP.
 
@@ -139,7 +168,7 @@ def viewer_key(request: Request) -> str:
         uid = session_user_id(request)
         if uid:
             return f"u:{uid}"
-    return f"ip:{client_ip(request)}"
+    return f"ip:{ip_key(client_ip(request))}"
 
 
 def enforce_rate_limit(request: Request, bucket: str) -> None:
@@ -214,6 +243,47 @@ def csrf_failure(scope) -> Optional[str]:
         if not ok:
             return "Cross-origin request refused."
     return None
+
+
+def _is_loopback_peer(host: str) -> bool:
+    if host == "testclient":  # Starlette's TestClient
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class DemoLoopbackMiddleware:
+    """Demo mode lets anyone act as anyone, so it only serves this machine.
+
+    Refuses requests from a non-loopback peer, requests relayed by a proxy, and
+    requests whose Host is not a localhost name (DNS rebinding).
+    WEBJAM_DEMO_ALLOW_REMOTE=1 turns this off for a trusted LAN.
+    """
+
+    ALLOWED_HOSTS = set(LOOPBACK_HOSTS) | {"testserver"}
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and get_config().mode == "demo" and not demo_allows_remote():
+            headers = Headers(scope=scope)
+            peer = (scope.get("client") or ("", 0))[0] or ""
+            host = urllib.parse.urlsplit("//" + headers.get("host", "")).hostname or ""
+            if (
+                not _is_loopback_peer(peer)
+                or "x-forwarded-for" in headers
+                or "forwarded" in headers
+                or host not in self.ALLOWED_HOSTS
+            ):
+                return await _send_json(
+                    scope, receive, send, 403,
+                    "Demo mode only serves localhost. Use WEBJAM_AUTH_MODE=google to share Webjam "
+                    "(or set WEBJAM_DEMO_ALLOW_REMOTE=1 on a trusted network).",
+                )
+        await self.app(scope, receive, send)
 
 
 class CSRFMiddleware:
@@ -314,7 +384,9 @@ async def lifespan(app: FastAPI):
     conn = get_connection()
     try:
         check_demo_mode_allowed(conn)
+        migrate_legacy_google_accounts(conn)
         seed_invites_from_env(conn)
+        invite_count = len(list_invites(conn))
     finally:
         conn.close()
     reset_rate_limits()
@@ -322,6 +394,11 @@ async def lifespan(app: FastAPI):
         logger.warning("Webjam auth mode: DEMO — anyone can act as anyone. Never expose this instance publicly.")
     else:
         logger.warning("Webjam auth mode: google (invite-only), base URL %s", cfg.base_url)
+        if invite_count == 0:
+            logger.warning(
+                "No invites: nobody (including you) can sign in. Set WEBJAM_INVITE_EMAILS or run "
+                "`python -m app.invite add you@example.com`."
+            )
     yield
 
 
@@ -330,8 +407,15 @@ app = FastAPI(title="Webjam — Social YouTube Playlist Curation", lifespan=life
 app.add_middleware(ConfiguredSessionMiddleware)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(DemoLoopbackMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(auth_router)
+
+
+@app.exception_handler(OverflowError)
+async def _integer_out_of_range(request: Request, exc: OverflowError):
+    # A huge id/number reached SQLite ("Python int too large to convert to SQLite INTEGER").
+    return JSONResponse({"detail": "A number in the request is out of range."}, status_code=400)
 
 
 def now_str() -> str:
@@ -370,6 +454,7 @@ LongText = Annotated[str, Field(max_length=MAX_TEXT)]
 UrlBlob = Annotated[str, Field(max_length=MAX_URL_BLOB)]
 VideoRef = Annotated[str, Field(max_length=2048)]  # an id or one URL
 TimeValue = Optional[Union[int, float, Annotated[str, Field(max_length=32)]]]
+ClipSeconds = Optional[Annotated[int, Field(ge=0, le=MAX_CLIP_SECONDS)]]
 
 
 class LoginRequest(BaseModel):
@@ -456,12 +541,12 @@ class ReorderTracksRequest(BaseModel):
 
 
 class SnapshotTrackItem(BaseModel):
-    id: Optional[int] = None
+    id: Optional[Annotated[int, Field(ge=1, le=2**53)]] = None
     video_id: Annotated[str, Field(max_length=32)]
     position: Optional[int] = None
     track_note: Optional[LongText] = ""
-    start_seconds: Optional[int] = None
-    end_seconds: Optional[int] = None
+    start_seconds: ClipSeconds = None
+    end_seconds: ClipSeconds = None
     migrated_from_video_id: Optional[Annotated[str, Field(max_length=32)]] = None
     migrated_from_title: Optional[Annotated[str, Field(max_length=500)]] = None
     display_title: Optional[Title] = None
@@ -545,12 +630,50 @@ def fetch_comments_page(
 class VideoLookupFailed(Exception):
     """YouTube had no metadata for this id (deleted, private or never existed)."""
 
+    reason = "not_found"
+
+
+class VideoLookupUnavailable(VideoLookupFailed):
+    """YouTube could not be asked right now (network error, 429/5xx). Worth retrying."""
+
+    reason = "youtube_unavailable"
+
+
+NOT_FOUND_DETAIL = "YouTube couldn't find that video (it may be private, deleted or mistyped)."
+UNAVAILABLE_DETAIL = "YouTube isn't answering right now. Please try again in a moment."
+
+
+def lookup_failure(exc: VideoLookupFailed) -> HTTPException:
+    if isinstance(exc, VideoLookupUnavailable):
+        return HTTPException(status_code=503, detail=UNAVAILABLE_DETAIL, headers={"Retry-After": "30"})
+    return HTTPException(status_code=400, detail=NOT_FOUND_DETAIL)
+
 
 async def lookup_new_song_metadata(video_id: str) -> Dict[str, Any]:
     meta = await fetch_youtube_metadata(video_id)
+    if meta and meta.get("status") == "UNAVAILABLE":
+        raise VideoLookupUnavailable(video_id)
     if not meta or meta.get("status") == "NOT_FOUND" or not meta.get("title"):
         raise VideoLookupFailed(video_id)
     return meta
+
+
+def insert_song_if_new(
+    conn: sqlite3.Connection, video_id: str, meta: Dict[str, Any], user_id: int, playlist_id: int, ts: str
+) -> Tuple[bool, sqlite3.Row]:
+    """Insert a song row unless another request beat us to it. Returns (inserted, row)."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(video_id) DO NOTHING
+        """,
+        (video_id, meta["title"], meta["channel_title"], meta["thumbnail_url"], user_id, playlist_id, ts),
+    )
+    inserted = cur.rowcount > 0
+    row = cur.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,)).fetchone()
+    return inserted, row
 
 
 def clean_display_title(custom_title: Optional[str], song_title: Optional[str]) -> Optional[str]:
@@ -630,23 +753,13 @@ async def add_single_video_to_playlist(
         # songs.title always comes from YouTube; a custom title only applies to this row.
         # Raises VideoLookupFailed before anything is written when YouTube has no such video.
         meta = await lookup_new_song_metadata(video_id)
-        cur.execute(
-            """
-            INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                video_id,
-                meta["title"],
-                meta["channel_title"],
-                meta["thumbnail_url"],
-                user_id,
-                playlist_id,
-                ts,
-            ),
-        )
-        is_new_discovery = True
-        song_title = meta["title"]
+        # Another request may have added the same new video while we were waiting on YouTube.
+        is_new_discovery, song_row = insert_song_if_new(conn, video_id, meta, user_id, playlist_id, ts)
+        song_title = song_row["title"]
+    else:
+        song_title = song_row["title"]
+
+    if is_new_discovery:
         cur.execute(
             """
             INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -659,8 +772,6 @@ async def add_single_video_to_playlist(
                 ts,
             ),
         )
-    else:
-        song_title = song_row["title"]
 
     display_title = clean_display_title(custom_title, song_title)
 
@@ -792,6 +903,14 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
             # 'demo' means anyone can act as anyone; the UI should say so.
             "mode": auth_mode(),
             "signed_in": bool(auth_enabled() and current_user["id"]),
+            # False until incremental YouTube consent ships (Phase 4): hide "My YouTube".
+            "youtube_connected": bool(
+                auth_enabled()
+                and current_user["id"]
+                and has_youtube_access(
+                    cur.execute("SELECT * FROM google_accounts WHERE user_id = ?", (current_user["id"],)).fetchone()
+                )
+            ),
         },
     }
 
@@ -855,11 +974,14 @@ def update_my_handle(req: UpdateHandleRequest, request: Request, conn: sqlite3.C
     uid = resolve_actor(request, req.user_id)
     handle = validate_handle(req.handle)
     cur = conn.cursor()
-    if not cur.execute("SELECT 1 FROM users WHERE id = ?", (uid,)).fetchone():
+    me = cur.execute("SELECT username FROM users WHERE id = ?", (uid,)).fetchone()
+    if not me:
         raise HTTPException(status_code=404, detail="User not found")
     if handle_taken(cur, handle, exclude_user_id=uid):
         raise HTTPException(status_code=409, detail="That handle is taken.")
     try:
+        if (me["username"] or "").lower() != handle:
+            release_handle(cur, me["username"], uid, now_str())
         cur.execute("UPDATE users SET username = ? WHERE id = ?", (handle, uid))
         conn.commit()
     except sqlite3.IntegrityError:
@@ -1148,8 +1270,8 @@ async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sq
                 start_seconds=entry["start_seconds"],
                 end_seconds=entry["end_seconds"],
             )
-        except VideoLookupFailed:
-            skipped.append({"video_id": entry["video_id"], "reason": "not_found"})
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": entry["video_id"], "reason": exc.reason})
             continue
         added_tracks.append(res)
 
@@ -1259,16 +1381,15 @@ async def add_tracks_to_playlist(
                 source_playlist_id=src[0] if src else None,
                 source_user_id=src[1] if src else None,
             )
-        except VideoLookupFailed:
-            skipped.append({"video_id": vid, "reason": "not_found"})
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": vid, "reason": exc.reason})
             continue
         results.append(res)
 
     if not results:
-        raise HTTPException(
-            status_code=400,
-            detail="YouTube couldn't find that video (it may be private, deleted or mistyped).",
-        )
+        if any(s["reason"] == VideoLookupUnavailable.reason for s in skipped):
+            raise lookup_failure(VideoLookupUnavailable())
+        raise lookup_failure(VideoLookupFailed())
 
     # Evaluate badges for the user who added/grabbed the track
     new_badges = evaluate_and_award_badges(conn, req.user_id)
@@ -1300,6 +1421,8 @@ async def update_playlist_track(
 ):
     req.user_id = resolve_actor(request, req.user_id)
     require_playlist_owner(conn, playlist_id, req.user_id)
+    if req.new_video_id and req.new_video_id.strip():
+        enforce_rate_limit(request, "add")  # a swap can cost a YouTube lookup, like an add
     cur = conn.cursor()
     cur.execute(
         """
@@ -1337,28 +1460,16 @@ async def update_playlist_track(
         if not srow:
             try:
                 meta = await lookup_new_song_metadata(new_vid)
-            except VideoLookupFailed:
-                raise HTTPException(
-                    status_code=400,
-                    detail="YouTube couldn't find that video (it may be private, deleted or mistyped).",
-                )
-            cur.execute(
-                """
-                INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    new_vid,
-                    meta["title"],
-                    meta["channel_title"],
-                    meta["thumbnail_url"],
-                    req.user_id,
-                    playlist_id,
-                    ts,
-                ),
-            )
-            migrated_title = meta["title"]
-            migrated_channel = meta["channel_title"]
+            except VideoLookupFailed as exc:
+                raise lookup_failure(exc)
+            inserted, srow = insert_song_if_new(conn, new_vid, meta, req.user_id, playlist_id, ts)
+            migrated_title = srow["title"]
+            migrated_channel = srow["channel_title"]
+        else:
+            migrated_title = srow["title"]
+            migrated_channel = srow["channel_title"]
+            inserted = False
+        if inserted:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -1371,9 +1482,6 @@ async def update_playlist_track(
                     ts,
                 ),
             )
-        else:
-            migrated_title = srow["title"]
-            migrated_channel = srow["channel_title"]
 
         # The custom title (if any) is this row's display title; it never renames the song.
         new_display_title = clean_display_title(req.custom_title, migrated_title)
@@ -1393,13 +1501,23 @@ async def update_playlist_track(
                     else ""
                 )
 
+        # Grab credit ("from @someone") only survives a swap if the source playlist really
+        # has the new video; otherwise any song could be passed off as theirs.
+        source_pid, source_uid = track["source_playlist_id"], track["source_user_id"]
+        if new_vid != track["video_id"] and source_pid:
+            src = verified_source(conn, source_pid, new_vid)
+            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
+        elif new_vid != track["video_id"]:
+            source_pid, source_uid = None, None
+
         cur.execute(
             """
             UPDATE playlist_tracks
-            SET video_id = ?, migrated_from_video_id = ?, migrated_from_title = ?, display_title = ?
+            SET video_id = ?, migrated_from_video_id = ?, migrated_from_title = ?, display_title = ?,
+                source_playlist_id = ?, source_user_id = ?
             WHERE id = ? AND playlist_id = ?
             """,
-            (new_vid, orig_from_vid, orig_from_title, new_display_title, track_id, playlist_id),
+            (new_vid, orig_from_vid, orig_from_title, new_display_title, source_pid, source_uid, track_id, playlist_id),
         )
         migrated_video_id = new_vid
     elif req.custom_title is not None:
@@ -1479,6 +1597,9 @@ async def inspect_playlist_import(req: InspectPlaylistImportRequest, request: Re
         return report
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPError as exc:
+        logger.warning("Playlist inspect failed talking to YouTube: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Couldn't reach YouTube. Please try again in a moment.")
 
 
 @app.post("/api/playlists/import/commit", dependencies=[rate_limit("add")])
@@ -1547,8 +1668,8 @@ async def commit_playlist_import(
                 migrated_from_video_id=item.migrated_from_video_id,
                 migrated_from_title=item.migrated_from_title,
             )
-        except VideoLookupFailed:
-            skipped.append({"video_id": vid, "reason": "not_found"})
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": vid, "reason": exc.reason})
             continue
         added_tracks.append(res)
 
@@ -1608,19 +1729,20 @@ async def audit_playlist_embeds(
         infos = dict(zip(unique_ids, await asyncio.gather(*(check_one(v) for v in unique_ids))))
 
     audited = []
+    suggestions: Dict[Tuple[str, str], str] = {}
     for r in rows:
         info = infos.get(r["video_id"]) or {}
         base_title = r.get("migrated_from_title") or r["title"] or info.get("title") or r["video_id"]
+        channel = "" if r.get("migrated_from_title") else (r["channel_title"] or info.get("channel_title") or "")
+        if (base_title, channel) not in suggestions:
+            suggestions[(base_title, channel)] = clean_migration_query(base_title, channel)
         audited.append(
             {
                 **r,
                 "embeddable": bool(info.get("embeddable")),
                 "status": info.get("status", "UNKNOWN"),
                 "reason": info.get("reason"),
-                "suggested_query": clean_migration_query(
-                    base_title,
-                    "" if r.get("migrated_from_title") else (r["channel_title"] or info.get("channel_title") or ""),
-                ),
+                "suggested_query": suggestions[(base_title, channel)],
             }
         )
 
@@ -1734,10 +1856,19 @@ def restore_playlist_snapshot(
         if known != video_ids:
             raise HTTPException(status_code=400, detail="Snapshot contains a track that isn't on Webjam.")
 
+    for t in req.tracks:
+        if t.start_seconds is not None and t.end_seconds is not None and t.end_seconds <= t.start_seconds:
+            raise HTTPException(status_code=400, detail="End time must be greater than start time.")
+
     existing = {
         r["id"]: r
         for r in cur.execute("SELECT * FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)).fetchall()
     }
+    # A client id is only reused for a row that once existed (undoing a delete), never
+    # above the highest id SQLite has handed out: an id near 2^63 would make every
+    # later AUTOINCREMENT insert fail with SQLITE_FULL for the whole site.
+    seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'playlist_tracks'").fetchone()
+    max_issued_id = int(seq_row["seq"]) if seq_row else 0
 
     ts = now_str()
     cur.execute(
@@ -1750,15 +1881,24 @@ def restore_playlist_snapshot(
     for idx, t in enumerate(req.tracks, start=1):
         orig = existing.get(t.id) if t.id is not None and t.id not in used_ids else None
         row_id: Optional[int] = None
-        if orig is not None:
+        if orig is not None and orig["video_id"] == t.video_id:
             row_id = orig["id"]
             added_by = orig["added_by_user_id"]
             source_pid, source_uid = orig["source_playlist_id"], orig["source_user_id"]
             created_at = orig["created_at"]
-            fallback_display = orig["display_title"] if orig["video_id"] == t.video_id else None
+            fallback_display = orig["display_title"]
+        elif orig is not None:
+            # Same row, different song (e.g. undoing a swap): its grab credit only carries
+            # over if the source playlist really contains this song.
+            row_id = orig["id"]
+            added_by = orig["added_by_user_id"]
+            src = verified_source(conn, orig["source_playlist_id"] or t.source_playlist_id, t.video_id)
+            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
+            created_at = orig["created_at"]
+            fallback_display = None
         else:
             # Reuse a client id only if no row anywhere holds it (e.g. undoing a delete).
-            if t.id is not None and t.id > 0 and t.id not in used_ids:
+            if t.id is not None and t.id <= max_issued_id and t.id not in used_ids:
                 if not cur.execute("SELECT 1 FROM playlist_tracks WHERE id = ?", (t.id,)).fetchone():
                     row_id = t.id
             added_by = req.user_id
@@ -2023,8 +2163,11 @@ def _play_badge_eval_due(owner_id: int) -> bool:
 def record_playlist_play(
     playlist_id: int, req: RecordPlayRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
-    """Count one play. req.count is ignored; the same listener (user, else IP) counts at
-    most once per playlist+track every 30 minutes, and video_id must be in the playlist."""
+    """Count one play. req.count is ignored and video_id must be in the playlist.
+
+    The playlist's play count goes up at most once per listener (user, else IP) per
+    playlist every 30 minutes, and never for the owner's own listening (it feeds
+    badges). A song's total_plays counts once per listener+track per 30 minutes."""
     cur = conn.cursor()
     cur.execute("SELECT id, user_id, plays FROM playlists WHERE id = ?", (playlist_id,))
     pl = cur.fetchone()
@@ -2041,22 +2184,29 @@ def record_playlist_play(
             raise HTTPException(status_code=400, detail="That track isn't in this playlist.")
 
     key = viewer_key(request)
+    is_owner = auth_enabled() and session_user_id(request) == pl["user_id"]
     now = int(time.time())
+    since = now - PLAY_DEDUPE_SECONDS
     with _play_record_lock:
-        cur.execute("DELETE FROM play_events WHERE at < ?", (now - PLAY_DEDUPE_SECONDS,))
-        recent = cur.execute(
-            "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND video_id = ? AND at >= ?",
-            (key, playlist_id, video_id, now - PLAY_DEDUPE_SECONDS),
+        cur.execute("DELETE FROM play_events WHERE at < ?", (since,))
+        playlist_recent = cur.execute(
+            "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND at >= ?",
+            (key, playlist_id, since),
         ).fetchone()
-        counted = recent is None
-        if counted:
+        track_recent = playlist_recent and cur.execute(
+            "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND video_id = ? AND at >= ?",
+            (key, playlist_id, video_id, since),
+        ).fetchone()
+        counted = playlist_recent is None and not is_owner
+        if not track_recent:
             cur.execute(
                 "INSERT INTO play_events (viewer_key, playlist_id, video_id, at) VALUES (?, ?, ?, ?)",
                 (key, playlist_id, video_id, now),
             )
-            cur.execute("UPDATE playlists SET plays = plays + 1 WHERE id = ?", (playlist_id,))
             if video_id:
                 cur.execute("UPDATE songs SET total_plays = total_plays + 1 WHERE video_id = ?", (video_id,))
+        if counted:
+            cur.execute("UPDATE playlists SET plays = plays + 1 WHERE id = ?", (playlist_id,))
         conn.commit()
 
     owner_badges = (
@@ -2333,7 +2483,7 @@ def resolve_comment_target(conn: sqlite3.Connection, target_type: str, target_id
     cur = conn.cursor()
     raw = (target_id or "").strip()
     if target_type in ("playlist", "profile"):
-        if not raw.isdigit() or len(raw) > 18:
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 18:
             raise HTTPException(status_code=400, detail=f"Invalid {target_type} id")
         num = int(raw)
         if target_type == "playlist":
@@ -2405,12 +2555,25 @@ def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Co
     }
 
 
-@app.get("/api/youtube/search", dependencies=[rate_limit("search")])
+@app.get("/api/youtube/search")
 async def search_youtube_embeddable(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(8, ge=1, le=15),
 ):
-    results = await search_embeddable_youtube_songs(q, max_results=limit)
+    if auth_enabled():
+        # Guests can't add tracks, and every search spends shared YouTube quota.
+        resolve_actor(request, None)
+    results = cached_search_results(q, max_results=limit)
+    if results is None:
+        enforce_rate_limit(request, "search")  # only cache misses cost anything
+        try:
+            results = await search_embeddable_youtube_songs(q, max_results=limit)
+        except SearchBudgetExceeded:
+            raise HTTPException(
+                status_code=503,
+                detail="Webjam's YouTube search budget for today is used up. Paste a YouTube link instead, or try again tomorrow.",
+            )
     return {"query": q, "results": results}
 
 

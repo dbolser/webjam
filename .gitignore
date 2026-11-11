@@ -225,6 +225,13 @@ Thumbs.db
 *.sqlite3
 *.db-journal
 *.sqlite3-journal
+# SQLite WAL sidecars (journal_mode=WAL) hold uncommitted pages of the database
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 data/*.db
 data/*.sqlite3
 !data/.gitkeep

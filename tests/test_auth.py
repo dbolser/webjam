@@ -83,7 +83,7 @@ def sign_in(client):
 
 def test_anonymous_is_guest_and_cannot_write(client):
     boot = client.get("/api/bootstrap?user_id=1").json()
-    assert boot["auth"] == {"mode": "google", "signed_in": False}
+    assert boot["auth"] == {"mode": "google", "signed_in": False, "youtube_connected": False}
     assert boot["current_user"]["id"] == 0  # ?user_id=1 is ignored
 
     assert client.post("/api/playlists", json={"user_id": 1, "title": "x"}).status_code == 401

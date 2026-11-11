@@ -1,6 +1,9 @@
 import hashlib
+import logging
 import os
+import secrets
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Generator
 
@@ -9,6 +12,8 @@ from app.badges import evaluate_and_award_badges
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = Path(os.environ.get("WEBJAM_DB_PATH", str(DATA_DIR / "webjam.db")))
+
+logger = logging.getLogger("webjam.database")
 
 
 def hash_password(password: str) -> str:
@@ -29,6 +34,29 @@ def _ensure_private_db_file(path: Path) -> None:
         os.chmod(str(path), 0o600)
 
 
+def tighten_db_permissions(path: Path) -> None:
+    """Make an existing DB (and its -wal/-shm sidecars) private to the service user.
+
+    _ensure_private_db_file only sets modes on files it creates, so a database that
+    predates it (or was copied in) may still be group/world readable.
+    """
+    getuid = getattr(os, "getuid", None)
+    for p in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            continue
+        if stat.S_IMODE(st.st_mode) & 0o077 and (getuid is None or st.st_uid == getuid()):
+            os.chmod(p, 0o600)
+            logger.warning("Tightened permissions on %s to 0600", p)
+    try:
+        parent_mode = stat.S_IMODE(os.stat(path.parent).st_mode)
+    except FileNotFoundError:
+        return
+    if parent_mode & 0o077:
+        logger.warning("Database directory %s is readable by other users (mode %o); consider chmod 700", path.parent, parent_mode)
+
+
 def get_connection() -> sqlite3.Connection:
     _ensure_private_db_file(DB_PATH)
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=5.0)
@@ -47,6 +75,11 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
 
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
@@ -56,6 +89,14 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT DEFAULT '',
     session_epoch INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
+);
+
+-- Handles a user gave up. Only that user can take one back: old activity lines
+-- still say '@handle', so it must never point at somebody else.
+CREATE TABLE IF NOT EXISTS handle_history (
+    handle TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    released_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS invites (
@@ -406,7 +447,12 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL;")  # persistent; concurrent readers + one writer
         conn.executescript(SCHEMA_SQL)
+        # A random id per database: sessions carry it, so a wiped DB rejects old cookies.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('install_id', ?)", (secrets.token_urlsafe(16),)
+        )
         conn.commit()
+        tighten_db_permissions(DB_PATH)
         ensure_playlist_track_clip_columns(conn)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS cnt FROM users")

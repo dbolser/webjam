@@ -357,12 +357,21 @@ def test_no_google_tokens_are_stored(google):
     assert row["access_token"] is None and row["refresh_token"] is None
 
 
-def test_state_is_single_use(google):
+def test_state_is_single_use(google, monkeypatch):
+    """The callback consumes its state even when sign-in then fails, so the same
+    browser cannot retry it. (Replaying a cookie captured *before* the callback is
+    not prevented by this: sessions are client-side; Google's code is single-use.)"""
     login = google.get("/auth/google/login", follow_redirects=False)
     state = urllib.parse.parse_qs(urllib.parse.urlparse(login.headers["location"]).query)["state"][0]
-    assert google.get("/auth/google/callback", params={"code": "c", "state": state}, follow_redirects=False).status_code == 303
-    google.post("/auth/logout")
-    assert google.get("/auth/google/callback", params={"code": "c", "state": state}).status_code == 400
+
+    async def failing_post(self, url, data=None, **kwargs):
+        return FakeResponse(400, {"error": "invalid_grant"})
+
+    monkeypatch.setattr(FakeGoogle, "post", failing_post)
+    first = google.get("/auth/google/callback", params={"code": "c", "state": state})
+    assert first.status_code == 400 and "exchanging the code" in first.json()["detail"]
+    retry = google.get("/auth/google/callback", params={"code": "c", "state": state})
+    assert retry.status_code == 400 and "Invalid or expired" in retry.json()["detail"]
 
 
 # --- #9 session epoch / revocation, #10 Secure cookie -------------------------
@@ -752,8 +761,13 @@ def test_play_counts_once_and_dedupes(demo):
     assert first["plays"] == start + 1 and first["counted"] is True
     again = demo.post("/api/playlists/1/play", json={"video_id": "0PsOJ_fRckg"}).json()
     assert again["plays"] == start + 1 and again["counted"] is False
+    # Another track in the same playlist: the song's plays count, the playlist's don't again.
+    conn = db()
+    song_before = conn.execute("SELECT total_plays FROM songs WHERE video_id = 'TNsSBhl_2LI'").fetchone()[0]
     other = demo.post("/api/playlists/1/play", json={"video_id": "TNsSBhl_2LI"}).json()
-    assert other["plays"] == start + 2
+    assert other["plays"] == start + 1 and other["counted"] is False
+    assert conn.execute("SELECT total_plays FROM songs WHERE video_id = 'TNsSBhl_2LI'").fetchone()[0] == song_before + 1
+    conn.close()
 
 
 def test_play_requires_video_in_playlist(demo):

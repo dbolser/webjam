@@ -291,11 +291,45 @@ async function api(path, options = {}) {
     let errText = `Request failed (${res.status})`;
     try {
       const data = await res.json();
-      if (data.detail) errText = data.detail;
+      // FastAPI validation errors (422) carry a list of {msg, ...}.
+      if (Array.isArray(data.detail)) {
+        errText = data.detail.map((d) => (d && d.msg) || String(d)).join('; ') || errText;
+      } else if (data.detail) {
+        errText = String(data.detail);
+      }
     } catch (_) {}
-    throw new Error(errText);
+    const err = new Error(errText);
+    err.status = res.status;
+    err.retryAfter = Number(res.headers.get('Retry-After')) || 0;
+    throw err;
   }
   return res.json();
+}
+
+// For loops that make many requests (auto-migrate): wait out a 429/503 and retry
+// instead of silently skipping the rest.
+async function apiWithRetry(path, options = {}, attempts = 4) {
+  for (let i = 1; ; i++) {
+    try {
+      return await api(path, options);
+    } catch (err) {
+      if (i >= attempts || (err.status !== 429 && err.status !== 503)) throw err;
+      const waitSec = Math.min(Math.max(err.retryAfter || 2, 1), 30);
+      await new Promise((resolve) => setTimeout(resolve, waitSec * 1000));
+    }
+  }
+}
+
+// " (2 skipped: …)" for add/import results whose videos YouTube couldn't look up.
+function skippedNote(skipped) {
+  const list = Array.isArray(skipped) ? skipped : [];
+  if (!list.length) return '';
+  const unavailable = list.filter((s) => s && s.reason === 'youtube_unavailable').length;
+  const missing = list.length - unavailable;
+  const parts = [];
+  if (missing) parts.push(`${missing} not found on YouTube`);
+  if (unavailable) parts.push(`${unavailable} couldn't be checked right now, try again`);
+  return ` (${list.length} skipped: ${parts.join(', ')})`;
 }
 
 // --- YouTube IFrame Player API Integration ---
@@ -639,7 +673,11 @@ async function simulateExtraSpin() {
         count: 1,
       }),
     });
-    showToast(`Logged +1 spin on "${esc(state.queuePlaylistTitle)}" (Total: ${res.plays} plays)`);
+    showToast(
+      res.counted
+        ? `Logged +1 spin on "${esc(state.queuePlaylistTitle)}" (Total: ${res.plays} plays)`
+        : `Spin not counted: your own playlist, or already counted in the last 30 min (Total: ${res.plays} plays)`
+    );
     notifyBadges(res.new_badges, state.queuePlaylistOwner);
     await refreshBootstrapSilently();
     renderCurrentRoute();
@@ -1421,8 +1459,8 @@ async function renderPlaylistView(container, playlistId) {
               onclick="toggleLikePlaylist(${Number(pl.id)}, event)"
               title="${esc(getLoveBtnTitle(plMyLikes, 'playlist'))}"
             >${formatLoveBtnHtml(plMyLikes, pl.like_count, 'header-playlist')}</button>
-            <button class="btn-secondary" onclick="incrementPlaylistSpin(${Number(pl.id)})" title="Record a playlist spin (great for testing play-count badges!)">+1 Spin</button>
-            <button class="btn-secondary" id="audit-embeds-btn-${pl.id}" onclick="auditPlaylistEmbeds(${Number(pl.id)})" title="Check all songs in this playlist for embed playback & migrate restricted tracks">🔍 Audit Embeds</button>
+            <button class="btn-secondary" onclick="incrementPlaylistSpin(${Number(pl.id)})" title="Record a playlist spin (counts once per listener every 30 minutes; owners' own spins don't count)">+1 Spin</button>
+            ${isOwner ? `<button class="btn-secondary" id="audit-embeds-btn-${pl.id}" onclick="auditPlaylistEmbeds(${Number(pl.id)})" title="Check all songs in this playlist for embed playback & migrate restricted tracks">🔍 Audit Embeds</button>` : ''}
             ${isOwner ? `<button class="btn-secondary" onclick="openImportPlaylistModal(${Number(pl.id)})" title="Import a YouTube playlist into this mix">📥 Import YT Playlist</button>` : ''}
             ${isOwner ? `<button class="btn-secondary" onclick="document.getElementById('pl-edit-box').classList.toggle('hidden')">✎ Edit Liner Notes</button>` : ''}
             ${isOwner && lastUndoForPl ? `<button class="btn-secondary" onclick="undoLastPlaylistChange()" title="Undo last change (Ctrl+Z): ${esc(lastUndoForPl.actionLabel)}">↶ Undo</button>` : ''}
@@ -1444,7 +1482,7 @@ async function renderPlaylistView(container, playlistId) {
       </ol>
     </article>
 
-    ${renderCommentsSection('playlist', String(pl.id), pl.comments || [], `Comments & Liner Note Replies on "${pl.title}"`)}
+    ${renderCommentsSection('playlist', String(pl.id), pl.comments || [], `Comments & Liner Note Replies on "${pl.title}"`, pl.comments_has_more)}
   `;
 }
 
@@ -1581,7 +1619,7 @@ async function renderSongView(container, videoId) {
       </ol>
     </div>
 
-    ${renderCommentsSection('song', song.video_id, song.comments || [], `Community Notes on "${song.title}"`)}
+    ${renderCommentsSection('song', song.video_id, song.comments || [], `Community Notes on "${song.title}"`, song.comments_has_more)}
   `;
 }
 
@@ -1867,7 +1905,7 @@ async function renderUserView(container, profileUserId) {
       </div>
     </div>
 
-    ${renderCommentsSection('profile', String(u.id), data.comments || [], `@${u.username}'s Guestbook / Profile Wall`)}
+    ${renderCommentsSection('profile', String(u.id), data.comments || [], `@${u.username}'s Guestbook / Profile Wall`, data.comments_has_more)}
   `;
 }
 
@@ -2038,12 +2076,8 @@ async function renderBadgesView(container) {
 }
 
 // --- Shared Comments Component ---
-function renderCommentsSection(targetType, targetId, comments, heading) {
-  const listHtml =
-    comments.length > 0
-      ? comments
-          .map(
-            (c) => `
+function renderCommentItem(c) {
+  return `
           <div class="comment-item">
             <div class="comment-meta">
               <a href="#user/${Number(c.author_user_id)}" class="user-chip" onclick="navigate('user', ${Number(c.author_user_id)}); return false;">
@@ -2053,14 +2087,23 @@ function renderCommentsSection(targetType, targetId, comments, heading) {
             </div>
             <div class="comment-body">${esc(c.body)}</div>
           </div>
-        `
-          )
-          .join('')
+        `;
+}
+
+function renderCommentsSection(targetType, targetId, comments, heading, hasMore = false) {
+  const listHtml =
+    comments.length > 0
+      ? comments.map(renderCommentItem).join('')
       : `<p class="muted" style="font-size:13px;">No comments yet. Be the first to leave a note!</p>`;
+  const oldestId = comments.length > 0 ? Number(comments[0].id) : 0;
+  const olderBtn = hasMore
+    ? `<button type="button" class="btn-secondary btn-tiny" data-before-id="${oldestId}" onclick="loadOlderComments(this, ${jsArg(targetType)}, ${jsArg(targetId)})" style="margin-bottom:8px;">Show older comments</button>`
+    : '';
 
   return `
     <section class="comments-box">
-      <h3 style="margin:0 0 10px; font-family:var(--font-serif); font-size:16px;">💬 ${esc(heading)} (${comments.length})</h3>
+      <h3 style="margin:0 0 10px; font-family:var(--font-serif); font-size:16px;">💬 ${esc(heading)} (${comments.length}${hasMore ? '+' : ''})</h3>
+      ${olderBtn}
       <div id="comments-list-${esc(targetType)}-${esc(targetId)}">
         ${listHtml}
       </div>
@@ -2068,6 +2111,7 @@ function renderCommentsSection(targetType, targetId, comments, heading) {
         <textarea
           id="comment-input-${esc(targetType)}-${esc(targetId)}"
           class="input-textarea full-width"
+          maxlength="2000"
           rows="2"
           placeholder="Write a comment as @${esc(state.currentUser?.username || 'user')}…"
           required
@@ -2078,6 +2122,28 @@ function renderCommentsSection(targetType, targetId, comments, heading) {
       </form>
     </section>
   `;
+}
+
+async function loadOlderComments(btn, targetType, targetId) {
+  const beforeId = Number(btn.dataset.beforeId || 0);
+  const list = document.getElementById(`comments-list-${targetType}-${targetId}`);
+  if (!beforeId || !list) return;
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams({ target_type: targetType, target_id: String(targetId), before_id: String(beforeId) });
+    const data = await api(`/api/comments?${params.toString()}`);
+    const older = data.comments || [];
+    list.insertAdjacentHTML('afterbegin', older.map(renderCommentItem).join(''));
+    if (data.has_more && older.length) {
+      btn.dataset.beforeId = String(Number(older[0].id));
+      btn.disabled = false;
+    } else {
+      btn.remove();
+    }
+  } catch (err) {
+    btn.disabled = false;
+    showToast(esc(err.message));
+  }
 }
 
 // --- Interactive Actions & Form Handlers ---
@@ -2107,7 +2173,7 @@ async function handleQuickDrop(e) {
         method: 'POST',
         body: JSON.stringify({
           user_id: state.currentUserId,
-          title: `${state.currentUser.display_name}'s Crate`,
+          title: `${String(state.currentUser.display_name || 'My').slice(0, 180)}'s Crate`,
           description: 'Curated on Webjam.',
         }),
       });
@@ -2133,7 +2199,7 @@ async function handleQuickDrop(e) {
     const addedCount = res.results.filter((r) => !r.already_in_playlist).length;
     const newDiscoveries = res.results.filter((r) => r.is_new_discovery).length;
     showToast(
-      `Dropped ${addedCount} track(s) into playlist! ${newDiscoveries > 0 ? `(◈ ${newDiscoveries} brand-new Webjam discovery!)` : ''}`
+      `Dropped ${addedCount} track(s) into playlist!${esc(skippedNote(res.skipped))} ${newDiscoveries > 0 ? `(◈ ${newDiscoveries} brand-new Webjam discovery!)` : ''}`
     );
     notifyBadges(res.new_badges);
 
@@ -2180,7 +2246,7 @@ async function handleDropIntoPlaylist(e, playlistId) {
     const maxOcc = Math.max(0, ...res.results.map((r) => Number(r.occurrences_in_playlist || 1)));
     const occNote = maxOcc > 1 ? ` (×${maxOcc} in this mix!)` : '';
     showToast(
-      `Added ${res.results.length} track(s)${occNote}! ${newDiscoveries > 0 ? '◈ You were the FIRST to add this song to Webjam!' : ''} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+      `Added ${res.results.length} track(s)${occNote}!${esc(skippedNote(res.skipped))} ${newDiscoveries > 0 ? '◈ You were the FIRST to add this song to Webjam!' : ''} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
     );
     notifyBadges(res.new_badges);
     delete playlistCache[playlistId];
@@ -2336,6 +2402,7 @@ async function capturePlaylistSnapshot(playlistId, actionLabel) {
       source_user_id: t.source_user_id ?? null,
       migrated_from_video_id: t.migrated_from_video_id ?? null,
       migrated_from_title: t.migrated_from_title ?? null,
+      display_title: t.display_title ?? null,
       created_at: t.created_at || null,
     })),
   };
@@ -2751,7 +2818,11 @@ async function incrementPlaylistSpin(playlistId) {
       method: 'POST',
       body: JSON.stringify({ count: 1 }),
     });
-    showToast(`+1 Spin recorded (Now at ${res.plays} spins)`);
+    showToast(
+      res.counted
+        ? `+1 Spin recorded (Now at ${res.plays} spins)`
+        : `Spin not counted: your own playlist, or already counted in the last 30 min (${res.plays} spins)`
+    );
     notifyBadges(res.new_badges);
     delete playlistCache[playlistId];
     await refreshBootstrapSilently();
@@ -3170,7 +3241,8 @@ async function loadMyYouTubePlaylists() {
   const wrap = document.getElementById('import-my-youtube');
   const sel = document.getElementById('import-my-youtube-select');
   if (!wrap || !sel) return;
-  const show = isGoogleAuthMode() && state.auth.signed_in;
+  // Hidden until YouTube access can be connected (incremental consent, Phase 4).
+  const show = isGoogleAuthMode() && state.auth.signed_in && Boolean(state.auth.youtube_connected);
   wrap.classList.toggle('hidden', !show);
   if (!show) return;
   sel.innerHTML = '<option value="">Loading your playlists…</option>';
@@ -3628,13 +3700,14 @@ async function autoMigrateAllImportTracks() {
   }
 
   let migratedNow = 0;
+  let failedNow = 0;
   for (let idx = 0; idx < wiz.tracks.length; idx++) {
     const t = wiz.tracks[idx];
     if (!t.included || t.embeddable) continue;
     const query = (t.suggested_query || t.title || '').trim();
     if (!query) continue;
     try {
-      const data = await api(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
+      const data = await apiWithRetry(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
       const match = (data.results || []).find((r) => r.video_id !== t.original_video_id && r.embeddable);
       if (match) {
         wiz.candidatesByIdx[idx] = data.results;
@@ -3648,15 +3721,18 @@ async function autoMigrateAllImportTracks() {
         state.embedAuditByVideoId[match.video_id] = { embeddable: true, status: 'OK', reason: null };
         migratedNow++;
       }
-    } catch (_) {}
+    } catch (_) {
+      failedNow++;
+    }
   }
 
   wiz.openDrawerIdx = null;
   renderImportWizardStep();
+  const failNote = failedNow > 0 ? ` ${failedNow} search${failedNow === 1 ? '' : 'es'} failed (try again in a minute).` : '';
   if (migratedNow > 0) {
-    showToast(`✨ Auto-migrated ${migratedNow} restricted song${migratedNow === 1 ? '' : 's'} to verified-embeddable versions!`);
+    showToast(`✨ Auto-migrated ${migratedNow} restricted song${migratedNow === 1 ? '' : 's'} to verified-embeddable versions!${failNote}`);
   } else {
-    showToast('Could not auto-find replacements for all tracks — click "🪄 Migrate Song" on a track to customize the search.');
+    showToast(`Could not auto-find replacements for all tracks — click "🪄 Migrate Song" on a track to customize the search.${failNote}`);
   }
 }
 
@@ -3707,7 +3783,7 @@ async function submitCommitPlaylistImport() {
 
     closeModal('import-playlist-modal');
     showToast(
-      `Imported ${res.added_tracks.length} track(s) into "${esc(res.title)}"!`
+      `Imported ${res.added_tracks.length} track(s) into "${esc(res.title)}"!${esc(skippedNote(res.skipped))}`
     );
     notifyBadges(res.new_badges);
     delete playlistCache[res.playlist_id];
@@ -3793,6 +3869,7 @@ async function autoMigrateAuditedPlaylist(playlistId) {
 
   await capturePlaylistSnapshot(pid, 'Auto-migrated restricted songs');
   let migratedCount = 0;
+  let failedCount = 0;
 
   for (const t of pl.tracks) {
     const audit = state.embedAuditByVideoId[t.video_id];
@@ -3800,10 +3877,10 @@ async function autoMigrateAuditedPlaylist(playlistId) {
     const query = (audit.suggested_query || `${t.channel_title || ''} ${t.title || ''}`).trim();
     if (!query) continue;
     try {
-      const searchRes = await api(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
+      const searchRes = await apiWithRetry(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
       const match = (searchRes.results || []).find((r) => r.video_id !== t.video_id && r.embeddable);
       if (match) {
-        await api(`/api/playlists/${pid}/tracks/${t.id}`, {
+        await apiWithRetry(`/api/playlists/${pid}/tracks/${t.id}`, {
           method: 'PUT',
           body: JSON.stringify({
             user_id: state.currentUserId,
@@ -3814,17 +3891,20 @@ async function autoMigrateAuditedPlaylist(playlistId) {
         state.embedAuditByVideoId[match.video_id] = { embeddable: true, status: 'OK', reason: null };
         migratedCount++;
       }
-    } catch (_) {}
+    } catch (_) {
+      failedCount++;
+    }
   }
 
   delete playlistCache[pid];
   await syncQueueWithPlaylistIfActive(pid);
   await refreshBootstrapSilently();
   await renderCurrentRoute();
+  const failNote = failedCount > 0 ? ` ${failedCount} track(s) failed (try again in a minute).` : '';
   showToast(
     migratedCount > 0
-      ? `✨ Auto-migrated ${migratedCount} track(s) to verified-embeddable versions! <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
-      : 'Could not auto-find replacements — click "⇄ Swap" on individual tracks to search.'
+      ? `✨ Auto-migrated ${migratedCount} track(s) to verified-embeddable versions!${failNote} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+      : `Could not auto-find replacements — click "⇄ Swap" on individual tracks to search.${failNote}`
   );
 }
 

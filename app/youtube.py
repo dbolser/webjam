@@ -26,6 +26,8 @@ MAX_URL_TOKEN_CHARS = 2048
 MAX_SEARCH_QUERY_CHARS = 200
 MAX_SEARCH_RESULTS = 20
 MAX_TEXT_FIELD_CHARS = 300
+# Clip start/end times above this are rejected (no YouTube video is longer than a day).
+MAX_CLIP_SECONDS = 24 * 60 * 60
 
 RAW_VIDEO_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{11}$')
 _VIDEO_ID_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
@@ -139,6 +141,7 @@ def clear_youtube_caches() -> None:
     """Drop all cached YouTube lookups (used by tests)."""
     _EMBED_CACHE.clear()
     _SEARCH_CACHE.clear()
+    _search_budget.update(day="", used=0)
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +185,24 @@ def parse_timestamp_seconds(val: Any) -> Optional[int]:
       - int / float / numeric strings: "90" -> 90
       - mm:ss or hh:mm:ss: "1:30" -> 90, "01:02:03" -> 3723
       - YouTube duration strings: "1h2m30s", "2m15s", "45s" -> 135, 45
-    Returns None if empty or invalid.
+    Returns None if empty, invalid, negative or longer than MAX_CLIP_SECONDS.
     """
+    sec = _parse_timestamp_raw(val)
+    if sec is None or sec < 0 or sec > MAX_CLIP_SECONDS:
+        return None
+    return sec
+
+
+def _parse_timestamp_raw(val: Any) -> Optional[int]:
     if val is None:
         return None
+    if isinstance(val, bool):
+        return None
     if isinstance(val, (int, float)):
-        sec = int(val)
-        return sec if sec >= 0 else None
+        try:
+            return int(val)
+        except (OverflowError, ValueError):  # inf / nan
+            return None
 
     s = str(val).strip().lower()
     if not s:
@@ -371,20 +385,27 @@ async def _fetch_embeddability(
         "status": "NOT_FOUND",
         "reason": "Video unavailable or does not allow oEmbed",
     }
+    # Network errors, 429/5xx and garbled replies say nothing about the video itself.
+    unavailable = {
+        **not_found,
+        "status": "UNAVAILABLE",
+        "reason": "YouTube could not be reached; try again in a moment",
+    }
     if isinstance(o_resp, BaseException):
-        return not_found, None
+        return unavailable, None
     if o_resp.status_code != 200:
         # 4xx from oEmbed is a definitive answer (missing, private, embedding off);
         # 429/5xx are transient and must not be cached.
-        ttl = EMBED_NEGATIVE_CACHE_TTL_SECONDS if o_resp.status_code in (400, 401, 403, 404) else None
-        return not_found, ttl
+        if o_resp.status_code in (400, 401, 403, 404):
+            return not_found, EMBED_NEGATIVE_CACHE_TTL_SECONDS
+        return unavailable, None
 
     try:
         o_data = o_resp.json()
         if not isinstance(o_data, dict):
             raise ValueError("unexpected oEmbed payload")
     except ValueError:
-        return not_found, None
+        return unavailable, None
 
     title = _clean_text(o_data.get("title")) or f"YouTube Track ({video_id})"
     channel_title = _clean_text(o_data.get("author_name")) or "YouTube Artist"
@@ -614,6 +635,51 @@ async def _search_via_scrape_dev_only(
     return verified
 
 
+class SearchBudgetExceeded(Exception):
+    """The daily YouTube Data API search budget is used up."""
+
+
+# search.list costs 100 of the default 10,000 daily quota units; stop well before Google does.
+_search_budget = {"day": "", "used": 0}
+
+
+def _search_daily_cap() -> int:
+    try:
+        return max(0, int(os.environ.get("WEBJAM_SEARCH_DAILY_CAP", "80")))
+    except ValueError:
+        return 80
+
+
+def _charge_search_budget() -> None:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _search_budget["day"] != day:
+        _search_budget["day"], _search_budget["used"] = day, 0
+    if _search_budget["used"] >= _search_daily_cap():
+        raise SearchBudgetExceeded()
+    _search_budget["used"] += 1
+
+
+def _search_cache_key(query: str, max_results: Any) -> Optional[Tuple[str, str, int]]:
+    clean_q = (query or "").strip()[:MAX_SEARCH_QUERY_CHARS].strip()
+    if not clean_q:
+        return None
+    try:
+        max_results = int(max_results)
+    except (TypeError, ValueError):
+        max_results = 8
+    max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
+    api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    return ("api" if api_key else "scrape", clean_q, max_results)
+
+
+def cached_search_results(query: str, max_results: int = 8) -> Optional[List[Dict[str, Any]]]:
+    """Results already cached for this search (no outbound request), else None."""
+    key = _search_cache_key(query, max_results)
+    if key is None:
+        return []
+    return _SEARCH_CACHE.get(key)
+
+
 async def search_embeddable_youtube_songs(query: str, max_results: int = 8) -> List[Dict[str, Any]]:
     """
     Search YouTube for music videos and filter to those verified as embeddable.
@@ -625,21 +691,17 @@ async def search_embeddable_youtube_songs(query: str, max_results: int = 8) -> L
 
     The query is capped at MAX_SEARCH_QUERY_CHARS; non-empty results are cached.
     """
-    clean_q = (query or "").strip()[:MAX_SEARCH_QUERY_CHARS].strip()
-    if not clean_q:
+    cache_key = _search_cache_key(query, max_results)
+    if cache_key is None:
         return []
-    try:
-        max_results = int(max_results)
-    except (TypeError, ValueError):
-        max_results = 8
-    max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
-
+    _mode, clean_q, max_results = cache_key
     api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
-    cache_key = ("api" if api_key else "scrape", clean_q, max_results)
     cached = _SEARCH_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    if api_key:
+        _charge_search_budget()  # raises SearchBudgetExceeded
     async with httpx.AsyncClient(timeout=6.5) as client:
         if api_key:
             results = await _search_via_data_api(clean_q, max_results, api_key, client)
@@ -675,14 +737,20 @@ def extract_playlist_id(text: str) -> Optional[str]:
     return None
 
 
+# `remastered[^)\]]*` swallows everything up to the closing bracket and is atomic, so it
+# never overlaps with the `\s*` that follows (the old `remastered.*?\s*` was quadratic).
+_MIGRATION_NOISE_PATTERN = re.compile(
+    r"(\(|\[)\s*(official\s*(music\s*)?video|official\s*audio|lyric\s*video|hd|4k|hq|(?>remastered[^)\]]*)|visualizer)\s*(\)|\])",
+    re.IGNORECASE,
+)
+MAX_MIGRATION_TITLE_CHARS = 300
+
+
 def clean_migration_query(title: str, channel_title: str = "") -> str:
     """Build a clean search query to find embeddable alternatives for a restricted track."""
-    cleaned = re.sub(
-        r"(\(|\[)\s*(official\s*(music\s*)?video|official\s*audio|lyric\s*video|hd|4k|hq|remastered.*?|visualizer)\s*(\)|\])",
-        "",
-        title or "",
-        flags=re.IGNORECASE,
-    ).strip()
+    title = (title or "")[:MAX_MIGRATION_TITLE_CHARS]
+    channel_title = (channel_title or "")[:MAX_MIGRATION_TITLE_CHARS]
+    cleaned = _MIGRATION_NOISE_PATTERN.sub("", title).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     if " - " not in cleaned and channel_title and channel_title.lower() not in ("youtube", "youtube artist"):
         ch_clean = re.sub(r"\s*-\s*topic$", "", channel_title, flags=re.IGNORECASE).strip()
