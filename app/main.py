@@ -1,24 +1,52 @@
 import asyncio
-import os
-import secrets
+import ipaddress
+import logging
+import re
+import threading
+import time
+import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
 import httpx
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.auth import auth_enabled, base_url, resolve_actor, resolve_viewer, router as auth_router
+from app.auth import (
+    LOOPBACK_HOSTS,
+    SESSION_MAX_AGE,
+    auth_enabled,
+    auth_mode,
+    check_demo_mode_allowed,
+    configure_from_env,
+    demo_allows_remote,
+    get_config,
+    handle_taken,
+    has_youtube_access,
+    migrate_legacy_google_accounts,
+    release_handle,
+    resolve_actor,
+    resolve_viewer,
+    router as auth_router,
+    session_user_id,
+    validate_handle,
+)
 
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
-from app.database import get_db, hash_password, init_db
+from app.database import get_connection, get_db, init_db
+from app.invite import list_invites, seed_invites_from_env
 from app.youtube import (
+    MAX_CLIP_SECONDS,
+    SearchBudgetExceeded,
+    cached_search_results,
     check_video_embeddability,
     clean_migration_query,
     extract_video_entries,
@@ -32,23 +60,362 @@ from app.youtube import (
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
+logger = logging.getLogger("webjam")
+
+VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# --- Size caps ---
+MAX_TITLE = 200
+MAX_TEXT = 5000  # liner notes, descriptions, bios
+MAX_COMMENT = 2000
+MAX_URL_BLOB = 100_000  # urls_or_ids / initial_urls / source_input
+MAX_ENTRIES_PER_REQUEST = 50
+MAX_TRACKS_PER_PLAYLIST = 1000
+MAX_BODY_BYTES = 256 * 1024
+# A 1000-row snapshot (undo) is larger than an ordinary request.
+SNAPSHOT_PATH = re.compile(r"^/api/playlists/\d+/snapshot$")
+MAX_SNAPSHOT_BODY_BYTES = 1024 * 1024
+COMMENTS_PAGE_SIZE = 50
+
+# --- Rate limits: bucket -> (burst capacity, tokens refilled per second) ---
+RATE_LIMITS: Dict[str, Tuple[float, float]] = {
+    # Only searches that miss the cache are charged (auto-migrate repeats queries).
+    "search": (30, 30 / 60),
+    "inspect": (6, 6 / 60),
+    "add": (30, 30 / 60),
+    "comment": (10, 5 / 60),
+    "like": (60, 1.0),
+    "play": (60, 1.0),
+    "audit": (5, 5 / 60),
+}
+PLAY_DEDUPE_SECONDS = 30 * 60
+PLAY_BADGE_EVAL_INTERVAL = 60
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+
+
+class TokenBucketLimiter:
+    """Small in-process token bucket. Good enough for one uvicorn worker.
+
+    Buckets live in an LRU of at most `max_buckets` keys, so memory is bounded and
+    eviction is O(1). An evicted key just starts again with a full bucket.
+    """
+
+    def __init__(self, max_buckets: int = 50_000) -> None:
+        self._buckets: "OrderedDict[Tuple[str, str], Tuple[float, float]]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.max_buckets = max_buckets
+
+    def allow(self, key: Tuple[str, str], capacity: float, refill_per_sec: float) -> Tuple[bool, float]:
+        now = time.monotonic()
+        with self._lock:
+            tokens, last = self._buckets.get(key, (capacity, now))
+            tokens = min(capacity, tokens + (now - last) * refill_per_sec)
+            allowed = tokens >= 1
+            self._buckets[key] = (tokens - 1 if allowed else tokens, now)
+            self._buckets.move_to_end(key)
+            while len(self._buckets) > self.max_buckets:
+                self._buckets.popitem(last=False)
+            if allowed:
+                return True, 0.0
+            return False, (1 - tokens) / refill_per_sec
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+
+rate_limiter = TokenBucketLimiter()
+_play_badge_eval_lock = threading.Lock()
+_last_play_badge_eval: Dict[int, float] = {}
+
+
+def reset_rate_limits() -> None:
+    rate_limiter.reset()
+    with _play_badge_eval_lock:
+        _last_play_badge_eval.clear()
+
+
+def client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else ""
+    if peer in TRUSTED_PROXIES:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        # The right-most entry is the one our local reverse proxy appended.
+        last = forwarded.split(",")[-1].strip() if forwarded else ""
+        if last:
+            return last
+    return peer or "unknown"
+
+
+def ip_key(ip: str) -> str:
+    """IPv4 addresses as-is; IPv6 by /64, since one client usually owns a whole /64."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
+def viewer_key(request: Request) -> str:
+    """Who is calling, for rate limits and play dedupe: the signed-in user, else the client IP.
+
+    In demo mode the client-chosen user_id is not trusted, so the IP is used.
+    """
+    if auth_enabled():
+        uid = session_user_id(request)
+        if uid:
+            return f"u:{uid}"
+    return f"ip:{ip_key(client_ip(request))}"
+
+
+def enforce_rate_limit(request: Request, bucket: str) -> None:
+    capacity, refill = RATE_LIMITS[bucket]
+    ok, retry_after = rate_limiter.allow((bucket, viewer_key(request)), capacity, refill)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail="Slow down a little — too many requests. Try again in a moment.",
+            headers={"Retry-After": str(max(1, int(retry_after + 0.999)))},
+        )
+
+
+def rate_limit(bucket: str):
+    def _dependency(request: Request) -> None:
+        enforce_rate_limit(request, bucket)
+
+    return Depends(_dependency)
+
+
+# --- Middleware (pure ASGI) ---
+
+async def _send_json(scope, receive, send, status: int, detail: str) -> None:
+    await JSONResponse({"detail": detail}, status_code=status)(scope, receive, send)
+
+
+class ConfiguredSessionMiddleware:
+    """Starlette's signed-cookie sessions, configured from the auth config chosen at startup."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._inner: Optional[SessionMiddleware] = None
+        self._key: Optional[Tuple[str, bool]] = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        cfg = get_config()
+        key = (cfg.session_secret, cfg.https_only)
+        if self._inner is None or self._key != key:
+            self._inner = SessionMiddleware(
+                self.app,
+                secret_key=cfg.session_secret,
+                session_cookie="webjam_session",
+                max_age=SESSION_MAX_AGE,
+                same_site="lax",
+                https_only=cfg.https_only,
+            )
+            self._key = key
+        await self._inner(scope, receive, send)
+
+
+def _origin_of(url: str) -> str:
+    p = urllib.parse.urlparse(url)
+    return f"{p.scheme}://{p.netloc}".lower()
+
+
+def csrf_failure(scope) -> Optional[str]:
+    """Why an unsafe request should be refused, or None if it looks same-origin."""
+    headers = Headers(scope=scope)
+    if headers.get("x-webjam") != "1":
+        return "Missing X-Webjam request header."
+    if headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return "Cross-site request refused."
+    origin = headers.get("origin")
+    if origin:
+        cfg = get_config()
+        if cfg.base_url:
+            ok = origin.rstrip("/").lower() == _origin_of(cfg.base_url)
+        else:
+            ok = urllib.parse.urlparse(origin).netloc.lower() == headers.get("host", "").lower()
+        if not ok:
+            return "Cross-origin request refused."
+    return None
+
+
+def _is_loopback_peer(host: str) -> bool:
+    if host == "testclient":  # Starlette's TestClient
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class DemoLoopbackMiddleware:
+    """Demo mode lets anyone act as anyone, so it only serves this machine.
+
+    Refuses requests from a non-loopback peer, requests relayed by a proxy, and
+    requests whose Host is not a localhost name (DNS rebinding).
+    WEBJAM_DEMO_ALLOW_REMOTE=1 turns this off for a trusted LAN.
+    """
+
+    ALLOWED_HOSTS = set(LOOPBACK_HOSTS) | {"testserver"}
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and get_config().mode == "demo" and not demo_allows_remote():
+            headers = Headers(scope=scope)
+            peer = (scope.get("client") or ("", 0))[0] or ""
+            host = urllib.parse.urlsplit("//" + headers.get("host", "")).hostname or ""
+            if (
+                not _is_loopback_peer(peer)
+                or "x-forwarded-for" in headers
+                or "forwarded" in headers
+                or host not in self.ALLOWED_HOSTS
+            ):
+                return await _send_json(
+                    scope, receive, send, 403,
+                    "Demo mode only serves localhost. Use WEBJAM_AUTH_MODE=google to share Webjam "
+                    "(or set WEBJAM_DEMO_ALLOW_REMOTE=1 on a trusted network).",
+                )
+        await self.app(scope, receive, send)
+
+
+class CSRFMiddleware:
+    """Unsafe methods on /api/ and /auth/logout need X-Webjam: 1 and a same-origin Origin (if sent)."""
+
+    UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] in self.UNSAFE:
+            path = scope.get("path", "")
+            if path.startswith("/api/") or path == "/auth/logout":
+                reason = csrf_failure(scope)
+                if reason:
+                    return await _send_json(scope, receive, send, 403, reason)
+        await self.app(scope, receive, send)
+
+
+class BodySizeLimitMiddleware:
+    """Refuse request bodies over the cap with 413 before any handler parses them."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
+            return await self.app(scope, receive, send)
+        limit = MAX_SNAPSHOT_BODY_BYTES if SNAPSHOT_PATH.match(scope.get("path", "")) else MAX_BODY_BYTES
+        declared = Headers(scope=scope).get("content-length")
+        if declared is not None and (not declared.isdigit() or int(declared) > limit):
+            return await _send_json(scope, receive, send, 413, "Request body too large.")
+
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body = message.get("body", b"")
+            total += len(body)
+            if total > limit:
+                return await _send_json(scope, receive, send, 413, "Request body too large.")
+            chunks.append(body)
+            if not message.get("more_body", False):
+                break
+
+        buffered = b"".join(chunks)
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": buffered, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "DENY",
+    # Only anti-framing for now; a full CSP needs the inline handlers gone first (Phase 1).
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    # Leave autoplay/fullscreen/encrypted-media alone: the YouTube iframe needs them.
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+}
+
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in SECURITY_HEADERS.items():
+                    if name not in headers:
+                        headers[name] = value
+                if get_config().base_url.startswith("https://") and "Strict-Transport-Security" not in headers:
+                    headers["Strict-Transport-Security"] = "max-age=15552000"
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cfg = configure_from_env()  # raises AuthConfigError: refuse to start on bad config
     init_db()
+    conn = get_connection()
+    try:
+        check_demo_mode_allowed(conn)
+        migrate_legacy_google_accounts(conn)
+        seed_invites_from_env(conn)
+        invite_count = len(list_invites(conn))
+    finally:
+        conn.close()
+    reset_rate_limits()
+    if cfg.mode == "demo":
+        logger.warning("Webjam auth mode: DEMO — anyone can act as anyone. Never expose this instance publicly.")
+    else:
+        logger.warning("Webjam auth mode: google (invite-only), base URL %s", cfg.base_url)
+        if invite_count == 0:
+            logger.warning(
+                "No invites: nobody (including you) can sign in. Set WEBJAM_INVITE_EMAILS or run "
+                "`python -m app.invite add you@example.com`."
+            )
     yield
 
 
 app = FastAPI(title="Webjam — Social YouTube Playlist Curation", lifespan=lifespan)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=os.environ.get("WEBJAM_SESSION_SECRET") or secrets.token_urlsafe(32),
-    session_cookie="webjam_session",
-    max_age=60 * 60 * 24 * 30,
-    same_site="lax",
-    https_only=os.environ.get("WEBJAM_BASE_URL", "").startswith("https://"),
-)
+# Added innermost first: security headers wrap everything, then body cap, CSRF, sessions.
+app.add_middleware(ConfiguredSessionMiddleware)
+app.add_middleware(CSRFMiddleware)
+app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(DemoLoopbackMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(auth_router)
+
+
+@app.exception_handler(OverflowError)
+async def _integer_out_of_range(request: Request, exc: OverflowError):
+    # A huge id/number reached SQLite ("Python int too large to convert to SQLite INTEGER").
+    return JSONResponse({"detail": "A number in the request is out of range."}, status_code=400)
 
 
 def now_str() -> str:
@@ -82,102 +449,120 @@ GUEST_USER = {
 
 # --- Pydantic Schemas ---
 
+Title = Annotated[str, Field(max_length=MAX_TITLE)]
+LongText = Annotated[str, Field(max_length=MAX_TEXT)]
+UrlBlob = Annotated[str, Field(max_length=MAX_URL_BLOB)]
+VideoRef = Annotated[str, Field(max_length=2048)]  # an id or one URL
+TimeValue = Optional[Union[int, float, Annotated[str, Field(max_length=32)]]]
+ClipSeconds = Optional[Annotated[int, Field(ge=0, le=MAX_CLIP_SECONDS)]]
+
+
 class LoginRequest(BaseModel):
-    username: str
-    password: Optional[str] = "webjam"
-    display_name: Optional[str] = None
-    bio: Optional[str] = ""
+    """Demo mode only. The password is accepted for old clients but ignored entirely."""
+
+    username: Annotated[str, Field(max_length=64)]
+    password: Optional[Annotated[str, Field(max_length=200)]] = None
+    display_name: Optional[Title] = None
+    bio: Optional[LongText] = ""
 
 
 class UpdateProfileRequest(BaseModel):
-    display_name: str
-    bio: str
+    display_name: Title
+    bio: LongText
+
+
+class UpdateHandleRequest(BaseModel):
+    user_id: Optional[int] = None  # demo mode only
+    handle: Annotated[str, Field(max_length=64)]
 
 
 class CreatePlaylistRequest(BaseModel):
     user_id: Optional[int] = None
-    title: str
-    description: Optional[str] = ""
-    initial_urls: Optional[str] = ""
+    title: Title
+    description: Optional[LongText] = ""
+    initial_urls: Optional[UrlBlob] = ""
 
 
 class UpdatePlaylistRequest(BaseModel):
     user_id: Optional[int] = None
-    title: str
-    description: str
+    title: Title
+    description: LongText
 
 
 class AddTracksRequest(BaseModel):
     user_id: Optional[int] = None
-    urls_or_ids: str
-    track_note: Optional[str] = ""
-    custom_title: Optional[str] = None
-    start_time: Optional[Any] = None
-    end_time: Optional[Any] = None
+    urls_or_ids: UrlBlob
+    track_note: Optional[LongText] = ""
+    custom_title: Optional[Title] = None
+    start_time: TimeValue = None
+    end_time: TimeValue = None
     source_playlist_id: Optional[int] = None
+    # Ignored: provenance is derived from source_playlist_id on the server.
     source_user_id: Optional[int] = None
 
 
 class UpdateTrackRequest(BaseModel):
     user_id: Optional[int] = None
-    track_note: Optional[str] = None
-    start_time: Optional[Any] = None
-    end_time: Optional[Any] = None
+    track_note: Optional[LongText] = None
+    start_time: TimeValue = None
+    end_time: TimeValue = None
     update_clip: Optional[bool] = False
-    direction: Optional[str] = None  # 'up' or 'down'
-    new_video_id: Optional[str] = None
-    custom_title: Optional[str] = None
+    direction: Optional[Annotated[str, Field(max_length=8)]] = None  # 'up' or 'down'
+    new_video_id: Optional[VideoRef] = None
+    custom_title: Optional[Title] = None
 
 
 class InspectPlaylistImportRequest(BaseModel):
-    source_input: str
+    source_input: UrlBlob
     max_tracks: int = 30
 
 
 class CommitImportedTrackItem(BaseModel):
-    video_id: str
-    custom_title: Optional[str] = None
-    track_note: Optional[str] = ""
-    start_seconds: Optional[Any] = None
-    end_seconds: Optional[Any] = None
-    migrated_from_video_id: Optional[str] = None
-    migrated_from_title: Optional[str] = None
+    video_id: VideoRef
+    custom_title: Optional[Title] = None
+    track_note: Optional[LongText] = ""
+    start_seconds: TimeValue = None
+    end_seconds: TimeValue = None
+    migrated_from_video_id: Optional[Annotated[str, Field(max_length=32)]] = None
+    migrated_from_title: Optional[Annotated[str, Field(max_length=500)]] = None
 
 
 class CommitPlaylistImportRequest(BaseModel):
     user_id: Optional[int] = None
-    title: str
-    description: Optional[str] = ""
+    title: Title
+    description: Optional[LongText] = ""
     target_playlist_id: Optional[int] = None
     tracks: List[CommitImportedTrackItem]
 
 
 class ReorderTracksRequest(BaseModel):
     user_id: Optional[int] = None
-    track_ids: List[int]
+    track_ids: Annotated[List[int], Field(max_length=MAX_TRACKS_PER_PLAYLIST)]
 
 
 class SnapshotTrackItem(BaseModel):
-    id: Optional[int] = None
-    video_id: str
-    position: int
-    track_note: Optional[str] = ""
-    start_seconds: Optional[int] = None
-    end_seconds: Optional[int] = None
-    migrated_from_video_id: Optional[str] = None
-    migrated_from_title: Optional[str] = None
+    id: Optional[Annotated[int, Field(ge=1, le=2**53)]] = None
+    video_id: Annotated[str, Field(max_length=32)]
+    position: Optional[int] = None
+    track_note: Optional[LongText] = ""
+    start_seconds: ClipSeconds = None
+    end_seconds: ClipSeconds = None
+    migrated_from_video_id: Optional[Annotated[str, Field(max_length=32)]] = None
+    migrated_from_title: Optional[Annotated[str, Field(max_length=500)]] = None
+    display_title: Optional[Title] = None
+    # Attribution fields are accepted for compatibility but never trusted: rows keep
+    # the attribution they already had on the server, new rows get the actor/now.
     added_by_user_id: Optional[int] = None
     source_playlist_id: Optional[int] = None
     source_user_id: Optional[int] = None
-    created_at: Optional[str] = None
+    created_at: Optional[Annotated[str, Field(max_length=64)]] = None
 
 
 class RestorePlaylistSnapshotRequest(BaseModel):
     user_id: Optional[int] = None
-    title: str
-    description: Optional[str] = ""
+    title: Title
+    description: Optional[LongText] = ""
     tracks: List[SnapshotTrackItem]
-
 
 
 class ToggleLikeRequest(BaseModel):
@@ -187,15 +572,15 @@ class ToggleLikeRequest(BaseModel):
 
 
 class RecordPlayRequest(BaseModel):
-    video_id: Optional[str] = None
-    count: int = 1
+    video_id: Optional[Annotated[str, Field(max_length=32)]] = None
+    count: int = 1  # ignored: every play counts once
 
 
 class CreateCommentRequest(BaseModel):
     author_user_id: Optional[int] = None
-    target_type: str  # 'playlist' | 'song' | 'profile'
-    target_id: str
-    body: str
+    target_type: Annotated[str, Field(max_length=16)]  # 'playlist' | 'song' | 'profile'
+    target_id: Annotated[str, Field(max_length=64)]
+    body: Annotated[str, Field(max_length=MAX_COMMENT)]
 
 
 # --- Helper query functions ---
@@ -216,7 +601,14 @@ def fetch_all_users_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return [dict(r) for r in cur.fetchall()]
 
 
-def fetch_comments(conn: sqlite3.Connection, target_type: str, target_id: str) -> List[Dict[str, Any]]:
+def fetch_comments_page(
+    conn: sqlite3.Connection,
+    target_type: str,
+    target_id: str,
+    before_id: Optional[int] = None,
+    limit: int = COMMENTS_PAGE_SIZE,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """The newest `limit` comments (older than before_id, if given), oldest first, plus has_more."""
     cur = conn.cursor()
     cur.execute(
         """
@@ -224,12 +616,107 @@ def fetch_comments(conn: sqlite3.Connection, target_type: str, target_id: str) -
                u.username AS author_username, u.display_name AS author_display_name, u.avatar_color AS author_avatar_color
         FROM comments c
         JOIN users u ON u.id = c.author_user_id
-        WHERE c.target_type = ? AND c.target_id = ?
-        ORDER BY c.created_at ASC, c.id ASC
+        WHERE c.target_type = ? AND c.target_id = ? AND (? IS NULL OR c.id < ?)
+        ORDER BY c.id DESC
+        LIMIT ?
         """,
-        (target_type, str(target_id)),
+        (target_type, str(target_id), before_id, before_id, limit + 1),
     )
-    return [dict(r) for r in cur.fetchall()]
+    rows = [dict(r) for r in cur.fetchall()]
+    has_more = len(rows) > limit
+    return list(reversed(rows[:limit])), has_more
+
+
+class VideoLookupFailed(Exception):
+    """YouTube had no metadata for this id (deleted, private or never existed)."""
+
+    reason = "not_found"
+
+
+class VideoLookupUnavailable(VideoLookupFailed):
+    """YouTube could not be asked right now (network error, 429/5xx). Worth retrying."""
+
+    reason = "youtube_unavailable"
+
+
+NOT_FOUND_DETAIL = "YouTube couldn't find that video (it may be private, deleted or mistyped)."
+UNAVAILABLE_DETAIL = "YouTube isn't answering right now. Please try again in a moment."
+
+
+def lookup_failure(exc: VideoLookupFailed) -> HTTPException:
+    if isinstance(exc, VideoLookupUnavailable):
+        return HTTPException(status_code=503, detail=UNAVAILABLE_DETAIL, headers={"Retry-After": "30"})
+    return HTTPException(status_code=400, detail=NOT_FOUND_DETAIL)
+
+
+async def lookup_new_song_metadata(video_id: str) -> Dict[str, Any]:
+    meta = await fetch_youtube_metadata(video_id)
+    if meta and meta.get("status") == "UNAVAILABLE":
+        raise VideoLookupUnavailable(video_id)
+    if not meta or meta.get("status") == "NOT_FOUND" or not meta.get("title"):
+        raise VideoLookupFailed(video_id)
+    return meta
+
+
+def insert_song_if_new(
+    conn: sqlite3.Connection, video_id: str, meta: Dict[str, Any], user_id: int, playlist_id: int, ts: str
+) -> Tuple[bool, sqlite3.Row]:
+    """Insert a song row unless another request beat us to it. Returns (inserted, row)."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(video_id) DO NOTHING
+        """,
+        (video_id, meta["title"], meta["channel_title"], meta["thumbnail_url"], user_id, playlist_id, ts),
+    )
+    inserted = cur.rowcount > 0
+    row = cur.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,)).fetchone()
+    return inserted, row
+
+
+def clean_display_title(custom_title: Optional[str], song_title: Optional[str]) -> Optional[str]:
+    """A per-row title override, or None when it is empty or the same as the song's real title."""
+    title = (custom_title or "").strip()[:MAX_TITLE]
+    return title if title and title != (song_title or "") else None
+
+
+def ensure_playlist_capacity(conn: sqlite3.Connection, playlist_id: int, adding: int = 1) -> None:
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
+    ).fetchone()
+    if int(row["cnt"]) + adding > MAX_TRACKS_PER_PLAYLIST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Playlists can hold at most {MAX_TRACKS_PER_PLAYLIST} tracks.",
+        )
+
+
+def ensure_entry_count(count: int) -> None:
+    if count > MAX_ENTRIES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Add at most {MAX_ENTRIES_PER_REQUEST} videos at a time.",
+        )
+
+
+def verified_source(
+    conn: sqlite3.Connection, source_playlist_id: Optional[int], video_id: str
+) -> Optional[Tuple[int, int]]:
+    """(source_playlist_id, owner_id) if that playlist exists and contains the video, else None."""
+    if not source_playlist_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT p.id, p.user_id FROM playlists p
+        WHERE p.id = ? AND EXISTS (
+            SELECT 1 FROM playlist_tracks pt WHERE pt.playlist_id = p.id AND pt.video_id = ?
+        )
+        """,
+        (source_playlist_id, video_id),
+    ).fetchone()
+    return (row["id"], row["user_id"]) if row else None
 
 
 async def add_single_video_to_playlist(
@@ -255,30 +742,24 @@ async def add_single_video_to_playlist(
             detail="End time must be greater than start time.",
         )
 
+    ensure_playlist_capacity(conn, playlist_id)
+
     # Check if song already exists in Webjam
     cur.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,))
     song_row = cur.fetchone()
     is_new_discovery = False
 
     if not song_row:
-        meta = await fetch_youtube_metadata(video_id, custom_title=custom_title)
-        cur.execute(
-            """
-            INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                video_id,
-                meta["title"],
-                meta["channel_title"],
-                meta["thumbnail_url"],
-                user_id,
-                playlist_id,
-                ts,
-            ),
-        )
-        is_new_discovery = True
-        song_title = meta["title"]
+        # songs.title always comes from YouTube; a custom title only applies to this row.
+        # Raises VideoLookupFailed before anything is written when YouTube has no such video.
+        meta = await lookup_new_song_metadata(video_id)
+        # Another request may have added the same new video while we were waiting on YouTube.
+        is_new_discovery, song_row = insert_song_if_new(conn, video_id, meta, user_id, playlist_id, ts)
+        song_title = song_row["title"]
+    else:
+        song_title = song_row["title"]
+
+    if is_new_discovery:
         cur.execute(
             """
             INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -291,8 +772,8 @@ async def add_single_video_to_playlist(
                 ts,
             ),
         )
-    else:
-        song_title = song_row["title"]
+
+    display_title = clean_display_title(custom_title, song_title)
 
     # Determine next position (songs can be added to a playlist as many times as desired!)
     cur.execute(
@@ -304,8 +785,8 @@ async def add_single_video_to_playlist(
     cur.execute(
         """
         INSERT INTO playlist_tracks
-        (playlist_id, video_id, position, added_by_user_id, track_note, start_seconds, end_seconds, migrated_from_video_id, migrated_from_title, source_playlist_id, source_user_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (playlist_id, video_id, position, added_by_user_id, track_note, start_seconds, end_seconds, migrated_from_video_id, migrated_from_title, display_title, source_playlist_id, source_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             playlist_id,
@@ -315,8 +796,9 @@ async def add_single_video_to_playlist(
             (track_note or "").strip(),
             start_seconds,
             end_seconds,
-            migrated_from_video_id,
-            migrated_from_title,
+            migrated_from_video_id if migrated_from_video_id and VIDEO_ID_PATTERN.match(migrated_from_video_id) else None,
+            (migrated_from_title or "").strip()[:500] or None,
+            display_title,
             source_playlist_id,
             source_user_id,
             ts,
@@ -369,7 +851,7 @@ async def add_single_video_to_playlist(
     return {
         "track_id": inserted_track_id,
         "video_id": video_id,
-        "title": song_title,
+        "title": display_title or song_title,
         "already_in_playlist": False,
         "occurrences_in_playlist": occurrences_in_playlist,
         "is_new_discovery": is_new_discovery,
@@ -418,19 +900,43 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
         },
         "badge_catalog": BADGE_CATALOG,
         "auth": {
-            "mode": "google" if auth_enabled() else "demo",
+            # 'demo' means anyone can act as anyone; the UI should say so.
+            "mode": auth_mode(),
             "signed_in": bool(auth_enabled() and current_user["id"]),
+            # False until incremental YouTube consent ships (Phase 4): hide "My YouTube".
+            "youtube_connected": bool(
+                auth_enabled()
+                and current_user["id"]
+                and has_youtube_access(
+                    cur.execute("SELECT * FROM google_accounts WHERE user_id = ?", (current_user["id"],)).fetchone()
+                )
+            ),
         },
     }
 
 
+def normalize_demo_username(raw: str) -> str:
+    """Demo usernames are restricted to the same [a-z0-9_]{3,20} alphabet as Google handles."""
+    name = re.sub(r"[\s.\-]+", "_", (raw or "").strip().lower().lstrip("@"))
+    name = re.sub(r"[^a-z0-9_]", "", name).strip("_")[:20]
+    if len(name) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Usernames are 3-20 characters: lowercase letters, digits and underscores.",
+        )
+    return name
+
+
 @app.post("/api/auth/login")
 def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_db)):
+    """Demo-mode persona switch / registration.
+
+    There is deliberately no password check: req.password is ignored entirely and
+    no password is stored. Demo mode means anyone can act as anyone.
+    """
     if auth_enabled():
         raise HTTPException(status_code=404, detail="Use Google sign-in")
-    clean_uname = req.username.strip().lower().lstrip("@")
-    if not clean_uname:
-        raise HTTPException(status_code=400, detail="Username cannot be empty")
+    clean_uname = normalize_demo_username(req.username)
 
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE LOWER(username) = ?", (clean_uname,))
@@ -442,25 +948,45 @@ def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_
     palette = ["#1f5f5b", "#8c3b2b", "#3d4e81", "#6b4226", "#4a6b2c", "#7a3b69"]
     cur.execute("SELECT COUNT(*) AS cnt FROM users")
     color = palette[cur.fetchone()["cnt"] % len(palette)]
-    display = (req.display_name or req.username).strip()
+    display = ((req.display_name or "").strip() or clean_uname)[:MAX_TITLE]
     ts = now_str()
     cur.execute(
         """
         INSERT INTO users (username, display_name, bio, avatar_color, password_hash, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, '', ?)
         """,
         (
             clean_uname,
             display,
             (req.bio or "New crate digger on Webjam.").strip(),
             color,
-            hash_password(req.password or "webjam"),
             ts,
         ),
     )
     new_uid = cur.lastrowid
     conn.commit()
-    return {"user_id": new_uid, "created": True}
+    return {"user_id": new_uid, "created": True, "username": clean_uname}
+
+
+@app.put("/api/me/handle")
+def update_my_handle(req: UpdateHandleRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    """Choose your public @handle (never derived from your email address)."""
+    uid = resolve_actor(request, req.user_id)
+    handle = validate_handle(req.handle)
+    cur = conn.cursor()
+    me = cur.execute("SELECT username FROM users WHERE id = ?", (uid,)).fetchone()
+    if not me:
+        raise HTTPException(status_code=404, detail="User not found")
+    if handle_taken(cur, handle, exclude_user_id=uid):
+        raise HTTPException(status_code=409, detail="That handle is taken.")
+    try:
+        if (me["username"] or "").lower() != handle:
+            release_handle(cur, me["username"], uid, now_str())
+        cur.execute("UPDATE users SET username = ? WHERE id = ?", (handle, uid))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="That handle is taken.")
+    return {"ok": True, "username": handle}
 
 
 @app.put("/api/users/{user_id}")
@@ -520,7 +1046,8 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
             SELECT pt.id, pt.video_id, pt.position, pt.track_note,
                    pt.start_seconds, pt.end_seconds,
                    pt.migrated_from_video_id, pt.migrated_from_title,
-                   s.title, s.channel_title, s.thumbnail_url, s.first_added_by_user_id,
+                   COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, pt.display_title,
+                   s.channel_title, s.thumbnail_url, s.first_added_by_user_id,
                    su.username AS source_username,
                    fu.username AS first_finder_username,
                    (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = pt.video_id) AS song_like_count,
@@ -651,7 +1178,8 @@ def get_playlist_detail(
                pt.track_note, pt.start_seconds, pt.end_seconds,
                pt.migrated_from_video_id, pt.migrated_from_title,
                pt.source_playlist_id, pt.source_user_id, pt.created_at,
-               s.title, s.channel_title, s.thumbnail_url, s.total_plays,
+               COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, pt.display_title,
+               s.channel_title, s.thumbnail_url, s.total_plays,
                s.first_added_by_user_id, s.first_added_playlist_id, s.first_added_at,
                fu.username AS first_finder_username, fu.display_name AS first_finder_display_name,
                su.username AS source_username, su.display_name AS source_display_name,
@@ -695,7 +1223,7 @@ def get_playlist_detail(
         tracks.append(t)
 
     playlist["tracks"] = tracks
-    playlist["comments"] = fetch_comments(conn, "playlist", str(playlist_id))
+    playlist["comments"], playlist["comments_has_more"] = fetch_comments_page(conn, "playlist", str(playlist_id))
     return playlist
 
 
@@ -705,6 +1233,10 @@ async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sq
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Playlist title is required")
+    entries = extract_video_entries(req.initial_urls) if (req.initial_urls or "").strip() else []
+    ensure_entry_count(len(entries))
+    if entries:
+        enforce_rate_limit(request, "add")
 
     ts = now_str()
     cur = conn.cursor()
@@ -727,9 +1259,9 @@ async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sq
     conn.commit()
 
     added_tracks = []
-    if req.initial_urls and req.initial_urls.strip():
-        entries = extract_video_entries(req.initial_urls)
-        for entry in entries:
+    skipped = []
+    for entry in entries:
+        try:
             res = await add_single_video_to_playlist(
                 conn=conn,
                 playlist_id=playlist_id,
@@ -738,12 +1270,16 @@ async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sq
                 start_seconds=entry["start_seconds"],
                 end_seconds=entry["end_seconds"],
             )
-            added_tracks.append(res)
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": entry["video_id"], "reason": exc.reason})
+            continue
+        added_tracks.append(res)
 
     new_badges = evaluate_and_award_badges(conn, req.user_id)
     return {
         "playlist_id": playlist_id,
         "added_tracks": added_tracks,
+        "skipped": skipped,
         "new_badges": new_badges,
     }
 
@@ -770,13 +1306,42 @@ def update_playlist(
     return {"ok": True, "new_badges": new_badges}
 
 
-@app.post("/api/playlists/{playlist_id}/tracks")
+def derive_grab_source(
+    conn: sqlite3.Connection,
+    source_playlist_id: Optional[int],
+    claimed_source_user_id: Optional[int],
+    video_id: str,
+) -> Optional[Tuple[int, int]]:
+    """Server-side provenance for a grab: (source_playlist_id, source_user_id) or None.
+
+    The source playlist must exist and contain the video, and the credited user is
+    always that playlist's owner; otherwise the track is added with no provenance
+    (a stale page can still grab, it just can't credit anyone). A client-sent
+    source_user_id is never stored; on its own it only means "credit the song's
+    first finder", which is checked against songs.first_added_by_user_id and the
+    finder's debut playlist.
+    """
+    if source_playlist_id:
+        return verified_source(conn, source_playlist_id, video_id)
+    if claimed_source_user_id:
+        song = conn.execute(
+            "SELECT first_added_by_user_id, first_added_playlist_id FROM songs WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        if song and song["first_added_by_user_id"] == claimed_source_user_id:
+            src = verified_source(conn, song["first_added_playlist_id"], video_id)
+            if src and src[1] == claimed_source_user_id:
+                return src
+    return None
+
+
+@app.post("/api/playlists/{playlist_id}/tracks", dependencies=[rate_limit("add")])
 async def add_tracks_to_playlist(
     playlist_id: int, req: AddTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
     req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
-    pl = require_playlist_owner(conn, playlist_id, req.user_id)
+    require_playlist_owner(conn, playlist_id, req.user_id)
 
     entries = extract_video_entries(req.urls_or_ids)
     if not entries:
@@ -784,45 +1349,64 @@ async def add_tracks_to_playlist(
             status_code=400,
             detail="Could not find a valid YouTube link or 11-character video ID. Try pasting any youtube.com/watch?v=... or youtu.be/... link!",
         )
+    ensure_entry_count(len(entries))
+    ensure_playlist_capacity(conn, playlist_id, len(entries))
 
     explicit_start = parse_timestamp_seconds(req.start_time)
     explicit_end = parse_timestamp_seconds(req.end_time)
 
+    # Verify provenance for every entry before writing anything.
+    sources = {
+        e["video_id"]: derive_grab_source(conn, req.source_playlist_id, req.source_user_id, e["video_id"])
+        for e in entries
+    }
+
     results = []
+    skipped = []
     for entry in entries:
         vid = entry["video_id"]
         start_sec = explicit_start if explicit_start is not None else entry["start_seconds"]
         end_sec = explicit_end if explicit_end is not None else entry["end_seconds"]
-        res = await add_single_video_to_playlist(
-            conn=conn,
-            playlist_id=playlist_id,
-            user_id=req.user_id,
-            video_id=vid,
-            track_note=req.track_note or "",
-            custom_title=req.custom_title if len(entries) == 1 else None,
-            start_seconds=start_sec,
-            end_seconds=end_sec,
-            source_playlist_id=req.source_playlist_id,
-            source_user_id=req.source_user_id,
-        )
+        src = sources[vid]
+        try:
+            res = await add_single_video_to_playlist(
+                conn=conn,
+                playlist_id=playlist_id,
+                user_id=req.user_id,
+                video_id=vid,
+                track_note=req.track_note or "",
+                custom_title=req.custom_title if len(entries) == 1 else None,
+                start_seconds=start_sec,
+                end_seconds=end_sec,
+                source_playlist_id=src[0] if src else None,
+                source_user_id=src[1] if src else None,
+            )
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": vid, "reason": exc.reason})
+            continue
         results.append(res)
+
+    if not results:
+        if any(s["reason"] == VideoLookupUnavailable.reason for s in skipped):
+            raise lookup_failure(VideoLookupUnavailable())
+        raise lookup_failure(VideoLookupFailed())
 
     # Evaluate badges for the user who added/grabbed the track
     new_badges = evaluate_and_award_badges(conn, req.user_id)
 
-    # Also evaluate badges for the source curator (if grabbed from someone else) and original song discoverers
-    if req.source_user_id and req.source_user_id != req.user_id:
-        evaluate_and_award_badges(conn, req.source_user_id)
-
-    for entry in entries:
-        vid = entry["video_id"]
-        cur.execute("SELECT first_added_by_user_id FROM songs WHERE video_id = ?", (vid,))
+    # Also evaluate badges for the (verified) source curators and original song discoverers
+    others = {src[1] for src in sources.values() if src and src[1] != req.user_id}
+    for res in results:
+        cur.execute("SELECT first_added_by_user_id FROM songs WHERE video_id = ?", (res["video_id"],))
         srow = cur.fetchone()
         if srow and srow["first_added_by_user_id"] != req.user_id:
-            evaluate_and_award_badges(conn, srow["first_added_by_user_id"])
+            others.add(srow["first_added_by_user_id"])
+    for uid in others:
+        evaluate_and_award_badges(conn, uid)
 
     return {
         "results": results,
+        "skipped": skipped,
         "new_badges": new_badges,
     }
 
@@ -837,6 +1421,8 @@ async def update_playlist_track(
 ):
     req.user_id = resolve_actor(request, req.user_id)
     require_playlist_owner(conn, playlist_id, req.user_id)
+    if req.new_video_id and req.new_video_id.strip():
+        enforce_rate_limit(request, "add")  # a swap can cost a YouTube lookup, like an add
     cur = conn.cursor()
     cur.execute(
         """
@@ -853,7 +1439,8 @@ async def update_playlist_track(
         raise HTTPException(status_code=404, detail="Track not found in playlist")
 
     migrated_video_id = track["video_id"]
-    migrated_title = track["current_song_title"]
+    current_row_title = track["display_title"] or track["current_song_title"]
+    migrated_title = current_row_title
     migrated_channel = track["current_channel_title"]
     orig_from_vid = track["migrated_from_video_id"]
     orig_from_title = track["migrated_from_title"]
@@ -871,24 +1458,18 @@ async def update_playlist_track(
         cur.execute("SELECT * FROM songs WHERE video_id = ?", (new_vid,))
         srow = cur.fetchone()
         if not srow:
-            meta = await fetch_youtube_metadata(new_vid, custom_title=req.custom_title)
-            cur.execute(
-                """
-                INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    new_vid,
-                    meta["title"],
-                    meta["channel_title"],
-                    meta["thumbnail_url"],
-                    req.user_id,
-                    playlist_id,
-                    ts,
-                ),
-            )
-            migrated_title = meta["title"]
-            migrated_channel = meta["channel_title"]
+            try:
+                meta = await lookup_new_song_metadata(new_vid)
+            except VideoLookupFailed as exc:
+                raise lookup_failure(exc)
+            inserted, srow = insert_song_if_new(conn, new_vid, meta, req.user_id, playlist_id, ts)
+            migrated_title = srow["title"]
+            migrated_channel = srow["channel_title"]
+        else:
+            migrated_title = srow["title"]
+            migrated_channel = srow["channel_title"]
+            inserted = False
+        if inserted:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -901,9 +1482,11 @@ async def update_playlist_track(
                     ts,
                 ),
             )
-        else:
-            migrated_title = req.custom_title.strip() if (req.custom_title and req.custom_title.strip()) else srow["title"]
-            migrated_channel = srow["channel_title"]
+
+        # The custom title (if any) is this row's display title; it never renames the song.
+        new_display_title = clean_display_title(req.custom_title, migrated_title)
+        if new_display_title:
+            migrated_title = new_display_title
 
         if new_vid != track["video_id"]:
             if orig_from_vid and new_vid == orig_from_vid:
@@ -912,21 +1495,39 @@ async def update_playlist_track(
                 orig_from_title = None
             elif not orig_from_vid:
                 orig_from_vid = track["video_id"]
-                orig_from_title = f"{track['current_song_title']}" + (
+                orig_from_title = f"{current_row_title}" + (
                     f" ({track['current_channel_title']})"
                     if track["current_channel_title"] and track["current_channel_title"] not in ("YouTube", "YouTube Artist")
                     else ""
                 )
 
+        # Grab credit ("from @someone") only survives a swap if the source playlist really
+        # has the new video; otherwise any song could be passed off as theirs.
+        source_pid, source_uid = track["source_playlist_id"], track["source_user_id"]
+        if new_vid != track["video_id"] and source_pid:
+            src = verified_source(conn, source_pid, new_vid)
+            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
+        elif new_vid != track["video_id"]:
+            source_pid, source_uid = None, None
+
         cur.execute(
             """
             UPDATE playlist_tracks
-            SET video_id = ?, migrated_from_video_id = ?, migrated_from_title = ?
+            SET video_id = ?, migrated_from_video_id = ?, migrated_from_title = ?, display_title = ?,
+                source_playlist_id = ?, source_user_id = ?
             WHERE id = ? AND playlist_id = ?
             """,
-            (new_vid, orig_from_vid, orig_from_title, track_id, playlist_id),
+            (new_vid, orig_from_vid, orig_from_title, new_display_title, source_pid, source_uid, track_id, playlist_id),
         )
         migrated_video_id = new_vid
+    elif req.custom_title is not None:
+        # Rename just this row (an empty string goes back to the song's real title).
+        new_display_title = clean_display_title(req.custom_title, track["current_song_title"])
+        cur.execute(
+            "UPDATE playlist_tracks SET display_title = ? WHERE id = ? AND playlist_id = ?",
+            (new_display_title, track_id, playlist_id),
+        )
+        migrated_title = new_display_title or track["current_song_title"]
 
     if req.track_note is not None:
         cur.execute(
@@ -984,7 +1585,7 @@ async def update_playlist_track(
     }
 
 
-@app.post("/api/playlists/import/inspect")
+@app.post("/api/playlists/import/inspect", dependencies=[rate_limit("inspect")])
 async def inspect_playlist_import(req: InspectPlaylistImportRequest, request: Request):
     if auth_enabled():
         resolve_actor(request, None)
@@ -996,9 +1597,12 @@ async def inspect_playlist_import(req: InspectPlaylistImportRequest, request: Re
         return report
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPError as exc:
+        logger.warning("Playlist inspect failed talking to YouTube: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Couldn't reach YouTube. Please try again in a moment.")
 
 
-@app.post("/api/playlists/import/commit")
+@app.post("/api/playlists/import/commit", dependencies=[rate_limit("add")])
 async def commit_playlist_import(
     req: CommitPlaylistImportRequest,
     request: Request,
@@ -1009,6 +1613,9 @@ async def commit_playlist_import(
         require_playlist_owner(conn, req.target_playlist_id, req.user_id)
     if not req.tracks:
         raise HTTPException(status_code=400, detail="Select at least one track to import.")
+    ensure_entry_count(len(req.tracks))
+    if req.target_playlist_id:
+        ensure_playlist_capacity(conn, req.target_playlist_id, len(req.tracks))
 
     cur = conn.cursor()
     ts = now_str()
@@ -1040,6 +1647,7 @@ async def commit_playlist_import(
         conn.commit()
 
     added_tracks = []
+    skipped = []
     for item in req.tracks:
         vids = extract_video_ids(item.video_id)
         if not vids:
@@ -1047,18 +1655,22 @@ async def commit_playlist_import(
         vid = vids[0]
         start_sec = parse_timestamp_seconds(item.start_seconds)
         end_sec = parse_timestamp_seconds(item.end_seconds)
-        res = await add_single_video_to_playlist(
-            conn=conn,
-            playlist_id=playlist_id,
-            user_id=req.user_id,
-            video_id=vid,
-            track_note=item.track_note or "",
-            custom_title=item.custom_title,
-            start_seconds=start_sec,
-            end_seconds=end_sec,
-            migrated_from_video_id=item.migrated_from_video_id,
-            migrated_from_title=item.migrated_from_title,
-        )
+        try:
+            res = await add_single_video_to_playlist(
+                conn=conn,
+                playlist_id=playlist_id,
+                user_id=req.user_id,
+                video_id=vid,
+                track_note=item.track_note or "",
+                custom_title=item.custom_title,
+                start_seconds=start_sec,
+                end_seconds=end_sec,
+                migrated_from_video_id=item.migrated_from_video_id,
+                migrated_from_title=item.migrated_from_title,
+            )
+        except VideoLookupFailed as exc:
+            skipped.append({"video_id": vid, "reason": exc.reason})
+            continue
         added_tracks.append(res)
 
     new_badges = evaluate_and_award_badges(conn, req.user_id)
@@ -1066,6 +1678,7 @@ async def commit_playlist_import(
         "playlist_id": playlist_id,
         "title": playlist_title,
         "added_tracks": added_tracks,
+        "skipped": skipped,
         "new_badges": new_badges,
     }
 
@@ -1073,20 +1686,21 @@ async def commit_playlist_import(
 @app.get("/api/playlists/{playlist_id}/audit-embeds")
 async def audit_playlist_embeds(
     playlist_id: int,
+    request: Request,
+    user_id: Optional[int] = Query(None),
     conn: sqlite3.Connection = Depends(get_db),
 ):
+    # Owner-only: each unique track costs outbound YouTube requests.
+    require_playlist_owner(conn, playlist_id, resolve_actor(request, user_id))
+    enforce_rate_limit(request, "audit")
     cur = conn.cursor()
-    cur.execute("SELECT id, title FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
 
     cur.execute(
         """
         SELECT pt.id AS track_id, pt.video_id, pt.position, pt.track_note,
                pt.start_seconds, pt.end_seconds,
                pt.migrated_from_video_id, pt.migrated_from_title,
-               s.title, s.channel_title, s.thumbnail_url
+               COALESCE(pt.display_title, s.title) AS title, s.channel_title, s.thumbnail_url
         FROM playlist_tracks pt
         JOIN songs s ON s.video_id = pt.video_id
         WHERE pt.playlist_id = ?
@@ -1106,22 +1720,31 @@ async def audit_playlist_embeds(
 
     sem = asyncio.Semaphore(10)
     async with httpx.AsyncClient(timeout=6.5) as client:
-        async def check_row(r: Dict[str, Any]) -> Dict[str, Any]:
+        async def check_one(video_id: str) -> Dict[str, Any]:
             async with sem:
-                info = await check_video_embeddability(r["video_id"], client=client)
-                base_title = r.get("migrated_from_title") or r["title"] or info.get("title") or r["video_id"]
-                return {
-                    **r,
-                    "embeddable": bool(info.get("embeddable")),
-                    "status": info.get("status", "UNKNOWN"),
-                    "reason": info.get("reason"),
-                    "suggested_query": clean_migration_query(
-                        base_title,
-                        "" if r.get("migrated_from_title") else (r["channel_title"] or info.get("channel_title") or ""),
-                    ),
-                }
+                return await check_video_embeddability(video_id, client=client)
 
-        audited = await asyncio.gather(*(check_row(r) for r in rows))
+        # Each distinct video is checked once, however many times it appears.
+        unique_ids = list(dict.fromkeys(r["video_id"] for r in rows))
+        infos = dict(zip(unique_ids, await asyncio.gather(*(check_one(v) for v in unique_ids))))
+
+    audited = []
+    suggestions: Dict[Tuple[str, str], str] = {}
+    for r in rows:
+        info = infos.get(r["video_id"]) or {}
+        base_title = r.get("migrated_from_title") or r["title"] or info.get("title") or r["video_id"]
+        channel = "" if r.get("migrated_from_title") else (r["channel_title"] or info.get("channel_title") or "")
+        if (base_title, channel) not in suggestions:
+            suggestions[(base_title, channel)] = clean_migration_query(base_title, channel)
+        audited.append(
+            {
+                **r,
+                "embeddable": bool(info.get("embeddable")),
+                "status": info.get("status", "UNKNOWN"),
+                "reason": info.get("reason"),
+                "suggested_query": suggestions[(base_title, channel)],
+            }
+        )
 
     embeddable_count = sum(1 for t in audited if t["embeddable"])
     return {
@@ -1201,9 +1824,51 @@ def restore_playlist_snapshot(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
+    """Undo stopgap (replaced by the op log in Phase 1).
+
+    Only the owner's own content is taken from the client: order, notes, clips,
+    migration notes and display titles. Attribution (added_by_user_id, source_*,
+    created_at) is never trusted: a row whose id already belongs to this playlist
+    keeps the attribution it has on the server; any other row is attributed to the
+    actor, now, and only gets a source if that source playlist really contains it.
+    """
     req.user_id = resolve_actor(request, req.user_id)
-    pl = require_playlist_owner(conn, playlist_id, req.user_id)
+    require_playlist_owner(conn, playlist_id, req.user_id)
     cur = conn.cursor()
+
+    if len(req.tracks) > MAX_TRACKS_PER_PLAYLIST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Playlists can hold at most {MAX_TRACKS_PER_PLAYLIST} tracks.",
+        )
+    video_ids = {t.video_id for t in req.tracks}
+    bad = [v for v in video_ids if not VIDEO_ID_PATTERN.match(v)]
+    if bad:
+        raise HTTPException(status_code=400, detail="Snapshot contains an invalid video id.")
+    if video_ids:
+        placeholders = ",".join("?" * len(video_ids))
+        known = {
+            r["video_id"]
+            for r in cur.execute(
+                f"SELECT video_id FROM songs WHERE video_id IN ({placeholders})", tuple(video_ids)
+            ).fetchall()
+        }
+        if known != video_ids:
+            raise HTTPException(status_code=400, detail="Snapshot contains a track that isn't on Webjam.")
+
+    for t in req.tracks:
+        if t.start_seconds is not None and t.end_seconds is not None and t.end_seconds <= t.start_seconds:
+            raise HTTPException(status_code=400, detail="End time must be greater than start time.")
+
+    existing = {
+        r["id"]: r
+        for r in cur.execute("SELECT * FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)).fetchall()
+    }
+    # A client id is only reused for a row that once existed (undoing a delete), never
+    # above the highest id SQLite has handed out: an id near 2^63 would make every
+    # later AUTOINCREMENT insert fail with SQLITE_FULL for the whole site.
+    seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'playlist_tracks'").fetchone()
+    max_issued_id = int(seq_row["seq"]) if seq_row else 0
 
     ts = now_str()
     cur.execute(
@@ -1212,67 +1877,80 @@ def restore_playlist_snapshot(
     )
 
     cur.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
+    used_ids = set()
     for idx, t in enumerate(req.tracks, start=1):
-        if t.id is not None:
-            cur.execute(
-                """
-                INSERT INTO playlist_tracks (
-                    id, playlist_id, video_id, position, track_note,
-                    start_seconds, end_seconds,
-                    migrated_from_video_id, migrated_from_title,
-                    added_by_user_id, source_playlist_id, source_user_id, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    t.id,
-                    playlist_id,
-                    t.video_id,
-                    idx,
-                    (t.track_note or "").strip(),
-                    t.start_seconds,
-                    t.end_seconds,
-                    t.migrated_from_video_id,
-                    t.migrated_from_title,
-                    t.added_by_user_id or pl["user_id"],
-                    t.source_playlist_id,
-                    t.source_user_id,
-                    t.created_at or ts,
-                ),
-            )
+        orig = existing.get(t.id) if t.id is not None and t.id not in used_ids else None
+        row_id: Optional[int] = None
+        if orig is not None and orig["video_id"] == t.video_id:
+            row_id = orig["id"]
+            added_by = orig["added_by_user_id"]
+            source_pid, source_uid = orig["source_playlist_id"], orig["source_user_id"]
+            created_at = orig["created_at"]
+            fallback_display = orig["display_title"]
+        elif orig is not None:
+            # Same row, different song (e.g. undoing a swap): its grab credit only carries
+            # over if the source playlist really contains this song.
+            row_id = orig["id"]
+            added_by = orig["added_by_user_id"]
+            src = verified_source(conn, orig["source_playlist_id"] or t.source_playlist_id, t.video_id)
+            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
+            created_at = orig["created_at"]
+            fallback_display = None
         else:
-            cur.execute(
-                """
-                INSERT INTO playlist_tracks (
-                    playlist_id, video_id, position, track_note,
-                    start_seconds, end_seconds,
-                    migrated_from_video_id, migrated_from_title,
-                    added_by_user_id, source_playlist_id, source_user_id, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    playlist_id,
-                    t.video_id,
-                    idx,
-                    (t.track_note or "").strip(),
-                    t.start_seconds,
-                    t.end_seconds,
-                    t.migrated_from_video_id,
-                    t.migrated_from_title,
-                    t.added_by_user_id or pl["user_id"],
-                    t.source_playlist_id,
-                    t.source_user_id,
-                    t.created_at or ts,
-                ),
+            # Reuse a client id only if no row anywhere holds it (e.g. undoing a delete).
+            if t.id is not None and t.id <= max_issued_id and t.id not in used_ids:
+                if not cur.execute("SELECT 1 FROM playlist_tracks WHERE id = ?", (t.id,)).fetchone():
+                    row_id = t.id
+            added_by = req.user_id
+            src = verified_source(conn, t.source_playlist_id, t.video_id)
+            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
+            created_at = ts
+            fallback_display = None
+        display_title = (
+            ((t.display_title or "").strip()[:MAX_TITLE] or None)
+            if "display_title" in t.model_fields_set
+            else fallback_display
+        )
+        migrated_vid = (
+            t.migrated_from_video_id
+            if t.migrated_from_video_id and VIDEO_ID_PATTERN.match(t.migrated_from_video_id)
+            else None
+        )
+        cur.execute(
+            """
+            INSERT INTO playlist_tracks (
+                id, playlist_id, video_id, position, track_note,
+                start_seconds, end_seconds,
+                migrated_from_video_id, migrated_from_title, display_title,
+                added_by_user_id, source_playlist_id, source_user_id, created_at
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_id,
+                playlist_id,
+                t.video_id,
+                idx,
+                (t.track_note or "").strip(),
+                t.start_seconds,
+                t.end_seconds,
+                migrated_vid,
+                (t.migrated_from_title or "").strip() or None,
+                display_title,
+                added_by,
+                source_pid,
+                source_uid,
+                created_at,
+            ),
+        )
+        used_ids.add(cur.lastrowid)
 
     conn.commit()
     return {"ok": True}
 
 
 
-@app.post("/api/playlists/{playlist_id}/like")
+@app.post("/api/playlists/{playlist_id}/like", dependencies=[rate_limit("like")])
 def toggle_playlist_like(
     playlist_id: int, req: ToggleLikeRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
@@ -1368,11 +2046,13 @@ def toggle_playlist_like(
     }
 
 
-@app.post("/api/songs/{video_id}/like")
+@app.post("/api/songs/{video_id}/like", dependencies=[rate_limit("like")])
 def toggle_song_like(
     video_id: str, req: ToggleLikeRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
     req.user_id = resolve_actor(request, req.user_id)
+    if not VIDEO_ID_PATTERN.match(video_id):
+        raise HTTPException(status_code=404, detail="Song not found in Webjam")
     cur = conn.cursor()
     cur.execute("SELECT video_id, title, first_added_by_user_id FROM songs WHERE video_id = ?", (video_id,))
     song = cur.fetchone()
@@ -1465,31 +2145,81 @@ def toggle_song_like(
     }
 
 
-@app.post("/api/playlists/{playlist_id}/play")
+_play_record_lock = threading.Lock()
+
+
+def _play_badge_eval_due(owner_id: int) -> bool:
+    """Play-driven badge evaluation runs at most once a minute per playlist owner."""
+    now = time.monotonic()
+    with _play_badge_eval_lock:
+        last = _last_play_badge_eval.get(owner_id)
+        if last is not None and now - last < PLAY_BADGE_EVAL_INTERVAL:
+            return False
+        _last_play_badge_eval[owner_id] = now
+        return True
+
+
+@app.post("/api/playlists/{playlist_id}/play", dependencies=[rate_limit("play")])
 def record_playlist_play(
-    playlist_id: int, req: RecordPlayRequest, conn: sqlite3.Connection = Depends(get_db)
+    playlist_id: int, req: RecordPlayRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
+    """Count one play. req.count is ignored and video_id must be in the playlist.
+
+    The playlist's play count goes up at most once per listener (user, else IP) per
+    playlist every 30 minutes, and never for the owner's own listening (it feeds
+    badges). A song's total_plays counts once per listener+track per 30 minutes."""
     cur = conn.cursor()
     cur.execute("SELECT id, user_id, plays FROM playlists WHERE id = ?", (playlist_id,))
     pl = cur.fetchone()
     if not pl:
         raise HTTPException(status_code=404, detail="Playlist not found")
 
-    inc = max(1, min(req.count, 20))
-    cur.execute("UPDATE playlists SET plays = plays + ? WHERE id = ?", (inc, playlist_id))
-    if req.video_id:
-        cur.execute(
-            "UPDATE songs SET total_plays = total_plays + ? WHERE video_id = ?",
-            (inc, req.video_id),
-        )
-    conn.commit()
+    video_id = (req.video_id or "").strip()
+    if video_id:
+        in_playlist = cur.execute(
+            "SELECT 1 FROM playlist_tracks WHERE playlist_id = ? AND video_id = ?",
+            (playlist_id, video_id),
+        ).fetchone()
+        if not in_playlist:
+            raise HTTPException(status_code=400, detail="That track isn't in this playlist.")
 
-    owner_badges = evaluate_and_award_badges(conn, pl["user_id"])
+    key = viewer_key(request)
+    is_owner = auth_enabled() and session_user_id(request) == pl["user_id"]
+    now = int(time.time())
+    since = now - PLAY_DEDUPE_SECONDS
+    with _play_record_lock:
+        cur.execute("DELETE FROM play_events WHERE at < ?", (since,))
+        playlist_recent = cur.execute(
+            "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND at >= ?",
+            (key, playlist_id, since),
+        ).fetchone()
+        track_recent = playlist_recent and cur.execute(
+            "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND video_id = ? AND at >= ?",
+            (key, playlist_id, video_id, since),
+        ).fetchone()
+        counted = playlist_recent is None and not is_owner
+        if not track_recent:
+            cur.execute(
+                "INSERT INTO play_events (viewer_key, playlist_id, video_id, at) VALUES (?, ?, ?, ?)",
+                (key, playlist_id, video_id, now),
+            )
+            if video_id:
+                cur.execute("UPDATE songs SET total_plays = total_plays + 1 WHERE video_id = ?", (video_id,))
+        if counted:
+            cur.execute("UPDATE playlists SET plays = plays + 1 WHERE id = ?", (playlist_id,))
+        conn.commit()
+
+    owner_badges = (
+        evaluate_and_award_badges(conn, pl["user_id"])
+        if counted and _play_badge_eval_due(pl["user_id"])
+        else []
+    )
     cur.execute("SELECT plays FROM playlists WHERE id = ?", (playlist_id,))
     updated_plays = cur.fetchone()["plays"]
 
     return {
         "plays": updated_plays,
+        "counted": counted,
         "owner_user_id": pl["user_id"],
         "new_badges": owner_badges,
     }
@@ -1557,7 +2287,7 @@ def get_song_page(
         (video_id,),
     )
     song["appearances"] = [dict(r) for r in cur.fetchall()]
-    song["comments"] = fetch_comments(conn, "song", video_id)
+    song["comments"], song["comments_has_more"] = fetch_comments_page(conn, "song", video_id)
     return song
 
 
@@ -1574,6 +2304,7 @@ def get_user_profile(
 
     user = dict(urow)
     user.pop("password_hash", None)
+    user.pop("session_epoch", None)
 
     badge_data = get_user_badge_progress(conn, profile_user_id)
 
@@ -1599,7 +2330,7 @@ def get_user_profile(
         cur.execute(
             """
             SELECT pt.id, pt.video_id, pt.position, pt.track_note, pt.start_seconds, pt.end_seconds,
-                   s.title, s.channel_title,
+                   COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, s.channel_title,
                    su.username AS source_username,
                    (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = pt.video_id) AS song_like_count,
                    (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = pt.video_id AND sl.user_id = ?) AS song_my_likes
@@ -1729,6 +2460,7 @@ def get_user_profile(
         (profile_user_id, profile_user_id),
     )
     grabs_by_user = [dict(r) for r in cur.fetchall()]
+    profile_comments, profile_comments_more = fetch_comments_page(conn, "profile", str(profile_user_id))
 
     return {
         "user": user,
@@ -1741,11 +2473,52 @@ def get_user_profile(
         "liked_playlists": liked_playlists,
         "grabs_from_user": grabs_from_user,
         "grabs_by_user": grabs_by_user,
-        "comments": fetch_comments(conn, "profile", str(profile_user_id)),
+        "comments": profile_comments,
+        "comments_has_more": profile_comments_more,
     }
 
 
-@app.post("/api/comments")
+def resolve_comment_target(conn: sqlite3.Connection, target_type: str, target_id: str) -> Tuple[str, str]:
+    """Validate a comment target. Returns (canonical target_id, activity label); 400/404 otherwise."""
+    cur = conn.cursor()
+    raw = (target_id or "").strip()
+    if target_type in ("playlist", "profile"):
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 18:
+            raise HTTPException(status_code=400, detail=f"Invalid {target_type} id")
+        num = int(raw)
+        if target_type == "playlist":
+            r = cur.execute("SELECT title FROM playlists WHERE id = ?", (num,)).fetchone()
+            if not r:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            return str(num), f"playlist '{r['title']}'"
+        r = cur.execute("SELECT username FROM users WHERE id = ?", (num,)).fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="User not found")
+        return str(num), f"@{r['username']}'s profile"
+    if target_type == "song":
+        if not VIDEO_ID_PATTERN.match(raw):
+            raise HTTPException(status_code=400, detail="Invalid song id")
+        r = cur.execute("SELECT title FROM songs WHERE video_id = ?", (raw,)).fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Song not found in Webjam")
+        return raw, f"song '{r['title']}'"
+    raise HTTPException(status_code=400, detail="Invalid comment target_type")
+
+
+@app.get("/api/comments")
+def list_comments(
+    target_type: str = Query(..., max_length=16),
+    target_id: str = Query(..., max_length=64),
+    before_id: Optional[int] = Query(None),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Older pages of a comment thread: the 50 comments before `before_id`, oldest first."""
+    canonical, _ = resolve_comment_target(conn, target_type, target_id)
+    comments, has_more = fetch_comments_page(conn, target_type, canonical, before_id=before_id)
+    return {"comments": comments, "has_more": has_more}
+
+
+@app.post("/api/comments", dependencies=[rate_limit("comment")])
 def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
     req.author_user_id = resolve_actor(request, req.author_user_id)
     if req.target_type not in ("playlist", "song", "profile"):
@@ -1753,6 +2526,7 @@ def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Co
     body = req.body.strip()
     if not body:
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
+    target_id, label = resolve_comment_target(conn, req.target_type, req.target_id)
 
     ts = now_str()
     cur = conn.cursor()
@@ -1761,52 +2535,50 @@ def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Co
         INSERT INTO comments (author_user_id, target_type, target_id, body, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (req.author_user_id, req.target_type, str(req.target_id), body, ts),
+        (req.author_user_id, req.target_type, target_id, body, ts),
     )
-
-    # Record activity
-    label = req.target_type
-    if req.target_type == "playlist":
-        cur.execute("SELECT title FROM playlists WHERE id = ?", (int(req.target_id),))
-        r = cur.fetchone()
-        label = f"playlist '{r['title']}'" if r else "a playlist"
-    elif req.target_type == "song":
-        cur.execute("SELECT title FROM songs WHERE video_id = ?", (req.target_id,))
-        r = cur.fetchone()
-        label = f"song '{r['title']}'" if r else "a song"
-    elif req.target_type == "profile":
-        cur.execute("SELECT username FROM users WHERE id = ?", (int(req.target_id),))
-        r = cur.fetchone()
-        label = f"@{r['username']}'s profile" if r else "a profile"
-
     cur.execute(
         """
         INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
         VALUES (?, 'commented', ?, ?, ?, ?)
         """,
-        (req.author_user_id, f"commented on {label}", req.target_type, str(req.target_id), ts),
+        (req.author_user_id, f"commented on {label}", req.target_type, target_id, ts),
     )
     conn.commit()
 
     new_badges = evaluate_and_award_badges(conn, req.author_user_id)
+    comments, has_more = fetch_comments_page(conn, req.target_type, target_id)
     return {
-        "comments": fetch_comments(conn, req.target_type, str(req.target_id)),
+        "comments": comments,
+        "comments_has_more": has_more,
         "new_badges": new_badges,
     }
 
 
 @app.get("/api/youtube/search")
 async def search_youtube_embeddable(
-    q: str = Query(..., min_length=1),
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(8, ge=1, le=15),
 ):
-    results = await search_embeddable_youtube_songs(q, max_results=limit)
+    if auth_enabled():
+        # Guests can't add tracks, and every search spends shared YouTube quota.
+        resolve_actor(request, None)
+    results = cached_search_results(q, max_results=limit)
+    if results is None:
+        enforce_rate_limit(request, "search")  # only cache misses cost anything
+        try:
+            results = await search_embeddable_youtube_songs(q, max_results=limit)
+        except SearchBudgetExceeded:
+            raise HTTPException(
+                status_code=503,
+                detail="Webjam's YouTube search budget for today is used up. Paste a YouTube link instead, or try again tomorrow.",
+            )
     return {"query": q, "results": results}
 
 
-@app.get("/api/youtube/check/{video_id}")
-async def check_youtube_embeddable(video_id: str):
-    return await check_video_embeddability(video_id)
+# GET /api/youtube/check/{video_id} was removed: the frontend never used it and it let
+# anonymous callers send unvalidated ids to YouTube.
 
 
 # Serve static files

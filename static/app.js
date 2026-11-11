@@ -56,6 +56,29 @@ function esc(str) {
     .replace(/'/g, '&#39;');
 }
 
+// Encode a value as a JS literal that is safe to drop into an inline on*="..."
+// handler attribute. JSON.stringify produces a valid JS expression (quoting
+// and backslash-escaping strings); esc() then HTML-attribute-escapes it so the
+// HTML parser decodes it back to exactly that literal before the JS runs.
+// Never put esc() output inside '...' in a handler: the browser decodes &#39;
+// back to ' before the JS engine sees it.
+function jsArg(value) {
+  return esc(JSON.stringify(value === undefined ? null : value));
+}
+
+// Number-or-null for optional numeric fields (e.g. clip start/end seconds).
+function numOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Only allow #rgb / #rrggbb colours from data into style attributes.
+function safeColor(value, fallback = '#8a8a8a') {
+  const s = String(value ?? '').trim();
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s) ? s : fallback;
+}
+
 function shortDate(iso) {
   if (!iso) return '';
   return String(iso).slice(0, 10);
@@ -160,7 +183,7 @@ function formatCoSignersHtml(users) {
           : cnt > 1
           ? ` <span class="superlove-my-pill" title="Loved ×${cnt}">×${cnt}</span>`
           : '';
-      return `<a href="#user/${u.id}" onclick="navigate('user', ${u.id}); return false;">@${esc(u.username)}</a>${badge}`;
+      return `<a href="#user/${Number(u.id)}" onclick="navigate('user', ${Number(u.id)}); return false;">@${esc(u.username)}</a>${badge}`;
     })
     .join(', ');
 }
@@ -259,18 +282,54 @@ function notifyBadges(badges, ownerUsername = null) {
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     ...options,
+    // X-Webjam marks same-origin app requests; the backend requires it on
+    // unsafe methods as a CSRF guard (custom headers force a CORS preflight).
+    headers: { 'Content-Type': 'application/json', 'X-Webjam': '1', ...(options.headers || {}) },
   });
   if (!res.ok) {
     let errText = `Request failed (${res.status})`;
     try {
       const data = await res.json();
-      if (data.detail) errText = data.detail;
+      // FastAPI validation errors (422) carry a list of {msg, ...}.
+      if (Array.isArray(data.detail)) {
+        errText = data.detail.map((d) => (d && d.msg) || String(d)).join('; ') || errText;
+      } else if (data.detail) {
+        errText = String(data.detail);
+      }
     } catch (_) {}
-    throw new Error(errText);
+    const err = new Error(errText);
+    err.status = res.status;
+    err.retryAfter = Number(res.headers.get('Retry-After')) || 0;
+    throw err;
   }
   return res.json();
+}
+
+// For loops that make many requests (auto-migrate): wait out a 429/503 and retry
+// instead of silently skipping the rest.
+async function apiWithRetry(path, options = {}, attempts = 4) {
+  for (let i = 1; ; i++) {
+    try {
+      return await api(path, options);
+    } catch (err) {
+      if (i >= attempts || (err.status !== 429 && err.status !== 503)) throw err;
+      const waitSec = Math.min(Math.max(err.retryAfter || 2, 1), 30);
+      await new Promise((resolve) => setTimeout(resolve, waitSec * 1000));
+    }
+  }
+}
+
+// " (2 skipped: …)" for add/import results whose videos YouTube couldn't look up.
+function skippedNote(skipped) {
+  const list = Array.isArray(skipped) ? skipped : [];
+  if (!list.length) return '';
+  const unavailable = list.filter((s) => s && s.reason === 'youtube_unavailable').length;
+  const missing = list.length - unavailable;
+  const parts = [];
+  if (missing) parts.push(`${missing} not found on YouTube`);
+  if (unavailable) parts.push(`${unavailable} couldn't be checked right now, try again`);
+  return ` (${list.length} skipped: ${parts.join(', ')})`;
 }
 
 // --- YouTube IFrame Player API Integration ---
@@ -498,7 +557,7 @@ function mountOrLoadYouTubeVideo(videoId, startSeconds = null, endSeconds = null
       onError: (event) => {
         stopClipMonitor();
         showToast(
-          `YouTube embed notice (code ${event.data}) — creator restricts external embedding or video unavailable. Advancing queue…`
+          `YouTube embed notice (code ${Number(event.data)}) — creator restricts external embedding or video unavailable. Advancing queue…`
         );
         setTimeout(() => {
           if (state.queue.length > 1 && state.queueIndex < state.queue.length - 1) {
@@ -614,7 +673,11 @@ async function simulateExtraSpin() {
         count: 1,
       }),
     });
-    showToast(`Logged +1 spin on "${esc(state.queuePlaylistTitle)}" (Total: ${res.plays} plays)`);
+    showToast(
+      res.counted
+        ? `Logged +1 spin on "${esc(state.queuePlaylistTitle)}" (Total: ${res.plays} plays)`
+        : `Spin not counted: your own playlist, or already counted in the last 30 min (Total: ${res.plays} plays)`
+    );
     notifyBadges(res.new_badges, state.queuePlaylistOwner);
     await refreshBootstrapSilently();
     renderCurrentRoute();
@@ -693,7 +756,7 @@ function updatePlayerDeckUI() {
     metaHtml += ` · <span class="pill pill-commons" title="Configured track clip window">⏱ ${esc(clipLabel)}</span>`;
   }
   if (state.queuePlaylistId) {
-    metaHtml += ` · from <a href="#playlist/${state.queuePlaylistId}" onclick="navigate('playlist', ${state.queuePlaylistId}); return false;">${esc(state.queuePlaylistTitle)}</a>`;
+    metaHtml += ` · from <a href="#playlist/${Number(state.queuePlaylistId)}" onclick="navigate('playlist', ${Number(state.queuePlaylistId)}); return false;">${esc(state.queuePlaylistTitle)}</a>`;
     if (state.queuePlaylistOwner) {
       metaHtml += ` by <strong>@${esc(state.queuePlaylistOwner)}</strong>`;
     }
@@ -773,7 +836,7 @@ function updatePlayerDeckUI() {
       const itemMyLikes = Number(item.song_my_likes ?? (item.song_liked_by_me ? 1 : 0));
       const itemLikes = Number(item.song_like_count ?? 0);
       return `
-      <li class="queue-item ${idx === state.queueIndex ? 'active' : ''}" onclick="playQueueIndex(${idx}, false)">
+      <li class="queue-item ${idx === state.queueIndex ? 'active' : ''}" onclick="playQueueIndex(${Number(idx)}, false)">
         <span style="min-width:0; overflow:hidden; text-overflow:ellipsis;">
           <span class="muted" style="font-family:var(--font-mono); margin-right:6px;">${String(idx + 1).padStart(2, '0')}</span>${esc(item.title)}
           ${item.migrated_from_video_id ? `<span class="embed-pill-migrated" style="margin-left:4px; padding:0 4px; font-size:9.5px;" title="Migrated from ${esc(item.migrated_from_title || item.migrated_from_video_id)}">⇄</span>` : ''}
@@ -785,7 +848,7 @@ function updatePlayerDeckUI() {
             class="queue-like-btn ${getLoveBtnClasses(itemMyLikes)}"
             data-song-like-btn="${esc(item.video_id)}"
             data-like-mode="queue"
-            onclick="toggleLikeSong('${esc(item.video_id)}', event)"
+            onclick="toggleLikeSong(${jsArg(item.video_id)}, event)"
             title="${esc(getLoveBtnTitle(itemMyLikes, 'song'))}"
           >${formatLoveBtnHtml(itemMyLikes, itemLikes, 'queue')}</button>
           <span class="muted" style="font-size:11px;">${idx === state.queueIndex ? '▶' : ''}</span>
@@ -873,8 +936,8 @@ function renderPersonaBar() {
     }
     const u = state.currentUser;
     container.innerHTML = state.auth.signed_in
-      ? `<a href="#user/${u.id}" class="persona-pill active" onclick="navigate('user', ${u.id}); return false;">
-           <span class="persona-dot" style="background:${esc(u.avatar_color)}"></span>@${esc(u.username)}
+      ? `<a href="#user/${Number(u.id)}" class="persona-pill active" onclick="navigate('user', ${Number(u.id)}); return false;">
+           <span class="persona-dot" style="background:${esc(safeColor(u.avatar_color))}"></span>@${esc(u.username)}
          </a>
          <button type="button" class="btn-tiny btn-outline" onclick="signOut()">Sign out</button>`
       : `<a href="/auth/google/login" class="btn-tiny btn-primary" style="text-decoration:none;">Sign in with Google</a>`;
@@ -886,10 +949,10 @@ function renderPersonaBar() {
       <button
         type="button"
         class="persona-pill ${u.id === state.currentUserId ? 'active' : ''}"
-        onclick="switchPersona(${u.id})"
+        onclick="switchPersona(${Number(u.id)})"
         title="@${esc(u.username)} (${u.badge_count} badges, ${u.playlist_count} playlists)"
       >
-        <span class="persona-dot" style="background:${esc(u.avatar_color)}"></span>
+        <span class="persona-dot" style="background:${esc(safeColor(u.avatar_color))}"></span>
         @${esc(u.username)}
       </button>
     `
@@ -932,8 +995,8 @@ function renderSidebarUserCard() {
   el.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
       <div>
-        <span class="user-avatar-dot" style="background:${esc(u.avatar_color)}"></span>
-        <strong><a href="#user/${u.id}" onclick="navigate('user', ${u.id}); return false;">@${esc(u.username)}</a></strong>
+        <span class="user-avatar-dot" style="background:${esc(safeColor(u.avatar_color))}"></span>
+        <strong><a href="#user/${Number(u.id)}" onclick="navigate('user', ${Number(u.id)}); return false;">@${esc(u.username)}</a></strong>
         <span class="muted" style="font-size:12px;">(${esc(u.display_name)})</span>
       </div>
       <a href="#badges" onclick="navigate('badges'); return false;" class="mono-badge">${(u.badges || []).length}/${state.badgeCatalog.length} badges</a>
@@ -1035,21 +1098,19 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
     provenancePills += `<span class="pill pill-commons" title="Configured playback window for this track">⏱ ${esc(clipRange)}</span>`;
   }
   if (isFirstFinder) {
-    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', '${esc(t.video_id)}'); return false;" class="pill pill-discovery" title="First added to Webjam by @${esc(t.first_finder_username)}">◈ First on Webjam</a>`;
+    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', ${jsArg(t.video_id)}); return false;" class="pill pill-discovery" title="First added to Webjam by @${esc(t.first_finder_username)}">◈ First on Webjam</a>`;
   } else if (t.first_finder_username) {
-    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', '${esc(t.video_id)}'); return false;" class="pill pill-commons" title="First discovered on Webjam by @${esc(t.first_finder_username)}">◈ 1st: @${esc(t.first_finder_username)}</a>`;
+    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', ${jsArg(t.video_id)}); return false;" class="pill pill-commons" title="First discovered on Webjam by @${esc(t.first_finder_username)}">◈ 1st: @${esc(t.first_finder_username)}</a>`;
   }
 
   if (hasSource) {
-    const srcClick = t.source_playlist_id
-      ? `navigate('playlist', ${t.source_playlist_id}); return false;`
-      : `navigate('user', ${t.source_user_id}); return false;`;
-    const srcHref = t.source_playlist_id ? `#playlist/${t.source_playlist_id}` : `#user/${t.source_user_id}`;
-    provenancePills += `<a href="${srcHref}" onclick="${srcClick}" class="pill pill-lineage" title="Grabbed from @${esc(t.source_username)}${t.source_playlist_title ? ` (${esc(t.source_playlist_title)})` : ''}">↳ via @${esc(t.source_username)}</a>`;
+    const srcView = t.source_playlist_id ? 'playlist' : 'user';
+    const srcId = Number(t.source_playlist_id || t.source_user_id);
+    provenancePills += `<a href="#${esc(srcView)}/${Number(srcId)}" onclick="navigate(${jsArg(srcView)}, ${Number(srcId)}); return false;" class="pill pill-lineage" title="Grabbed from @${esc(t.source_username)}${t.source_playlist_title ? ` (${esc(t.source_playlist_title)})` : ''}">↳ via @${esc(t.source_username)}</a>`;
   }
 
   if (t.playlist_count && t.playlist_count > 1) {
-    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', '${esc(t.video_id)}'); return false;" class="pill pill-commons" title="See all ${t.playlist_count} playlists featuring this song">in ${t.playlist_count} playlists</a>`;
+    provenancePills += `<a href="#song/${encodeURIComponent(t.video_id)}" onclick="navigate('song', ${jsArg(t.video_id)}); return false;" class="pill pill-commons" title="See all ${t.playlist_count} playlists featuring this song">in ${t.playlist_count} playlists</a>`;
   }
 
   if (t.migrated_from_video_id) {
@@ -1058,7 +1119,7 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
       : t.migrated_from_video_id;
     const clickAttr =
       isOwner && t.id
-        ? `onclick="openMigrateSongModal(${playlist.id}, ${t.id})" style="cursor:pointer;"`
+        ? `onclick="openMigrateSongModal(${Number(playlist.id)}, ${Number(t.id)})" style="cursor:pointer;"`
         : '';
     const titleHint =
       isOwner && t.id
@@ -1079,18 +1140,18 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
   let ownerControls = '';
   const canDrag = Boolean(isOwner && isDetailView && t.id);
   if (isOwner && t.id) {
-    const clipBtn = `<button type="button" class="btn-tiny btn-secondary" onclick="openTrackClipModal(${playlist.id}, ${t.id})" title="Configure start/end position and liner note">⏱ Clip / Note</button>`;
+    const clipBtn = `<button type="button" class="btn-tiny btn-secondary" onclick="openTrackClipModal(${Number(playlist.id)}, ${Number(t.id)})" title="Configure start/end position and liner note">⏱ Clip / Note</button>`;
     const swapTitle = t.migrated_from_video_id
       ? `Migrated from "${t.migrated_from_title || t.migrated_from_video_id}" — swap to a different or higher-quality YouTube version`
       : 'Swap this track to a different YouTube version';
-    const migrateBtn = `<button type="button" class="btn-tiny btn-secondary" onclick="openMigrateSongModal(${playlist.id}, ${t.id})" title="${esc(swapTitle)}">⇄ Swap</button>`;
+    const migrateBtn = `<button type="button" class="btn-tiny btn-secondary" onclick="openMigrateSongModal(${Number(playlist.id)}, ${Number(t.id)})" title="${esc(swapTitle)}">⇄ Swap</button>`;
     if (isDetailView) {
       ownerControls = `
         ${migrateBtn}
         ${clipBtn}
-        <button type="button" class="btn-tiny btn-secondary" onclick="moveTrack(${playlist.id}, ${t.id}, 'up')" title="Move track up">↑</button>
-        <button type="button" class="btn-tiny btn-secondary" onclick="moveTrack(${playlist.id}, ${t.id}, 'down')" title="Move track down">↓</button>
-        <button type="button" class="btn-tiny btn-secondary" onclick="removeTrack(${playlist.id}, ${t.id})" title="Remove track from playlist">×</button>
+        <button type="button" class="btn-tiny btn-secondary" onclick="moveTrack(${Number(playlist.id)}, ${Number(t.id)}, 'up')" title="Move track up">↑</button>
+        <button type="button" class="btn-tiny btn-secondary" onclick="moveTrack(${Number(playlist.id)}, ${Number(t.id)}, 'down')" title="Move track down">↓</button>
+        <button type="button" class="btn-tiny btn-secondary" onclick="removeTrack(${Number(playlist.id)}, ${Number(t.id)})" title="Remove track from playlist">×</button>
       `;
     } else {
       ownerControls = `${migrateBtn} ${clipBtn}`;
@@ -1098,7 +1159,7 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
   }
 
   const dragAttrs = canDrag
-    ? `draggable="true" data-track-id="${t.id}" ondragstart="handleTrackDragStart(event, ${playlist.id}, ${t.id})" ondragover="handleTrackDragOver(event, ${playlist.id}, ${t.id})" ondragleave="handleTrackDragLeave(event)" ondrop="handleTrackDrop(event, ${playlist.id}, ${t.id})" ondragend="handleTrackDragEnd(event)"`
+    ? `draggable="true" data-track-id="${t.id}" ondragstart="handleTrackDragStart(event, ${Number(playlist.id)}, ${Number(t.id)})" ondragover="handleTrackDragOver(event, ${Number(playlist.id)}, ${Number(t.id)})" ondragleave="handleTrackDragLeave(event)" ondrop="handleTrackDrop(event, ${Number(playlist.id)}, ${Number(t.id)})" ondragend="handleTrackDragEnd(event)"`
     : '';
   const dragHandleHtml = canDrag
     ? `<span class="track-drag-handle" title="Drag song into place">⠿</span>`
@@ -1115,12 +1176,12 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
         <button
           type="button"
           class="btn-play-inline"
-          onclick="playTrackFromPlaylistId(${playlist.id}, ${idx})"
+          onclick="playTrackFromPlaylistId(${Number(playlist.id)}, ${Number(idx)})"
           title="Play starting from this track"
         >▶</button>
         <div class="track-body">
           <div class="track-main-line">
-            <a href="#song/${encodeURIComponent(t.video_id)}" class="track-title-link" onclick="navigate('song', '${esc(t.video_id)}'); return false;">
+            <a href="#song/${encodeURIComponent(t.video_id)}" class="track-title-link" onclick="navigate('song', ${jsArg(t.video_id)}); return false;">
               ${esc(t.title)}
             </a>
             <span class="track-channel">${esc(t.channel_title)}</span>
@@ -1136,22 +1197,22 @@ function renderTrackRow(t, playlist, idx, isOwner = false, isDetailView = false)
           class="btn-tiny btn-secondary btn-like ${getLoveBtnClasses(trackMyLikes)}"
           data-song-like-btn="${esc(t.video_id)}"
           data-like-mode="compact"
-          onclick="toggleLikeSong('${esc(t.video_id)}', event)"
+          onclick="toggleLikeSong(${jsArg(t.video_id)}, event)"
           title="${esc(getLoveBtnTitle(trackMyLikes, 'song'))}"
         >${formatLoveBtnHtml(trackMyLikes, trackTotalLikes, 'compact')}</button>
         <button
           type="button"
           class="btn-tiny btn-secondary"
           onclick="openGrabModal({
-            videoId: '${esc(t.video_id)}',
-            title: '${esc(t.title)}',
-            channelTitle: '${esc(t.channel_title)}',
-            sourcePlaylistId: ${playlist.id},
-            sourcePlaylistTitle: '${esc(playlist.title)}',
-            sourceUserId: ${playlist.user_id},
-            sourceUsername: '${esc(playlist.username || '')}',
-            startSeconds: ${t.start_seconds !== null && t.start_seconds !== undefined ? Number(t.start_seconds) : 'null'},
-            endSeconds: ${t.end_seconds !== null && t.end_seconds !== undefined ? Number(t.end_seconds) : 'null'}
+            videoId: ${jsArg(t.video_id)},
+            title: ${jsArg(t.title)},
+            channelTitle: ${jsArg(t.channel_title)},
+            sourcePlaylistId: ${jsArg(numOrNull(playlist.id))},
+            sourcePlaylistTitle: ${jsArg(playlist.title)},
+            sourceUserId: ${jsArg(numOrNull(playlist.user_id))},
+            sourceUsername: ${jsArg(playlist.username || '')},
+            startSeconds: ${jsArg(numOrNull(t.start_seconds))},
+            endSeconds: ${jsArg(numOrNull(t.end_seconds))}
           })"
           title="Grab this song into one of your playlists"
         >+ Grab</button>
@@ -1193,29 +1254,29 @@ async function renderFeedView(container) {
           <div class="playlist-sheet-header">
             <div class="playlist-title-bar">
               <div>
-                <a href="#playlist/${pl.id}" class="playlist-title-link" onclick="navigate('playlist', ${pl.id}); return false;">
+                <a href="#playlist/${Number(pl.id)}" class="playlist-title-link" onclick="navigate('playlist', ${Number(pl.id)}); return false;">
                   ${esc(pl.title)}
                 </a>
                 <div class="playlist-byline">
-                  <span>curated by <a href="#user/${pl.user_id}" class="user-chip" onclick="navigate('user', ${pl.user_id}); return false;">
-                    <span class="user-avatar-dot" style="background:${esc(pl.avatar_color)}"></span>@${esc(pl.username)}
+                  <span>curated by <a href="#user/${Number(pl.user_id)}" class="user-chip" onclick="navigate('user', ${Number(pl.user_id)}); return false;">
+                    <span class="user-avatar-dot" style="background:${esc(safeColor(pl.avatar_color))}"></span>@${esc(pl.username)}
                   </a></span>
                   <span>· ${pl.track_count} tracks</span>
                   <span>· ${pl.plays} spins</span>
                   ${pl.times_grabbed_from > 0 ? `<span class="pill pill-lineage" title="Other users grabbed tracks from this playlist ${pl.times_grabbed_from} times">⚡ ${pl.times_grabbed_from} grabbed</span>` : ''}
-                  <span>· <a href="#playlist/${pl.id}" onclick="navigate('playlist', ${pl.id}); return false;">💬 ${pl.comment_count || 0} comments</a></span>
+                  <span>· <a href="#playlist/${Number(pl.id)}" onclick="navigate('playlist', ${Number(pl.id)}); return false;">💬 ${pl.comment_count || 0} comments</a></span>
                 </div>
               </div>
               <div class="playlist-actions-cluster">
-                <button class="btn-primary btn-tiny" onclick="playTrackFromPlaylistId(${pl.id}, 0)">▶ Play Mix</button>
+                <button class="btn-primary btn-tiny" onclick="playTrackFromPlaylistId(${Number(pl.id)}, 0)">▶ Play Mix</button>
                 <button
                   class="btn-secondary btn-tiny btn-like ${getLoveBtnClasses(plMyLikes)}"
                   data-playlist-like-btn="${pl.id}"
                   data-like-mode="header-playlist"
-                  onclick="toggleLikePlaylist(${pl.id}, event)"
+                  onclick="toggleLikePlaylist(${Number(pl.id)}, event)"
                   title="${esc(getLoveBtnTitle(plMyLikes, 'playlist'))}"
                 >${formatLoveBtnHtml(plMyLikes, pl.like_count, 'header-playlist')}</button>
-                <a href="#playlist/${pl.id}" class="btn-secondary btn-tiny" onclick="navigate('playlist', ${pl.id}); return false;">Open Sheet →</a>
+                <a href="#playlist/${Number(pl.id)}" class="btn-secondary btn-tiny" onclick="navigate('playlist', ${Number(pl.id)}); return false;">Open Sheet →</a>
               </div>
             </div>
             ${pl.description ? `<p class="playlist-liner-notes">${esc(pl.description)}</p>` : ''}
@@ -1238,7 +1299,7 @@ async function renderFeedView(container) {
       return `
       <li class="activity-item">
         <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-          <a href="#song/${encodeURIComponent(s.video_id)}" onclick="navigate('song', '${esc(s.video_id)}'); return false;" style="font-weight:600;">
+          <a href="#song/${encodeURIComponent(s.video_id)}" onclick="navigate('song', ${jsArg(s.video_id)}); return false;" style="font-weight:600;">
             ${esc(s.title)}
           </a>
           <button
@@ -1246,12 +1307,12 @@ async function renderFeedView(container) {
             class="btn-tiny btn-secondary btn-like ${getLoveBtnClasses(sMyLikes)}"
             data-song-like-btn="${esc(s.video_id)}"
             data-like-mode="compact"
-            onclick="toggleLikeSong('${esc(s.video_id)}', event)"
+            onclick="toggleLikeSong(${jsArg(s.video_id)}, event)"
             title="${esc(getLoveBtnTitle(sMyLikes, 'song'))}"
           >${formatLoveBtnHtml(sMyLikes, s.song_like_count, 'compact')}</button>
         </div>
         <div class="muted" style="font-size:11.5px; margin-top:2px;">
-          1st found by <a href="#user/${s.first_added_by_user_id}" onclick="navigate('user', ${s.first_added_by_user_id}); return false;">@${esc(s.finder_username)}</a>
+          1st found by <a href="#user/${Number(s.first_added_by_user_id)}" onclick="navigate('user', ${Number(s.first_added_by_user_id)}); return false;">@${esc(s.finder_username)}</a>
           · in ${s.playlist_count} playlist${s.playlist_count === 1 ? '' : 's'}
         </div>
       </li>
@@ -1264,15 +1325,15 @@ async function renderFeedView(container) {
     .map((a) => {
       let targetLink = '';
       if (a.link_type === 'playlist' && a.link_id) {
-        targetLink = `<a href="#playlist/${a.link_id}" onclick="navigate('playlist', ${Number(a.link_id)}); return false;">view →</a>`;
+        targetLink = `<a href="#playlist/${Number(a.link_id)}" onclick="navigate('playlist', ${Number(a.link_id)}); return false;">view →</a>`;
       } else if (a.link_type === 'song' && a.link_id) {
-        targetLink = `<a href="#song/${encodeURIComponent(a.link_id)}" onclick="navigate('song', '${esc(a.link_id)}'); return false;">song page →</a>`;
+        targetLink = `<a href="#song/${encodeURIComponent(a.link_id)}" onclick="navigate('song', ${jsArg(a.link_id)}); return false;">song page →</a>`;
       } else if (a.link_type === 'profile' && a.link_id) {
-        targetLink = `<a href="#user/${a.link_id}" onclick="navigate('user', ${Number(a.link_id)}); return false;">profile →</a>`;
+        targetLink = `<a href="#user/${Number(a.link_id)}" onclick="navigate('user', ${Number(a.link_id)}); return false;">profile →</a>`;
       }
       return `
         <li class="activity-item">
-          <a href="#user/${a.actor_user_id}" onclick="navigate('user', ${a.actor_user_id}); return false;" style="font-weight:600;">@${esc(a.username)}</a>
+          <a href="#user/${Number(a.actor_user_id)}" onclick="navigate('user', ${Number(a.actor_user_id)}); return false;" style="font-weight:600;">@${esc(a.username)}</a>
           ${esc(a.summary)} ${targetLink}
         </li>
       `;
@@ -1326,7 +1387,7 @@ async function renderPlaylistView(container, playlistId) {
   const ownerDropBox = isOwner
     ? `
       <div class="quick-drop-bar" style="margin-top:12px; background:#f8fbf9;">
-        <form onsubmit="handleDropIntoPlaylist(event, ${pl.id})">
+        <form onsubmit="handleDropIntoPlaylist(event, ${Number(pl.id)})">
           <div style="font-weight:600; font-size:12.5px; margin-bottom:6px; color:var(--accent-primary);">
             + Add YouTube Link(s) to "${esc(pl.title)}"
           </div>
@@ -1347,7 +1408,7 @@ async function renderPlaylistView(container, playlistId) {
   const ownerEditBox = isOwner
     ? `
       <div id="pl-edit-box" class="hidden" style="margin-top:10px; padding:10px; background:#fff; border:1px solid var(--border-strong); border-radius:3px;">
-        <form onsubmit="submitEditPlaylist(event, ${pl.id})">
+        <form onsubmit="submitEditPlaylist(event, ${Number(pl.id)})">
           <label class="form-label">Playlist Title</label>
           <input type="text" id="edit-pl-title" class="input-text full-width" value="${esc(pl.title)}" required />
           <label class="form-label">Playlist Liner Notes / Description</label>
@@ -1380,8 +1441,8 @@ async function renderPlaylistView(container, playlistId) {
           <div>
             <h1 class="page-title" style="font-size:22px;">${esc(pl.title)}</h1>
             <div class="playlist-byline">
-              <span>curated by <a href="#user/${pl.user_id}" class="user-chip" onclick="navigate('user', ${pl.user_id}); return false;">
-                <span class="user-avatar-dot" style="background:${esc(pl.avatar_color)}"></span>@${esc(pl.username)} (${esc(pl.display_name)})
+              <span>curated by <a href="#user/${Number(pl.user_id)}" class="user-chip" onclick="navigate('user', ${Number(pl.user_id)}); return false;">
+                <span class="user-avatar-dot" style="background:${esc(safeColor(pl.avatar_color))}"></span>@${esc(pl.username)} (${esc(pl.display_name)})
               </a></span>
               <span>· ${(pl.tracks || []).length} tracks</span>
               <span>· <strong>${pl.plays}</strong> spins</span>
@@ -1390,17 +1451,17 @@ async function renderPlaylistView(container, playlistId) {
             </div>
           </div>
           <div class="playlist-actions-cluster">
-            <button class="btn-primary" onclick="playTrackFromPlaylistId(${pl.id}, 0)">▶ Play Full Playlist</button>
+            <button class="btn-primary" onclick="playTrackFromPlaylistId(${Number(pl.id)}, 0)">▶ Play Full Playlist</button>
             <button
               class="btn-secondary btn-like ${getLoveBtnClasses(plMyLikes)}"
               data-playlist-like-btn="${pl.id}"
               data-like-mode="header-playlist"
-              onclick="toggleLikePlaylist(${pl.id}, event)"
+              onclick="toggleLikePlaylist(${Number(pl.id)}, event)"
               title="${esc(getLoveBtnTitle(plMyLikes, 'playlist'))}"
             >${formatLoveBtnHtml(plMyLikes, pl.like_count, 'header-playlist')}</button>
-            <button class="btn-secondary" onclick="incrementPlaylistSpin(${pl.id})" title="Record a playlist spin (great for testing play-count badges!)">+1 Spin</button>
-            <button class="btn-secondary" id="audit-embeds-btn-${pl.id}" onclick="auditPlaylistEmbeds(${pl.id})" title="Check all songs in this playlist for embed playback & migrate restricted tracks">🔍 Audit Embeds</button>
-            ${isOwner ? `<button class="btn-secondary" onclick="openImportPlaylistModal(${pl.id})" title="Import a YouTube playlist into this mix">📥 Import YT Playlist</button>` : ''}
+            <button class="btn-secondary" onclick="incrementPlaylistSpin(${Number(pl.id)})" title="Record a playlist spin (counts once per listener every 30 minutes; owners' own spins don't count)">+1 Spin</button>
+            ${isOwner ? `<button class="btn-secondary" id="audit-embeds-btn-${pl.id}" onclick="auditPlaylistEmbeds(${Number(pl.id)})" title="Check all songs in this playlist for embed playback & migrate restricted tracks">🔍 Audit Embeds</button>` : ''}
+            ${isOwner ? `<button class="btn-secondary" onclick="openImportPlaylistModal(${Number(pl.id)})" title="Import a YouTube playlist into this mix">📥 Import YT Playlist</button>` : ''}
             ${isOwner ? `<button class="btn-secondary" onclick="document.getElementById('pl-edit-box').classList.toggle('hidden')">✎ Edit Liner Notes</button>` : ''}
             ${isOwner && lastUndoForPl ? `<button class="btn-secondary" onclick="undoLastPlaylistChange()" title="Undo last change (Ctrl+Z): ${esc(lastUndoForPl.actionLabel)}">↶ Undo</button>` : ''}
           </div>
@@ -1421,7 +1482,7 @@ async function renderPlaylistView(container, playlistId) {
       </ol>
     </article>
 
-    ${renderCommentsSection('playlist', String(pl.id), pl.comments || [], `Comments & Liner Note Replies on "${pl.title}"`)}
+    ${renderCommentsSection('playlist', String(pl.id), pl.comments || [], `Comments & Liner Note Replies on "${pl.title}"`, pl.comments_has_more)}
   `;
 }
 
@@ -1449,11 +1510,11 @@ async function renderSongView(container, videoId) {
             <span class="track-num">#${idx + 1}</span>
             <div class="track-body">
               <div class="track-main-line">
-                <a href="#playlist/${ap.playlist_id}" class="track-title-link" onclick="navigate('playlist', ${ap.playlist_id}); return false;">
+                <a href="#playlist/${Number(ap.playlist_id)}" class="track-title-link" onclick="navigate('playlist', ${Number(ap.playlist_id)}); return false;">
                   ${esc(ap.playlist_title)}
                 </a>
-                <span>by <a href="#user/${ap.user_id}" class="user-chip" onclick="navigate('user', ${ap.user_id}); return false;">
-                  <span class="user-avatar-dot" style="background:${esc(ap.avatar_color)}"></span>@${esc(ap.username)}
+                <span>by <a href="#user/${Number(ap.user_id)}" class="user-chip" onclick="navigate('user', ${Number(ap.user_id)}); return false;">
+                  <span class="user-avatar-dot" style="background:${esc(safeColor(ap.avatar_color))}"></span>@${esc(ap.username)}
                 </a></span>
                 <span class="muted" style="font-size:12px;">(Track #${ap.position} · ${ap.playlist_plays} spins · ${ap.playlist_likes} likes · ${shortDate(ap.created_at)})</span>
                 ${apClip ? `<span class="pill pill-commons">⏱ ${esc(apClip)}</span>` : ''}
@@ -1463,17 +1524,17 @@ async function renderSongView(container, videoId) {
             </div>
           </div>
           <div class="track-right">
-            <button class="btn-tiny btn-secondary" onclick="playTrackFromPlaylistId(${ap.playlist_id}, ${Math.max(0, ap.position - 1)})">▶ Play in Mix</button>
+            <button class="btn-tiny btn-secondary" onclick="playTrackFromPlaylistId(${Number(ap.playlist_id)}, ${Number(Math.max(0, Number(ap.position) - 1))})">▶ Play in Mix</button>
             <button class="btn-tiny btn-secondary" onclick="openGrabModal({
-              videoId: '${esc(song.video_id)}',
-              title: '${esc(song.title)}',
-              channelTitle: '${esc(song.channel_title)}',
-              sourcePlaylistId: ${ap.playlist_id},
-              sourcePlaylistTitle: '${esc(ap.playlist_title)}',
-              sourceUserId: ${ap.user_id},
-              sourceUsername: '${esc(ap.username)}',
-              startSeconds: ${ap.start_seconds !== null && ap.start_seconds !== undefined ? Number(ap.start_seconds) : 'null'},
-              endSeconds: ${ap.end_seconds !== null && ap.end_seconds !== undefined ? Number(ap.end_seconds) : 'null'}
+              videoId: ${jsArg(song.video_id)},
+              title: ${jsArg(song.title)},
+              channelTitle: ${jsArg(song.channel_title)},
+              sourcePlaylistId: ${jsArg(numOrNull(ap.playlist_id))},
+              sourcePlaylistTitle: ${jsArg(ap.playlist_title)},
+              sourceUserId: ${jsArg(numOrNull(ap.user_id))},
+              sourceUsername: ${jsArg(ap.username)},
+              startSeconds: ${jsArg(numOrNull(ap.start_seconds))},
+              endSeconds: ${jsArg(numOrNull(ap.end_seconds))}
             })">+ Grab from @${esc(ap.username)}</button>
           </div>
         </li>
@@ -1502,29 +1563,29 @@ async function renderSongView(container, videoId) {
           </div>
           <div class="playlist-actions-cluster">
             <button class="btn-primary" onclick="playSingleSong({
-              video_id: '${esc(song.video_id)}',
-              title: '${esc(song.title)}',
-              channel_title: '${esc(song.channel_title)}',
-              finder_username: '${esc(song.finder_username)}',
+              video_id: ${jsArg(song.video_id)},
+              title: ${jsArg(song.title)},
+              channel_title: ${jsArg(song.channel_title)},
+              finder_username: ${jsArg(song.finder_username)},
               song_like_count: ${Number(song.like_count || 0)},
-              song_my_likes: ${songMyLikes},
-              song_liked_by_me: ${Boolean(song.liked_by_me)}
+              song_my_likes: ${Number(songMyLikes)},
+              song_liked_by_me: ${jsArg(Boolean(song.liked_by_me))}
             })">▶ Spin Track Now</button>
             <button
               class="btn-secondary btn-like ${getLoveBtnClasses(songMyLikes)}"
               data-song-like-btn="${esc(song.video_id)}"
               data-like-mode="header-song"
-              onclick="toggleLikeSong('${esc(song.video_id)}', event)"
+              onclick="toggleLikeSong(${jsArg(song.video_id)}, event)"
               title="${esc(getLoveBtnTitle(songMyLikes, 'song'))}"
             >${formatLoveBtnHtml(songMyLikes, song.like_count || 0, 'header-song')}</button>
             <button class="btn-secondary" onclick="openGrabModal({
-              videoId: '${esc(song.video_id)}',
-              title: '${esc(song.title)}',
-              channelTitle: '${esc(song.channel_title)}',
-              sourcePlaylistId: ${song.first_added_playlist_id || 'null'},
-              sourcePlaylistTitle: '${esc(song.debut_playlist_title || '')}',
-              sourceUserId: ${song.first_added_by_user_id},
-              sourceUsername: '${esc(song.finder_username)}'
+              videoId: ${jsArg(song.video_id)},
+              title: ${jsArg(song.title)},
+              channelTitle: ${jsArg(song.channel_title)},
+              sourcePlaylistId: ${jsArg(numOrNull(song.first_added_playlist_id))},
+              sourcePlaylistTitle: ${jsArg(song.debut_playlist_title || '')},
+              sourceUserId: ${jsArg(numOrNull(song.first_added_by_user_id))},
+              sourceUsername: ${jsArg(song.finder_username)}
             })">+ Grab to My Playlist</button>
           </div>
         </div>
@@ -1537,12 +1598,12 @@ async function renderSongView(container, videoId) {
         <div style="margin-top:12px; padding:10px 12px; background:var(--accent-gold-bg); border:1px solid #e3c878; border-radius:3px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
           <div>
             <strong>◈ First Discovered on Webjam by</strong>
-            <a href="#user/${song.first_added_by_user_id}" class="user-chip" onclick="navigate('user', ${song.first_added_by_user_id}); return false;" style="margin-left:4px;">
-              <span class="user-avatar-dot" style="background:${esc(song.finder_avatar_color)}"></span>@${esc(song.finder_username)} (${esc(song.finder_display_name)})
+            <a href="#user/${Number(song.first_added_by_user_id)}" class="user-chip" onclick="navigate('user', ${Number(song.first_added_by_user_id)}); return false;" style="margin-left:4px;">
+              <span class="user-avatar-dot" style="background:${esc(safeColor(song.finder_avatar_color))}"></span>@${esc(song.finder_username)} (${esc(song.finder_display_name)})
             </a>
             ${
               song.first_added_playlist_id
-                ? `in playlist <a href="#playlist/${song.first_added_playlist_id}" onclick="navigate('playlist', ${song.first_added_playlist_id}); return false;" style="font-weight:600;">“${esc(song.debut_playlist_title)}”</a>`
+                ? `in playlist <a href="#playlist/${Number(song.first_added_playlist_id)}" onclick="navigate('playlist', ${Number(song.first_added_playlist_id)}); return false;" style="font-weight:600;">“${esc(song.debut_playlist_title)}”</a>`
                 : ''
             }
           </div>
@@ -1558,7 +1619,7 @@ async function renderSongView(container, videoId) {
       </ol>
     </div>
 
-    ${renderCommentsSection('song', song.video_id, song.comments || [], `Community Notes on "${song.title}"`)}
+    ${renderCommentsSection('song', song.video_id, song.comments || [], `Community Notes on "${song.title}"`, song.comments_has_more)}
   `;
 }
 
@@ -1596,22 +1657,22 @@ async function renderUserView(container, profileUserId) {
         <div class="playlist-sheet-header">
           <div class="playlist-title-bar">
             <div>
-              <a href="#playlist/${pl.id}" class="playlist-title-link" onclick="navigate('playlist', ${pl.id}); return false;">${esc(pl.title)}</a>
+              <a href="#playlist/${Number(pl.id)}" class="playlist-title-link" onclick="navigate('playlist', ${Number(pl.id)}); return false;">${esc(pl.title)}</a>
               <span class="muted" style="font-size:12px; margin-left:8px;">
                 ${pl.track_count} tracks · ${pl.plays} spins · ${pl.like_count} loves
                 ${pl.times_grabbed_from > 0 ? ` · ⚡ ${pl.times_grabbed_from} grabbed by others` : ''}
               </span>
             </div>
             <div class="playlist-actions-cluster">
-              <button class="btn-primary btn-tiny" onclick="playTrackFromPlaylistId(${pl.id}, 0)">▶ Play</button>
+              <button class="btn-primary btn-tiny" onclick="playTrackFromPlaylistId(${Number(pl.id)}, 0)">▶ Play</button>
               <button
                 class="btn-secondary btn-tiny btn-like ${getLoveBtnClasses(plMyLikes)}"
                 data-playlist-like-btn="${pl.id}"
                 data-like-mode="header-playlist"
-                onclick="toggleLikePlaylist(${pl.id}, event)"
+                onclick="toggleLikePlaylist(${Number(pl.id)}, event)"
                 title="${esc(getLoveBtnTitle(plMyLikes, 'playlist'))}"
               >${formatLoveBtnHtml(plMyLikes, pl.like_count, 'header-playlist')}</button>
-              <a href="#playlist/${pl.id}" class="btn-secondary btn-tiny" onclick="navigate('playlist', ${pl.id}); return false;">Open →</a>
+              <a href="#playlist/${Number(pl.id)}" class="btn-secondary btn-tiny" onclick="navigate('playlist', ${Number(pl.id)}); return false;">Open →</a>
             </div>
           </div>
           ${pl.description ? `<p class="playlist-liner-notes">${esc(pl.description)}</p>` : ''}
@@ -1629,7 +1690,7 @@ async function renderUserView(container, profileUserId) {
         <div class="track-left">
           <span class="pill pill-discovery">◈ 1st</span>
           <div class="track-body">
-            <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', '${esc(s.video_id)}'); return false;">${esc(s.title)}</a>
+            <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', ${jsArg(s.video_id)}); return false;">${esc(s.title)}</a>
             <span class="track-channel">(${esc(s.channel_title)}) · in ${s.playlist_count} playlists</span>
           </div>
         </div>
@@ -1639,17 +1700,17 @@ async function renderUserView(container, profileUserId) {
             class="btn-tiny btn-secondary btn-like ${getLoveBtnClasses(sMyLikes)}"
             data-song-like-btn="${esc(s.video_id)}"
             data-like-mode="compact"
-            onclick="toggleLikeSong('${esc(s.video_id)}', event)"
+            onclick="toggleLikeSong(${jsArg(s.video_id)}, event)"
             title="${esc(getLoveBtnTitle(sMyLikes, 'song'))}"
           >${formatLoveBtnHtml(sMyLikes, s.song_like_count, 'compact')}</button>
           <button class="btn-tiny btn-secondary" onclick="openGrabModal({
-            videoId: '${esc(s.video_id)}',
-            title: '${esc(s.title)}',
-            channelTitle: '${esc(s.channel_title)}',
-            sourcePlaylistId: ${s.first_added_playlist_id || 'null'},
-            sourcePlaylistTitle: '${esc(s.debut_playlist_title || '')}',
-            sourceUserId: ${u.id},
-            sourceUsername: '${esc(u.username)}'
+            videoId: ${jsArg(s.video_id)},
+            title: ${jsArg(s.title)},
+            channelTitle: ${jsArg(s.channel_title)},
+            sourcePlaylistId: ${jsArg(numOrNull(s.first_added_playlist_id))},
+            sourcePlaylistTitle: ${jsArg(s.debut_playlist_title || '')},
+            sourceUserId: ${jsArg(numOrNull(u.id))},
+            sourceUsername: ${jsArg(u.username)}
           })">+ Grab</button>
         </div>
       </li>
@@ -1671,16 +1732,16 @@ async function renderUserView(container, profileUserId) {
       <li class="track-row">
         <div class="track-left">
           <button class="btn-play-inline" onclick="playSingleSong({
-            video_id: '${esc(s.video_id)}',
-            title: '${esc(s.title)}',
-            channel_title: '${esc(s.channel_title)}',
-            finder_username: '${esc(s.finder_username)}',
+            video_id: ${jsArg(s.video_id)},
+            title: ${jsArg(s.title)},
+            channel_title: ${jsArg(s.channel_title)},
+            finder_username: ${jsArg(s.finder_username)},
             song_like_count: ${Number(s.song_like_count || 0)},
-            song_my_likes: ${sMyLikes},
-            song_liked_by_me: ${Boolean(s.song_liked_by_me)}
+            song_my_likes: ${Number(sMyLikes)},
+            song_liked_by_me: ${jsArg(Boolean(s.song_liked_by_me))}
           })">▶</button>
           <div class="track-body">
-            <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', '${esc(s.video_id)}'); return false;">${esc(s.title)}</a>
+            <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', ${jsArg(s.video_id)}); return false;">${esc(s.title)}</a>
             <span class="track-channel">(${esc(s.channel_title)}) · 1st found by @${esc(s.finder_username)}</span>
             ${profileLoveBadge}
           </div>
@@ -1691,17 +1752,17 @@ async function renderUserView(container, profileUserId) {
             class="btn-tiny btn-secondary btn-like ${getLoveBtnClasses(sMyLikes)}"
             data-song-like-btn="${esc(s.video_id)}"
             data-like-mode="compact"
-            onclick="toggleLikeSong('${esc(s.video_id)}', event)"
+            onclick="toggleLikeSong(${jsArg(s.video_id)}, event)"
             title="${esc(getLoveBtnTitle(sMyLikes, 'song'))}"
           >${formatLoveBtnHtml(sMyLikes, s.song_like_count, 'compact')}</button>
           <button class="btn-tiny btn-secondary" onclick="openGrabModal({
-            videoId: '${esc(s.video_id)}',
-            title: '${esc(s.title)}',
-            channelTitle: '${esc(s.channel_title)}',
+            videoId: ${jsArg(s.video_id)},
+            title: ${jsArg(s.title)},
+            channelTitle: ${jsArg(s.channel_title)},
             sourcePlaylistId: null,
             sourcePlaylistTitle: '',
-            sourceUserId: ${s.first_added_by_user_id},
-            sourceUsername: '${esc(s.finder_username)}'
+            sourceUserId: ${jsArg(numOrNull(s.first_added_by_user_id))},
+            sourceUsername: ${jsArg(s.finder_username)}
           })">+ Grab</button>
         </div>
       </li>
@@ -1715,8 +1776,8 @@ async function renderUserView(container, profileUserId) {
       const pBadge = pLoves > 1 ? ` · <strong>×${pLoves}</strong>` : '';
       return `
       <li class="activity-item">
-        <a href="#playlist/${lp.id}" onclick="navigate('playlist', ${lp.id}); return false;" style="font-weight:600;">${esc(lp.title)}</a>
-        <span class="muted">by <a href="#user/${lp.user_id}" onclick="navigate('user', ${lp.user_id}); return false;">@${esc(lp.username)}</a> (${lp.track_count} tracks · ${lp.like_count} loves${pBadge})</span>
+        <a href="#playlist/${Number(lp.id)}" onclick="navigate('playlist', ${Number(lp.id)}); return false;" style="font-weight:600;">${esc(lp.title)}</a>
+        <span class="muted">by <a href="#user/${Number(lp.user_id)}" onclick="navigate('user', ${Number(lp.user_id)}); return false;">@${esc(lp.username)}</a> (${lp.track_count} tracks · ${lp.like_count} loves${pBadge})</span>
       </li>
     `;
     })
@@ -1726,9 +1787,9 @@ async function renderUserView(container, profileUserId) {
     .map(
       (g) => `
       <li class="activity-item">
-        <strong><a href="#user/${g.taker_user_id}" onclick="navigate('user', ${g.taker_user_id}); return false;">@${esc(g.taker_username)}</a></strong>
-        grabbed <a href="#song/${encodeURIComponent(g.video_id)}" onclick="navigate('song', '${esc(g.video_id)}'); return false;">${esc(g.song_title)}</a>
-        into <a href="#playlist/${g.target_playlist_id}" onclick="navigate('playlist', ${g.target_playlist_id}); return false;">“${esc(g.target_playlist_title)}”</a>
+        <strong><a href="#user/${Number(g.taker_user_id)}" onclick="navigate('user', ${Number(g.taker_user_id)}); return false;">@${esc(g.taker_username)}</a></strong>
+        grabbed <a href="#song/${encodeURIComponent(g.video_id)}" onclick="navigate('song', ${jsArg(g.video_id)}); return false;">${esc(g.song_title)}</a>
+        into <a href="#playlist/${Number(g.target_playlist_id)}" onclick="navigate('playlist', ${Number(g.target_playlist_id)}); return false;">“${esc(g.target_playlist_title)}”</a>
         (${g.target_playlist_plays} spins)
       </li>
     `
@@ -1739,9 +1800,9 @@ async function renderUserView(container, profileUserId) {
     .map(
       (g) => `
       <li class="activity-item">
-        Grabbed <a href="#song/${encodeURIComponent(g.video_id)}" onclick="navigate('song', '${esc(g.video_id)}'); return false;">${esc(g.song_title)}</a>
-        from <strong><a href="#user/${g.source_user_id}" onclick="navigate('user', ${g.source_user_id}); return false;">@${esc(g.source_username)}</a></strong>
-        into <a href="#playlist/${g.target_playlist_id}" onclick="navigate('playlist', ${g.target_playlist_id}); return false;">“${esc(g.target_playlist_title)}”</a>
+        Grabbed <a href="#song/${encodeURIComponent(g.video_id)}" onclick="navigate('song', ${jsArg(g.video_id)}); return false;">${esc(g.song_title)}</a>
+        from <strong><a href="#user/${Number(g.source_user_id)}" onclick="navigate('user', ${Number(g.source_user_id)}); return false;">@${esc(g.source_username)}</a></strong>
+        into <a href="#playlist/${Number(g.target_playlist_id)}" onclick="navigate('playlist', ${Number(g.target_playlist_id)}); return false;">“${esc(g.target_playlist_title)}”</a>
         (${g.target_playlist_plays} spins)
       </li>
     `
@@ -1753,7 +1814,7 @@ async function renderUserView(container, profileUserId) {
       <div class="playlist-sheet-header">
         <div class="playlist-title-bar">
           <div>
-            <span class="user-avatar-dot" style="background:${esc(u.avatar_color)}; width:12px; height:12px;"></span>
+            <span class="user-avatar-dot" style="background:${esc(safeColor(u.avatar_color))}; width:12px; height:12px;"></span>
             <h1 class="page-title" style="display:inline; margin-left:6px;">${esc(u.display_name)} (@${esc(u.username)})</h1>
             <p class="page-subtitle" style="margin-top:6px;">${esc(u.bio || 'No bio yet.')}</p>
           </div>
@@ -1762,7 +1823,7 @@ async function renderUserView(container, profileUserId) {
               isMe
                 ? `<button class="btn-secondary btn-tiny" onclick="document.getElementById('edit-bio-box').classList.toggle('hidden')">✎ Edit Profile</button>
                    <button class="btn-primary btn-tiny" onclick="openNewPlaylistModal()">+ New Playlist</button>`
-                : `<button class="btn-secondary btn-tiny" onclick="switchPersona(${u.id})">Switch to @${esc(u.username)}</button>`
+                : `<button class="btn-secondary btn-tiny" onclick="switchPersona(${Number(u.id)})">Switch to @${esc(u.username)}</button>`
             }
           </div>
         </div>
@@ -1770,7 +1831,7 @@ async function renderUserView(container, profileUserId) {
         ${
           isMe
             ? `<div id="edit-bio-box" class="hidden" style="margin-top:10px; padding:10px; background:#fff; border:1px solid var(--border-strong); border-radius:3px;">
-                <form onsubmit="submitEditProfile(event, ${u.id})">
+                <form onsubmit="submitEditProfile(event, ${Number(u.id)})">
                   <label class="form-label">Display Name</label>
                   <input type="text" id="edit-user-display" class="input-text full-width" value="${esc(u.display_name)}" required />
                   <label class="form-label">Bio / Liner Note Manifesto</label>
@@ -1844,7 +1905,7 @@ async function renderUserView(container, profileUserId) {
       </div>
     </div>
 
-    ${renderCommentsSection('profile', String(u.id), data.comments || [], `@${u.username}'s Guestbook / Profile Wall`)}
+    ${renderCommentsSection('profile', String(u.id), data.comments || [], `@${u.username}'s Guestbook / Profile Wall`, data.comments_has_more)}
   `;
 }
 
@@ -1859,17 +1920,17 @@ async function renderSongsDirectoryView(container) {
         <div class="track-left">
           <span class="track-num">${String(idx + 1).padStart(2, '0')}</span>
           <button class="btn-play-inline" onclick="playSingleSong({
-            video_id: '${esc(s.video_id)}',
-            title: '${esc(s.title)}',
-            channel_title: '${esc(s.channel_title)}',
-            finder_username: '${esc(s.finder_username)}',
+            video_id: ${jsArg(s.video_id)},
+            title: ${jsArg(s.title)},
+            channel_title: ${jsArg(s.channel_title)},
+            finder_username: ${jsArg(s.finder_username)},
             song_like_count: ${Number(s.song_like_count || 0)},
-            song_my_likes: ${sMyLikes},
-            song_liked_by_me: ${Boolean(s.song_liked_by_me)}
+            song_my_likes: ${Number(sMyLikes)},
+            song_liked_by_me: ${jsArg(Boolean(s.song_liked_by_me))}
           })">▶</button>
           <div class="track-body">
             <div class="track-main-line">
-              <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', '${esc(s.video_id)}'); return false;">
+              <a href="#song/${encodeURIComponent(s.video_id)}" class="track-title-link" onclick="navigate('song', ${jsArg(s.video_id)}); return false;">
                 ${esc(s.title)}
               </a>
               <span class="track-channel">${esc(s.channel_title)}</span>
@@ -1886,18 +1947,18 @@ async function renderSongsDirectoryView(container) {
             class="btn-tiny btn-secondary btn-like ${getLoveBtnClasses(sMyLikes)}"
             data-song-like-btn="${esc(s.video_id)}"
             data-like-mode="compact"
-            onclick="toggleLikeSong('${esc(s.video_id)}', event)"
+            onclick="toggleLikeSong(${jsArg(s.video_id)}, event)"
             title="${esc(getLoveBtnTitle(sMyLikes, 'song'))}"
           >${formatLoveBtnHtml(sMyLikes, s.song_like_count, 'compact')}</button>
-          <a href="#song/${encodeURIComponent(s.video_id)}" class="btn-tiny btn-secondary" onclick="navigate('song', '${esc(s.video_id)}'); return false;">Song Lineage →</a>
+          <a href="#song/${encodeURIComponent(s.video_id)}" class="btn-tiny btn-secondary" onclick="navigate('song', ${jsArg(s.video_id)}); return false;">Song Lineage →</a>
           <button class="btn-tiny btn-secondary" onclick="openGrabModal({
-            videoId: '${esc(s.video_id)}',
-            title: '${esc(s.title)}',
-            channelTitle: '${esc(s.channel_title)}',
-            sourcePlaylistId: ${s.first_added_playlist_id || 'null'},
-            sourcePlaylistTitle: '${esc(s.debut_playlist_title || '')}',
-            sourceUserId: ${s.first_added_by_user_id},
-            sourceUsername: '${esc(s.finder_username)}'
+            videoId: ${jsArg(s.video_id)},
+            title: ${jsArg(s.title)},
+            channelTitle: ${jsArg(s.channel_title)},
+            sourcePlaylistId: ${jsArg(numOrNull(s.first_added_playlist_id))},
+            sourcePlaylistTitle: ${jsArg(s.debut_playlist_title || '')},
+            sourceUserId: ${jsArg(numOrNull(s.first_added_by_user_id))},
+            sourceUsername: ${jsArg(s.finder_username)}
           })">+ Grab</button>
         </div>
       </li>
@@ -1927,8 +1988,8 @@ async function renderCuratorsView(container) {
       <div class="playlist-sheet" style="padding:14px;">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
           <div>
-            <span class="user-avatar-dot" style="background:${esc(u.avatar_color)}; width:10px; height:10px;"></span>
-            <a href="#user/${u.id}" onclick="navigate('user', ${u.id}); return false;" style="font-size:17px; font-weight:700; font-family:var(--font-serif);">
+            <span class="user-avatar-dot" style="background:${esc(safeColor(u.avatar_color))}; width:10px; height:10px;"></span>
+            <a href="#user/${Number(u.id)}" onclick="navigate('user', ${Number(u.id)}); return false;" style="font-size:17px; font-weight:700; font-family:var(--font-serif);">
               ${esc(u.display_name)} (@${esc(u.username)})
             </a>
             <p class="muted" style="margin:4px 0 8px;">${esc(u.bio)}</p>
@@ -1946,7 +2007,7 @@ async function renderCuratorsView(container) {
               ${u.playlist_count} playlists · ${u.songs_discovered} first finds · ⚡ ${u.times_grabbed} grabs by others
             </div>
             <div>
-              <a href="#user/${u.id}" class="btn-secondary btn-tiny" onclick="navigate('user', ${u.id}); return false;">Visit Crate &amp; Guestbook →</a>
+              <a href="#user/${Number(u.id)}" class="btn-secondary btn-tiny" onclick="navigate('user', ${Number(u.id)}); return false;">Visit Crate &amp; Guestbook →</a>
             </div>
           </div>
         </div>
@@ -1992,7 +2053,7 @@ async function renderBadgesView(container) {
             : `<div style="font-size:11.5px; color:var(--text-muted); margin-top:6px; font-family:var(--font-mono);">Progress: ${b.current_value} / ${b.threshold}</div>`
         }
         <div class="badge-progress-bar">
-          <div class="badge-progress-fill" style="width:${b.progress_pct}%"></div>
+          <div class="badge-progress-fill" style="width:${Number(b.progress_pct || 0)}%"></div>
         </div>
       </div>
     `
@@ -2015,36 +2076,42 @@ async function renderBadgesView(container) {
 }
 
 // --- Shared Comments Component ---
-function renderCommentsSection(targetType, targetId, comments, heading) {
-  const listHtml =
-    comments.length > 0
-      ? comments
-          .map(
-            (c) => `
+function renderCommentItem(c) {
+  return `
           <div class="comment-item">
             <div class="comment-meta">
-              <a href="#user/${c.author_user_id}" class="user-chip" onclick="navigate('user', ${c.author_user_id}); return false;">
-                <span class="user-avatar-dot" style="background:${esc(c.author_avatar_color)}"></span>@${esc(c.author_username)}
+              <a href="#user/${Number(c.author_user_id)}" class="user-chip" onclick="navigate('user', ${Number(c.author_user_id)}); return false;">
+                <span class="user-avatar-dot" style="background:${esc(safeColor(c.author_avatar_color))}"></span>@${esc(c.author_username)}
               </a>
               <span>(${esc(c.author_display_name)}) · ${esc(c.created_at)}</span>
             </div>
             <div class="comment-body">${esc(c.body)}</div>
           </div>
-        `
-          )
-          .join('')
+        `;
+}
+
+function renderCommentsSection(targetType, targetId, comments, heading, hasMore = false) {
+  const listHtml =
+    comments.length > 0
+      ? comments.map(renderCommentItem).join('')
       : `<p class="muted" style="font-size:13px;">No comments yet. Be the first to leave a note!</p>`;
+  const oldestId = comments.length > 0 ? Number(comments[0].id) : 0;
+  const olderBtn = hasMore
+    ? `<button type="button" class="btn-secondary btn-tiny" data-before-id="${oldestId}" onclick="loadOlderComments(this, ${jsArg(targetType)}, ${jsArg(targetId)})" style="margin-bottom:8px;">Show older comments</button>`
+    : '';
 
   return `
     <section class="comments-box">
-      <h3 style="margin:0 0 10px; font-family:var(--font-serif); font-size:16px;">💬 ${esc(heading)} (${comments.length})</h3>
+      <h3 style="margin:0 0 10px; font-family:var(--font-serif); font-size:16px;">💬 ${esc(heading)} (${comments.length}${hasMore ? '+' : ''})</h3>
+      ${olderBtn}
       <div id="comments-list-${esc(targetType)}-${esc(targetId)}">
         ${listHtml}
       </div>
-      <form onsubmit="submitComment(event, '${esc(targetType)}', '${esc(targetId)}')" style="margin-top:12px;">
+      <form onsubmit="submitComment(event, ${jsArg(targetType)}, ${jsArg(targetId)})" style="margin-top:12px;">
         <textarea
           id="comment-input-${esc(targetType)}-${esc(targetId)}"
           class="input-textarea full-width"
+          maxlength="2000"
           rows="2"
           placeholder="Write a comment as @${esc(state.currentUser?.username || 'user')}…"
           required
@@ -2055,6 +2122,28 @@ function renderCommentsSection(targetType, targetId, comments, heading) {
       </form>
     </section>
   `;
+}
+
+async function loadOlderComments(btn, targetType, targetId) {
+  const beforeId = Number(btn.dataset.beforeId || 0);
+  const list = document.getElementById(`comments-list-${targetType}-${targetId}`);
+  if (!beforeId || !list) return;
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams({ target_type: targetType, target_id: String(targetId), before_id: String(beforeId) });
+    const data = await api(`/api/comments?${params.toString()}`);
+    const older = data.comments || [];
+    list.insertAdjacentHTML('afterbegin', older.map(renderCommentItem).join(''));
+    if (data.has_more && older.length) {
+      btn.dataset.beforeId = String(Number(older[0].id));
+      btn.disabled = false;
+    } else {
+      btn.remove();
+    }
+  } catch (err) {
+    btn.disabled = false;
+    showToast(esc(err.message));
+  }
 }
 
 // --- Interactive Actions & Form Handlers ---
@@ -2084,7 +2173,7 @@ async function handleQuickDrop(e) {
         method: 'POST',
         body: JSON.stringify({
           user_id: state.currentUserId,
-          title: `${state.currentUser.display_name}'s Crate`,
+          title: `${String(state.currentUser.display_name || 'My').slice(0, 180)}'s Crate`,
           description: 'Curated on Webjam.',
         }),
       });
@@ -2110,7 +2199,7 @@ async function handleQuickDrop(e) {
     const addedCount = res.results.filter((r) => !r.already_in_playlist).length;
     const newDiscoveries = res.results.filter((r) => r.is_new_discovery).length;
     showToast(
-      `Dropped ${addedCount} track(s) into playlist! ${newDiscoveries > 0 ? `(◈ ${newDiscoveries} brand-new Webjam discovery!)` : ''}`
+      `Dropped ${addedCount} track(s) into playlist!${esc(skippedNote(res.skipped))} ${newDiscoveries > 0 ? `(◈ ${newDiscoveries} brand-new Webjam discovery!)` : ''}`
     );
     notifyBadges(res.new_badges);
 
@@ -2157,7 +2246,7 @@ async function handleDropIntoPlaylist(e, playlistId) {
     const maxOcc = Math.max(0, ...res.results.map((r) => Number(r.occurrences_in_playlist || 1)));
     const occNote = maxOcc > 1 ? ` (×${maxOcc} in this mix!)` : '';
     showToast(
-      `Added ${res.results.length} track(s)${occNote}! ${newDiscoveries > 0 ? '◈ You were the FIRST to add this song to Webjam!' : ''} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+      `Added ${res.results.length} track(s)${occNote}!${esc(skippedNote(res.skipped))} ${newDiscoveries > 0 ? '◈ You were the FIRST to add this song to Webjam!' : ''} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
     );
     notifyBadges(res.new_badges);
     delete playlistCache[playlistId];
@@ -2313,6 +2402,7 @@ async function capturePlaylistSnapshot(playlistId, actionLabel) {
       source_user_id: t.source_user_id ?? null,
       migrated_from_video_id: t.migrated_from_video_id ?? null,
       migrated_from_title: t.migrated_from_title ?? null,
+      display_title: t.display_title ?? null,
       created_at: t.created_at || null,
     })),
   };
@@ -2728,7 +2818,11 @@ async function incrementPlaylistSpin(playlistId) {
       method: 'POST',
       body: JSON.stringify({ count: 1 }),
     });
-    showToast(`+1 Spin recorded (Now at ${res.plays} spins)`);
+    showToast(
+      res.counted
+        ? `+1 Spin recorded (Now at ${res.plays} spins)`
+        : `Spin not counted: your own playlist, or already counted in the last 30 min (${res.plays} spins)`
+    );
     notifyBadges(res.new_badges);
     delete playlistCache[playlistId];
     await refreshBootstrapSilently();
@@ -3084,15 +3178,15 @@ async function executeEmbedSearch(query) {
               type="button"
               class="btn-tiny btn-secondary"
               onclick="playSingleSong({
-                video_id: '${esc(item.video_id)}',
-                title: '${esc(item.title)}',
-                channel_title: '${esc(item.channel_title)}'
+                video_id: ${jsArg(item.video_id)},
+                title: ${jsArg(item.title)},
+                channel_title: ${jsArg(item.channel_title)}
               })"
             >▶ Preview</button>
             <button
               type="button"
               class="btn-tiny btn-primary"
-              onclick="dropSearchedVideo('${esc(item.video_id)}', '${esc(item.title)}')"
+              onclick="dropSearchedVideo(${jsArg(item.video_id)}, ${jsArg(item.title)})"
             >+ Drop into Selected Playlist</button>
           </div>
         </li>
@@ -3147,7 +3241,8 @@ async function loadMyYouTubePlaylists() {
   const wrap = document.getElementById('import-my-youtube');
   const sel = document.getElementById('import-my-youtube-select');
   if (!wrap || !sel) return;
-  const show = isGoogleAuthMode() && state.auth.signed_in;
+  // Hidden until YouTube access can be connected (incremental consent, Phase 4).
+  const show = isGoogleAuthMode() && state.auth.signed_in && Boolean(state.auth.youtube_connected);
   wrap.classList.toggle('hidden', !show);
   if (!show) return;
   sel.innerHTML = '<option value="">Loading your playlists…</option>';
@@ -3385,8 +3480,8 @@ function renderImportWizardStep() {
                       </div>
                     </div>
                     <div class="track-right">
-                      <button type="button" class="btn-tiny btn-secondary" onclick="playSingleSong({ video_id: '${esc(c.video_id)}', title: '${esc(c.title)}', channel_title: '${esc(c.channel_title)}' })">▶ Preview</button>
-                      <button type="button" class="btn-tiny btn-primary" onclick="selectImportTrackMigration(${idx}, ${cIdx})">✓ Use This Version</button>
+                      <button type="button" class="btn-tiny btn-secondary" onclick="playSingleSong({ video_id: ${jsArg(c.video_id)}, title: ${jsArg(c.title)}, channel_title: ${jsArg(c.channel_title)} })">▶ Preview</button>
+                      <button type="button" class="btn-tiny btn-primary" onclick="selectImportTrackMigration(${Number(idx)}, ${Number(cIdx)})">✓ Use This Version</button>
                     </div>
                   </li>
                 `
@@ -3408,16 +3503,16 @@ function renderImportWizardStep() {
                 class="input-text flex-grow"
                 style="font-size:12px; padding:3px 7px;"
                 value="${esc(t.suggested_query || t.title)}"
-                onkeydown="if(event.key==='Enter'){event.preventDefault(); updateImportTrackQueryAndSearch(${idx});}"
+                onkeydown="if(event.key==='Enter'){event.preventDefault(); updateImportTrackQueryAndSearch(${Number(idx)});}"
               />
-              <button type="button" class="btn-tiny btn-primary" onclick="updateImportTrackQueryAndSearch(${idx})">🔍 Search Verified Embeds</button>
-              <button type="button" class="btn-tiny btn-secondary" onclick="toggleImportTrackMigrator(${idx})">Close</button>
+              <button type="button" class="btn-tiny btn-primary" onclick="updateImportTrackQueryAndSearch(${Number(idx)})">🔍 Search Verified Embeds</button>
+              <button type="button" class="btn-tiny btn-secondary" onclick="toggleImportTrackMigrator(${Number(idx)})">Close</button>
             </div>
             ${candidatesHtml}
             <div style="margin-top:6px; padding-top:6px; border-top:1px dashed #dcd6c6; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
               <span class="muted" style="font-size:11.5px;">Or paste custom YouTube URL/ID:</span>
               <input type="text" id="import-custom-vid-${idx}" class="input-text mono-input flex-grow" style="font-size:11.5px; padding:2px 6px;" placeholder="https://www.youtube.com/watch?v=..." />
-              <button type="button" class="btn-tiny btn-secondary" onclick="applyImportCustomVideo(${idx})">Swap to URL</button>
+              <button type="button" class="btn-tiny btn-secondary" onclick="applyImportCustomVideo(${Number(idx)})">Swap to URL</button>
             </div>
           </div>
         `
@@ -3430,7 +3525,7 @@ function renderImportWizardStep() {
               <input
                 type="checkbox"
                 ${t.included ? 'checked' : ''}
-                onchange="toggleImportTrackIncluded(${idx}, this.checked)"
+                onchange="toggleImportTrackIncluded(${Number(idx)}, this.checked)"
                 title="Include this track in import"
               />
               <span class="track-num">${String(idx + 1).padStart(2, '0')}</span>
@@ -3454,16 +3549,16 @@ function renderImportWizardStep() {
               <button
                 type="button"
                 class="btn-tiny btn-secondary"
-                onclick="playSingleSong({ video_id: '${esc(t.video_id)}', title: '${esc(t.title)}', channel_title: '${esc(t.channel_title)}' })"
+                onclick="playSingleSong({ video_id: ${jsArg(t.video_id)}, title: ${jsArg(t.title)}, channel_title: ${jsArg(t.channel_title)} })"
               >▶ Preview</button>
               <button
                 type="button"
                 class="btn-tiny ${!t.embeddable ? 'btn-primary' : 'btn-secondary'}"
-                onclick="toggleImportTrackMigrator(${idx})"
+                onclick="toggleImportTrackMigrator(${Number(idx)})"
               >🪄 ${t.migrated ? 'Change Version' : 'Migrate Song'}</button>
               ${
                 t.migrated
-                  ? `<button type="button" class="btn-tiny btn-secondary" onclick="revertImportTrackMigration(${idx})" title="Revert to original video ID">↺ Revert</button>`
+                  ? `<button type="button" class="btn-tiny btn-secondary" onclick="revertImportTrackMigration(${Number(idx)})" title="Revert to original video ID">↺ Revert</button>`
                   : ''
               }
             </div>
@@ -3605,13 +3700,14 @@ async function autoMigrateAllImportTracks() {
   }
 
   let migratedNow = 0;
+  let failedNow = 0;
   for (let idx = 0; idx < wiz.tracks.length; idx++) {
     const t = wiz.tracks[idx];
     if (!t.included || t.embeddable) continue;
     const query = (t.suggested_query || t.title || '').trim();
     if (!query) continue;
     try {
-      const data = await api(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
+      const data = await apiWithRetry(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
       const match = (data.results || []).find((r) => r.video_id !== t.original_video_id && r.embeddable);
       if (match) {
         wiz.candidatesByIdx[idx] = data.results;
@@ -3625,15 +3721,18 @@ async function autoMigrateAllImportTracks() {
         state.embedAuditByVideoId[match.video_id] = { embeddable: true, status: 'OK', reason: null };
         migratedNow++;
       }
-    } catch (_) {}
+    } catch (_) {
+      failedNow++;
+    }
   }
 
   wiz.openDrawerIdx = null;
   renderImportWizardStep();
+  const failNote = failedNow > 0 ? ` ${failedNow} search${failedNow === 1 ? '' : 'es'} failed (try again in a minute).` : '';
   if (migratedNow > 0) {
-    showToast(`✨ Auto-migrated ${migratedNow} restricted song${migratedNow === 1 ? '' : 's'} to verified-embeddable versions!`);
+    showToast(`✨ Auto-migrated ${migratedNow} restricted song${migratedNow === 1 ? '' : 's'} to verified-embeddable versions!${failNote}`);
   } else {
-    showToast('Could not auto-find replacements for all tracks — click "🪄 Migrate Song" on a track to customize the search.');
+    showToast(`Could not auto-find replacements for all tracks — click "🪄 Migrate Song" on a track to customize the search.${failNote}`);
   }
 }
 
@@ -3684,7 +3783,7 @@ async function submitCommitPlaylistImport() {
 
     closeModal('import-playlist-modal');
     showToast(
-      `Imported ${res.added_tracks.length} track(s) into "${esc(res.title)}"!`
+      `Imported ${res.added_tracks.length} track(s) into "${esc(res.title)}"!${esc(skippedNote(res.skipped))}`
     );
     notifyBadges(res.new_badges);
     delete playlistCache[res.playlist_id];
@@ -3709,7 +3808,7 @@ async function auditPlaylistEmbeds(playlistId) {
   }
 
   try {
-    const audit = await api(`/api/playlists/${pid}/audit-embeds`);
+    const audit = await api(`/api/playlists/${Number(pid)}/audit-embeds?user_id=${Number(state.currentUserId)}`);
     (audit.tracks || []).forEach((t) => {
       state.embedAuditByVideoId[t.video_id] = {
         embeddable: Boolean(t.embeddable),
@@ -3739,7 +3838,7 @@ async function auditPlaylistEmbeds(playlistId) {
           <div>
             ${
               audit.non_embeddable_count > 0 && isOwner
-                ? `<button type="button" class="btn-primary btn-tiny" id="pl-auto-migrate-btn-${pid}" onclick="autoMigrateAuditedPlaylist(${pid})">🪄 Auto-Migrate ${audit.non_embeddable_count} Restricted Song${audit.non_embeddable_count === 1 ? '' : 's'}</button>`
+                ? `<button type="button" class="btn-primary btn-tiny" id="pl-auto-migrate-btn-${pid}" onclick="autoMigrateAuditedPlaylist(${Number(pid)})">🪄 Auto-Migrate ${audit.non_embeddable_count} Restricted Song${audit.non_embeddable_count === 1 ? '' : 's'}</button>`
                 : ''
             }
           </div>
@@ -3770,6 +3869,7 @@ async function autoMigrateAuditedPlaylist(playlistId) {
 
   await capturePlaylistSnapshot(pid, 'Auto-migrated restricted songs');
   let migratedCount = 0;
+  let failedCount = 0;
 
   for (const t of pl.tracks) {
     const audit = state.embedAuditByVideoId[t.video_id];
@@ -3777,10 +3877,10 @@ async function autoMigrateAuditedPlaylist(playlistId) {
     const query = (audit.suggested_query || `${t.channel_title || ''} ${t.title || ''}`).trim();
     if (!query) continue;
     try {
-      const searchRes = await api(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
+      const searchRes = await apiWithRetry(`/api/youtube/search?q=${encodeURIComponent(query)}&limit=4`);
       const match = (searchRes.results || []).find((r) => r.video_id !== t.video_id && r.embeddable);
       if (match) {
-        await api(`/api/playlists/${pid}/tracks/${t.id}`, {
+        await apiWithRetry(`/api/playlists/${pid}/tracks/${t.id}`, {
           method: 'PUT',
           body: JSON.stringify({
             user_id: state.currentUserId,
@@ -3791,17 +3891,20 @@ async function autoMigrateAuditedPlaylist(playlistId) {
         state.embedAuditByVideoId[match.video_id] = { embeddable: true, status: 'OK', reason: null };
         migratedCount++;
       }
-    } catch (_) {}
+    } catch (_) {
+      failedCount++;
+    }
   }
 
   delete playlistCache[pid];
   await syncQueueWithPlaylistIfActive(pid);
   await refreshBootstrapSilently();
   await renderCurrentRoute();
+  const failNote = failedCount > 0 ? ` ${failedCount} track(s) failed (try again in a minute).` : '';
   showToast(
     migratedCount > 0
-      ? `✨ Auto-migrated ${migratedCount} track(s) to verified-embeddable versions! <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
-      : 'Could not auto-find replacements — click "⇄ Swap" on individual tracks to search.'
+      ? `✨ Auto-migrated ${migratedCount} track(s) to verified-embeddable versions!${failNote} <span class="muted" style="font-size:11px;">(Ctrl+Z to undo)</span>`
+      : `Could not auto-find replacements — click "⇄ Swap" on individual tracks to search.${failNote}`
   );
 }
 
@@ -3921,7 +4024,7 @@ async function openMigrateSongModal(playlistId, trackId) {
       <button type="button" class="btn-tiny btn-secondary" onclick="runMigrateChipSearch('full album studio version')">🎚 Studio Version</button>
       ${
         showCurrentChip
-          ? `<button type="button" class="btn-tiny btn-secondary" onclick="runMigrateDirectQuery('${esc(currentClean)}')">🔎 Search Current Title</button>`
+          ? `<button type="button" class="btn-tiny btn-secondary" onclick="runMigrateDirectQuery(${jsArg(currentClean)})">🔎 Search Current Title</button>`
           : ''
       }
     `;
@@ -4064,20 +4167,20 @@ async function executeMigrateModalSearch(query, excludeVideoId = null) {
                 <button
                   type="button"
                   class="btn-tiny btn-secondary"
-                  onclick="auditionMigrateCandidate(${cIdx})"
+                  onclick="auditionMigrateCandidate(${Number(cIdx)})"
                   title="Audition this version in the YouTube player without losing your queue"
                 >▶ Audition</button>
                 <button
                   type="button"
                   class="btn-tiny btn-secondary"
                   id="migrate-add-btn-${cIdx}"
-                  onclick="addMigrateModalCandidateToPlaylist(${cIdx})"
+                  onclick="addMigrateModalCandidateToPlaylist(${Number(cIdx)})"
                   title="Add this track to the current playlist (keeps your existing track)"
                 >+ Add to Playlist</button>
                 <button
                   type="button"
                   class="btn-tiny btn-primary"
-                  onclick="applyMigrateModalCandidate(${cIdx})"
+                  onclick="applyMigrateModalCandidate(${Number(cIdx)})"
                   title="Replace the current track with this version"
                 >✓ Swap to This Version</button>
               </div>
@@ -4260,6 +4363,15 @@ async function initApp() {
   state.currentRoute = parseHashRoute();
   updateNavHighlight(state.currentRoute.view);
   await refreshBootstrapSilently();
+  if (window.location.hash === '#not-invited') {
+    history.replaceState(null, '', '#feed');
+    state.currentRoute = parseHashRoute();
+    showToast('That Google account is not on the Webjam invite list yet. Ask a friend to invite you.');
+  } else if (window.location.hash === '#auth-error') {
+    history.replaceState(null, '', '#feed');
+    state.currentRoute = parseHashRoute();
+    showToast('Google sign-in was cancelled or failed. Please try again.');
+  }
   await renderCurrentRoute();
 }
 

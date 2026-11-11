@@ -33,7 +33,10 @@ class FakeAsyncClient:
 
     async def get(self, url, headers=None, params=None, **kwargs):
         if "userinfo" in url:
-            return FakeResponse(200, {"sub": "g-123", "email": "Test.User@example.com", "name": "Test User"})
+            return FakeResponse(
+                200,
+                {"sub": "g-123", "email": "Test.User@example.com", "email_verified": True, "name": "Test User"},
+            )
         if url.endswith("/playlists"):
             return FakeResponse(200, {"items": [{"id": "PLx", "snippet": {"title": "Mine"}, "contentDetails": {"itemCount": 2}, "status": {"privacyStatus": "private"}}]})
         if url.endswith("/playlistItems"):
@@ -47,13 +50,18 @@ def client(tmp_path, monkeypatch):
     import app.database
 
     monkeypatch.setattr(app.database, "DB_PATH", tmp_path / "auth.db")
+    monkeypatch.setenv("WEBJAM_AUTH_MODE", "google")
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid.apps.googleusercontent.com")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("WEBJAM_SESSION_SECRET", "s" * 40)
+    monkeypatch.setenv("WEBJAM_BASE_URL", "https://testserver")
+    monkeypatch.setenv("WEBJAM_INVITE_EMAILS", "test.user@example.com")
     monkeypatch.delenv("WEBJAM_DEMO_MODE", raising=False)
     monkeypatch.setattr(app.auth.httpx, "AsyncClient", FakeAsyncClient)
     from app.main import app as fastapi_app
 
-    with TestClient(fastapi_app) as c:
+    # https: the session cookie is Secure in google mode. X-Webjam: the CSRF header the SPA sends.
+    with TestClient(fastapi_app, base_url="https://testserver", headers={"X-Webjam": "1"}) as c:
         yield c
 
 
@@ -61,19 +69,21 @@ def sign_in(client):
     login = client.get("/auth/google/login", follow_redirects=False)
     assert login.status_code == 307
     params = urllib.parse.parse_qs(urllib.parse.urlparse(login.headers["location"]).query)
-    assert "youtube.readonly" in params["scope"][0]
-    assert params["redirect_uri"][0] == "http://testserver/auth/google/callback"
+    # Sign-in asks for identity only (YouTube access will be incremental consent later).
+    assert params["scope"][0] == "openid email profile"
+    assert params["redirect_uri"][0] == "https://testserver/auth/google/callback"
     cb = client.get(
         "/auth/google/callback",
         params={"code": "good-code", "state": params["state"][0]},
         follow_redirects=False,
     )
-    assert cb.status_code == 307
+    assert cb.status_code == 303
+    assert cb.headers["location"] == "/"
 
 
 def test_anonymous_is_guest_and_cannot_write(client):
     boot = client.get("/api/bootstrap?user_id=1").json()
-    assert boot["auth"] == {"mode": "google", "signed_in": False}
+    assert boot["auth"] == {"mode": "google", "signed_in": False, "youtube_connected": False}
     assert boot["current_user"]["id"] == 0  # ?user_id=1 is ignored
 
     assert client.post("/api/playlists", json={"user_id": 1, "title": "x"}).status_code == 401
@@ -92,7 +102,8 @@ def test_google_user_acts_as_self_only(client):
     boot = client.get("/api/bootstrap?user_id=1").json()
     me = boot["current_user"]
     assert boot["auth"]["signed_in"] is True
-    assert me["username"] == "testuser" and me["display_name"] == "Test User"
+    # Handle comes from the display name, never the email local part ("test.user").
+    assert me["username"] == "test_user" and me["display_name"] == "Test User"
 
     # Claimed user_id=1 is overridden by the session user
     created = client.post("/api/playlists", json={"user_id": 1, "title": "My Mix"}).json()
@@ -104,8 +115,11 @@ def test_google_user_acts_as_self_only(client):
     assert client.delete("/api/playlists/1/tracks/1").status_code == 403
     assert client.put("/api/users/1", json={"display_name": "x", "bio": "y"}).status_code == 403
 
-    assert client.get("/api/youtube/my-playlists").json()["playlists"][0]["title"] == "Mine"
-    assert client.get("/api/youtube/my-playlists/PLx/videos").json()["video_ids"] == ["M7lc1UVf-VE"]
+    # No YouTube scope is granted at sign-in, so the YouTube endpoints say so clearly.
+    for path in ("/api/youtube/my-playlists", "/api/youtube/my-playlists/PLx/videos"):
+        res = client.get(path)
+        assert res.status_code == 403
+        assert res.json()["detail"] == "YouTube access not connected yet."
 
     # Signing in again maps to the same Webjam user
     client.post("/auth/logout")
