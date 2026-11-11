@@ -15,7 +15,7 @@ from test_security_backend import db, db_path, demo, fakes  # noqa: F401  (fixtu
 from test_ops import ok, order, post_ops, q, redo, row, undo
 
 ROOT = Path(__file__).resolve().parent.parent
-APP_JS = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+APP_JS = (ROOT / "static" / "legacy" / "app.js").read_text(encoding="utf-8")
 
 
 def feed_text(client, viewer):
