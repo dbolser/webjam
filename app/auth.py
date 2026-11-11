@@ -1,33 +1,74 @@
-"""Google sign-in (OAuth 2.0 authorization-code flow) and session helpers.
+"""Auth mode, Google sign-in (OAuth 2.0 authorization-code flow + PKCE) and session helpers.
 
-Auth mode is enabled when GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set
-(unless WEBJAM_DEMO_MODE=1). In auth mode the acting user always comes from the
-signed session cookie; any user_id the client sends is ignored. Without Google
-credentials the app runs in the original demo mode (persona switcher, client
-chooses the user).
+Auth mode is chosen explicitly with ``WEBJAM_AUTH_MODE=google|demo`` and is fixed
+when the app starts (it is never re-read per request):
+
+* ``google`` -- invite-only Google sign-in. Startup fails unless GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET, WEBJAM_SESSION_SECRET (32+ chars) and WEBJAM_BASE_URL are
+  all set. The acting user always comes from the signed session cookie; any
+  user_id the client sends is ignored. Only Google accounts whose *verified*
+  email is in the ``invites`` table can sign in (seed it with
+  WEBJAM_INVITE_EMAILS=a@x.com,b@y.com or ``python -m app.invite add a@x.com``).
+* ``demo`` -- the original persona switcher for local development. The client
+  chooses the user and the password field is ignored entirely: anyone can act
+  as anyone. Demo mode is only the default when WEBJAM_AUTH_MODE is unset AND no
+  Google variables are set, and it refuses to start on a database that already
+  holds Google-linked accounts.
 """
 
+import base64
+import hashlib
+import logging
 import os
 import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 import urllib.parse
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from app.database import get_db
+from app.database import get_connection, get_db
+from app.invite import is_invited
+
+logger = logging.getLogger("webjam.auth")
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
-SCOPES = "openid email profile https://www.googleapis.com/auth/youtube.readonly"
+# Sign-in asks for identity only. YouTube access (youtube.readonly) will be requested
+# incrementally the first time someone opens "My YouTube" (Phase 4).
+SCOPES = "openid email profile"
+YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+
+SESSION_MAX_AGE = 60 * 60 * 24 * 14  # 14 days, refreshed on every response (sliding)
+MIN_SECRET_LEN = 32
+
+HANDLE_PATTERN = re.compile(r"^[a-z0-9_]{3,20}$")
+RESERVED_HANDLES = {"guest", "admin", "root", "webjam", "system", "support", "demo", "anonymous"}
 
 AVATAR_PALETTE = ["#1f5f5b", "#8c3b2b", "#3d4e81", "#6b4226", "#4a6b2c", "#7a3b69"]
+
+
+class AuthConfigError(RuntimeError):
+    """Raised at startup when the auth environment is missing or inconsistent."""
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    mode: str  # 'google' | 'demo'
+    session_secret: str
+    base_url: str  # '' in demo mode when WEBJAM_BASE_URL is unset
+    https_only: bool
+
+
+_config: Optional[AuthConfig] = None
 
 
 def _client_id() -> str:
@@ -38,14 +79,90 @@ def _client_secret() -> str:
     return os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
 
 
+def load_config_from_env() -> AuthConfig:
+    """Read and validate the auth environment. Raises AuthConfigError (fail closed)."""
+    raw_mode = os.environ.get("WEBJAM_AUTH_MODE", "").strip().lower()
+    has_google_vars = bool(_client_id() or _client_secret())
+    if not raw_mode:
+        if os.environ.get("WEBJAM_DEMO_MODE", "").strip():
+            raise AuthConfigError(
+                "WEBJAM_DEMO_MODE is no longer supported. Set WEBJAM_AUTH_MODE=demo or WEBJAM_AUTH_MODE=google."
+            )
+        # Never fall back to demo just because one Google variable went missing.
+        mode = "google" if has_google_vars else "demo"
+    elif raw_mode in ("google", "demo"):
+        mode = raw_mode
+    else:
+        raise AuthConfigError(f"WEBJAM_AUTH_MODE must be 'google' or 'demo', not {raw_mode!r}.")
+
+    secret = os.environ.get("WEBJAM_SESSION_SECRET", "").strip()
+    base = os.environ.get("WEBJAM_BASE_URL", "").strip().rstrip("/")
+
+    if mode == "google":
+        missing = [
+            name
+            for name, val in (
+                ("GOOGLE_CLIENT_ID", _client_id()),
+                ("GOOGLE_CLIENT_SECRET", _client_secret()),
+                ("WEBJAM_SESSION_SECRET", secret),
+                ("WEBJAM_BASE_URL", base),
+            )
+            if not val
+        ]
+        if missing:
+            raise AuthConfigError(f"WEBJAM_AUTH_MODE=google requires: {', '.join(missing)}")
+        if len(secret) < MIN_SECRET_LEN:
+            raise AuthConfigError(f"WEBJAM_SESSION_SECRET must be at least {MIN_SECRET_LEN} characters.")
+        parsed = urllib.parse.urlparse(base)
+        local_http = parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1")
+        if not parsed.netloc or not (parsed.scheme == "https" or local_http):
+            raise AuthConfigError("WEBJAM_BASE_URL must be an https:// URL (http:// is allowed only for localhost).")
+        return AuthConfig(mode="google", session_secret=secret, base_url=base, https_only=True)
+
+    return AuthConfig(
+        mode="demo",
+        session_secret=secret or secrets.token_urlsafe(32),
+        base_url=base,
+        https_only=base.startswith("https://"),
+    )
+
+
+def configure_from_env() -> AuthConfig:
+    """(Re)load the auth config. Called once at startup by the app lifespan."""
+    global _config
+    _config = load_config_from_env()
+    return _config
+
+
+def get_config() -> AuthConfig:
+    if _config is None:
+        return configure_from_env()
+    return _config
+
+
+def auth_mode() -> str:
+    return get_config().mode
+
+
 def auth_enabled() -> bool:
-    if os.environ.get("WEBJAM_DEMO_MODE", "").strip() == "1":
-        return False
-    return bool(_client_id() and _client_secret())
+    return auth_mode() == "google"
+
+
+def check_demo_mode_allowed(conn: sqlite3.Connection) -> None:
+    """Demo mode lets anyone impersonate anyone, so never run it over real accounts."""
+    if auth_mode() != "demo":
+        return
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS cnt FROM google_accounts")
+    if cur.fetchone()["cnt"]:
+        raise AuthConfigError(
+            "Refusing to start in demo mode: this database has Google-linked accounts. "
+            "Set WEBJAM_AUTH_MODE=google (with its required variables) or use a fresh WEBJAM_DB_PATH."
+        )
 
 
 def base_url(request: Request) -> str:
-    configured = os.environ.get("WEBJAM_BASE_URL", "").strip().rstrip("/")
+    configured = get_config().base_url
     return configured or str(request.base_url).rstrip("/")
 
 
@@ -53,13 +170,48 @@ def redirect_uri(request: Request) -> str:
     return f"{base_url(request)}/auth/google/callback"
 
 
+# --- Sessions ---
+
 def session_user_id(request: Request) -> Optional[int]:
-    uid = request.session.get("uid") if "session" in request.scope else None
-    return int(uid) if uid else None
+    """The signed-in user, only if they still exist and the cookie's epoch is current."""
+    if "session" not in request.scope:
+        return None
+    cached = getattr(request.state, "webjam_session_uid", -1)
+    if cached != -1:
+        return cached
+    uid_val = request.session.get("uid")
+    epoch_val = request.session.get("ep")
+    result: Optional[int] = None
+    try:
+        uid = int(uid_val) if uid_val is not None else 0
+        epoch = int(epoch_val) if epoch_val is not None else -1
+    except (TypeError, ValueError):
+        uid, epoch = 0, -1
+    if uid > 0 and epoch >= 0:
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT session_epoch FROM users WHERE id = ?", (uid,)).fetchone()
+        finally:
+            conn.close()
+        if row is not None and int(row["session_epoch"] or 0) == epoch:
+            result = uid
+    if result is None and (uid_val is not None or epoch_val is not None):
+        request.session.pop("uid", None)
+        request.session.pop("ep", None)
+    request.state.webjam_session_uid = result
+    return result
+
+
+def start_session(request: Request, conn: sqlite3.Connection, uid: int) -> None:
+    row = conn.execute("SELECT session_epoch FROM users WHERE id = ?", (uid,)).fetchone()
+    request.session.clear()
+    request.session["uid"] = uid
+    request.session["ep"] = int(row["session_epoch"] or 0) if row else 0
+    request.state.webjam_session_uid = uid
 
 
 def resolve_actor(request: Request, claimed_user_id: Optional[int]) -> int:
-    """The user performing a write. Session user in auth mode; client's claim in demo mode."""
+    """The user performing a write. Session user in google mode; client's claim in demo mode."""
     if auth_enabled():
         uid = session_user_id(request)
         if not uid:
@@ -77,27 +229,65 @@ def resolve_viewer(request: Request, claimed_user_id: Optional[int]) -> int:
     return int(claimed_user_id or 1)
 
 
+# --- Handles ---
+
+def slugify_handle(text: str) -> str:
+    """Lowercase [a-z0-9_] slug of a display name (accents folded, spaces -> '_')."""
+    folded = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", folded).strip("_")
+    return re.sub(r"_+", "_", slug)[:20].strip("_")
+
+
+def handle_taken(cur: sqlite3.Cursor, handle: str, exclude_user_id: Optional[int] = None) -> bool:
+    cur.execute(
+        "SELECT id FROM users WHERE LOWER(username) = ? AND id != ?",
+        (handle.lower(), exclude_user_id or 0),
+    )
+    return cur.fetchone() is not None
+
+
+def unique_handle(cur: sqlite3.Cursor, display_name: str) -> str:
+    """A public handle derived from the display name, never from the email address."""
+    base = slugify_handle(display_name)
+    if len(base) < 3 or base in RESERVED_HANDLES:
+        base = "curator"
+    if not handle_taken(cur, base):
+        return base
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    stem = base[:15]
+    while True:
+        candidate = f"{stem}_{''.join(secrets.choice(alphabet) for _ in range(4))}"
+        if not handle_taken(cur, candidate):
+            return candidate
+
+
+def validate_handle(handle: str) -> str:
+    clean = (handle or "").strip().lstrip("@").lower()
+    if not HANDLE_PATTERN.match(clean):
+        raise HTTPException(
+            status_code=400,
+            detail="Handles are 3-20 characters: lowercase letters, digits and underscores.",
+        )
+    if clean in RESERVED_HANDLES:
+        raise HTTPException(status_code=400, detail="That handle is reserved.")
+    return clean
+
+
 # --- Users & tokens ---
 
-def _unique_username(cur: sqlite3.Cursor, email: str, name: str) -> str:
-    base = re.sub(r"[^a-z0-9_]", "", (email.split("@")[0] or name).lower())[:20] or "curator"
-    candidate, n = base, 1
-    while True:
-        cur.execute("SELECT 1 FROM users WHERE LOWER(username) = ?", (candidate,))
-        if not cur.fetchone():
-            return candidate
-        n += 1
-        candidate = f"{base}{n}"
+def upsert_google_user(conn: sqlite3.Connection, info: Dict[str, Any], granted_scope: str = "") -> int:
+    """Find or create the Webjam user for a Google account.
 
-
-def upsert_google_user(conn: sqlite3.Connection, info: Dict[str, Any], tokens: Dict[str, Any]) -> int:
+    No Google tokens are stored: sign-in only asks for identity scopes, so there is
+    nothing worth keeping. (YouTube tokens arrive with incremental consent later.)
+    """
     cur = conn.cursor()
     sub = info["sub"]
-    email = info.get("email", "")
-    name = info.get("name") or email.split("@")[0] or "New Curator"
+    email = (info.get("email") or "").strip().lower()
+    name = (info.get("name") or "").strip()[:200] or "New Curator"
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    cur.execute("SELECT user_id, refresh_token FROM google_accounts WHERE google_sub = ?", (sub,))
+    cur.execute("SELECT user_id FROM google_accounts WHERE google_sub = ?", (sub,))
     row = cur.fetchone()
     if row:
         uid = row["user_id"]
@@ -109,45 +299,41 @@ def upsert_google_user(conn: sqlite3.Connection, info: Dict[str, Any], tokens: D
             INSERT INTO users (username, display_name, bio, avatar_color, password_hash, created_at)
             VALUES (?, ?, ?, ?, '', ?)
             """,
-            (_unique_username(cur, email, name), name, "New crate digger on Webjam.", color, now),
+            (unique_handle(cur, name), name, "New crate digger on Webjam.", color, now),
         )
         uid = cur.lastrowid
 
-    refresh = tokens.get("refresh_token") or (row["refresh_token"] if row else None)
     cur.execute(
         """
         INSERT INTO google_accounts (google_sub, user_id, email, access_token, refresh_token, token_expires_at, scope, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, NULL, NULL, 0, ?, ?)
         ON CONFLICT(google_sub) DO UPDATE SET
-            email = excluded.email, access_token = excluded.access_token,
-            refresh_token = excluded.refresh_token, token_expires_at = excluded.token_expires_at,
-            scope = excluded.scope, updated_at = excluded.updated_at
+            email = excluded.email, access_token = NULL, refresh_token = NULL,
+            token_expires_at = 0, scope = excluded.scope, updated_at = excluded.updated_at
         """,
-        (
-            sub,
-            uid,
-            email,
-            tokens.get("access_token"),
-            refresh,
-            int(time.time()) + int(tokens.get("expires_in", 3600)) - 60,
-            tokens.get("scope", ""),
-            now,
-        ),
+        (sub, uid, email, granted_scope or "", now),
     )
     conn.commit()
     return uid
+
+
+def has_youtube_access(acct: Optional[sqlite3.Row]) -> bool:
+    if not acct:
+        return False
+    scopes = (acct["scope"] or "").split()
+    return YOUTUBE_SCOPE in scopes and bool(acct["access_token"] or acct["refresh_token"])
 
 
 async def youtube_access_token(conn: sqlite3.Connection, user_id: int) -> str:
     cur = conn.cursor()
     cur.execute("SELECT * FROM google_accounts WHERE user_id = ?", (user_id,))
     acct = cur.fetchone()
-    if not acct:
-        raise HTTPException(status_code=403, detail="This account isn't connected to Google.")
+    if not has_youtube_access(acct):
+        raise HTTPException(status_code=403, detail="YouTube access not connected yet.")
     if acct["access_token"] and int(acct["token_expires_at"] or 0) > time.time():
         return acct["access_token"]
     if not acct["refresh_token"]:
-        raise HTTPException(status_code=401, detail="Google session expired — please sign in again.")
+        raise HTTPException(status_code=403, detail="YouTube access not connected yet.")
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -174,22 +360,33 @@ async def youtube_access_token(conn: sqlite3.Connection, user_id: int) -> str:
 
 router = APIRouter()
 
+_MAX_PENDING_LOGINS = 3
+
+
+def _pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
 
 @router.get("/auth/google/login")
 def google_login(request: Request):
     if not auth_enabled():
         raise HTTPException(status_code=404, detail="Google sign-in is not configured")
     state = secrets.token_urlsafe(24)
-    request.session["oauth_state"] = state
+    verifier = secrets.token_urlsafe(64)
+    pending = dict(request.session.get("oauth") or {})
+    pending[state] = verifier
+    # Keep only the newest few in-flight logins (several tabs) so the cookie stays small.
+    request.session["oauth"] = dict(list(pending.items())[-_MAX_PENDING_LOGINS:])
     params = {
         "client_id": _client_id(),
         "redirect_uri": redirect_uri(request),
         "response_type": "code",
         "scope": SCOPES,
         "state": state,
-        "access_type": "offline",
-        "include_granted_scopes": "true",
-        "prompt": "consent select_account",
+        "code_challenge": _pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+        "prompt": "select_account",
     }
     return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}")
 
@@ -202,10 +399,14 @@ async def google_callback(
     error: str = "",
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    expected = request.session.pop("oauth_state", None)
+    if not auth_enabled():
+        raise HTTPException(status_code=404, detail="Google sign-in is not configured")
+    pending = dict(request.session.get("oauth") or {})
+    verifier = pending.pop(state, None) if state else None
+    request.session["oauth"] = pending
     if error:
-        return RedirectResponse("/#auth-error")
-    if not code or not expected or not secrets.compare_digest(state, expected):
+        return RedirectResponse("/#auth-error", status_code=303)
+    if not code or not verifier:
         raise HTTPException(status_code=400, detail="Invalid or expired sign-in attempt. Please try again.")
 
     async with httpx.AsyncClient(timeout=10) as client:
@@ -215,6 +416,7 @@ async def google_callback(
                 "client_id": _client_id(),
                 "client_secret": _client_secret(),
                 "code": code,
+                "code_verifier": verifier,
                 "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri(request),
             },
@@ -229,23 +431,46 @@ async def google_callback(
             raise HTTPException(status_code=400, detail="Could not read your Google profile.")
         info = info_resp.json()
 
-    uid = upsert_google_user(conn, info, tokens)
-    request.session.clear()
-    request.session["uid"] = uid
-    return RedirectResponse("/")
+    email = (info.get("email") or "").strip().lower()
+    verified = info.get("email_verified") in (True, "true")
+    if not info.get("sub") or not email or not verified or not is_invited(conn, email):
+        logger.info("Rejected sign-in from an uninvited or unverified Google account")
+        request.session.clear()
+        return RedirectResponse("/#not-invited", status_code=303)
+
+    uid = upsert_google_user(conn, info, tokens.get("scope", ""))
+    start_session(request, conn, uid)
+    return RedirectResponse("/", status_code=303)
 
 
 @router.post("/auth/logout")
-def logout(request: Request):
+def logout(request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = session_user_id(request) if auth_enabled() else None
+    if uid:
+        # Bumping the epoch revokes every outstanding cookie for this user, not just this browser's.
+        conn.execute("UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?", (uid,))
+        conn.execute(
+            "UPDATE google_accounts SET access_token = NULL, refresh_token = NULL, token_expires_at = 0 WHERE user_id = ?",
+            (uid,),
+        )
+        conn.commit()
     request.session.clear()
     return {"ok": True}
 
 
+def _require_youtube_user(request: Request, conn: sqlite3.Connection, what: str) -> int:
+    uid = session_user_id(request) if auth_enabled() else None
+    if not uid:
+        raise HTTPException(status_code=401, detail=f"Sign in with Google to {what}.")
+    acct = conn.execute("SELECT * FROM google_accounts WHERE user_id = ?", (uid,)).fetchone()
+    if not has_youtube_access(acct):
+        raise HTTPException(status_code=403, detail="YouTube access not connected yet.")
+    return uid
+
+
 @router.get("/api/youtube/my-playlists")
 async def my_youtube_playlists(request: Request, conn: sqlite3.Connection = Depends(get_db)):
-    uid = resolve_actor(request, None) if auth_enabled() else None
-    if not uid:
-        raise HTTPException(status_code=401, detail="Sign in with Google to see your YouTube playlists.")
+    uid = _require_youtube_user(request, conn, "see your YouTube playlists")
     token = await youtube_access_token(conn, uid)
     playlists = []
     page_token = ""
@@ -278,9 +503,9 @@ async def my_youtube_playlists(request: Request, conn: sqlite3.Connection = Depe
 async def my_youtube_playlist_videos(
     playlist_id: str, request: Request, limit: int = 50, conn: sqlite3.Connection = Depends(get_db)
 ):
-    uid = resolve_actor(request, None) if auth_enabled() else None
-    if not uid:
-        raise HTTPException(status_code=401, detail="Sign in with Google to read your YouTube playlists.")
+    uid = _require_youtube_user(request, conn, "read your YouTube playlists")
+    if not re.match(r"^[A-Za-z0-9_-]{2,64}$", playlist_id):
+        raise HTTPException(status_code=400, detail="Invalid playlist id")
     token = await youtube_access_token(conn, uid)
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
