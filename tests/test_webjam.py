@@ -201,7 +201,7 @@ def test_full_webjam_workflow(monkeypatch):
             )
             assert bad_upd.status_code == 400
 
-            # 9. Test drag-and-drop track reorder and Ctrl+Z snapshot undo
+            # 9. Test drag-and-drop track reorder and Ctrl+Z undo
             before_pl = client.get(f"/api/playlists/{elena_pl_id}?user_id={elena_id}").json()
             orig_track_ids = [t["id"] for t in before_pl["tracks"]]
             assert len(orig_track_ids) == 4
@@ -215,17 +215,10 @@ def test_full_webjam_workflow(monkeypatch):
             after_reorder_pl = client.get(f"/api/playlists/{elena_pl_id}?user_id={elena_id}").json()
             assert [t["id"] for t in after_reorder_pl["tracks"]] == reversed_ids
 
-            # Restore snapshot (Ctrl+Z undo)
-            undo_res = client.put(
-                f"/api/playlists/{elena_pl_id}/snapshot",
-                json={
-                    "user_id": elena_id,
-                    "title": before_pl["title"],
-                    "description": before_pl["description"],
-                    "tracks": before_pl["tracks"],
-                },
-            )
+            # Ctrl+Z: the server-side undo stack reverts the reorder (PUT /snapshot is gone in Phase 1a)
+            undo_res = client.post("/api/ops/undo", json={"user_id": elena_id})
             assert undo_res.status_code == 200
+            assert undo_res.json()["group_id"] is not None
             restored_pl = client.get(f"/api/playlists/{elena_pl_id}?user_id={elena_id}").json()
             assert [t["id"] for t in restored_pl["tracks"]] == orig_track_ids
 

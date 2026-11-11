@@ -42,6 +42,7 @@ from fastapi.responses import RedirectResponse
 
 from app.database import get_connection, get_db
 from app.invite import is_invited
+from app.ops import ensure_crate
 
 logger = logging.getLogger("webjam.auth")
 
@@ -379,6 +380,7 @@ def upsert_google_user(conn: sqlite3.Connection, info: Dict[str, Any], granted_s
             (unique_handle(cur, name), name, "New crate digger on Webjam.", color, now),
         )
         uid = cur.lastrowid
+        ensure_crate(conn, uid)
 
     cur.execute(
         """

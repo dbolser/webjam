@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import sqlite3
 from typing import Any, Dict, List
 
+from app.visibility import listed
+
 BADGE_CATALOG: List[Dict[str, Any]] = [
     # 1. Discovery Badges (First to add songs to Webjam)
     {
@@ -167,6 +169,11 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
 
 BADGE_BY_KEY = {b["key"]: b for b in BADGE_CATALOG}
 
+# Every playlist-based metric is public on profiles, so it only counts LISTED playlists:
+# p = the playlist being measured, tp = the playlist a copied track now lives in.
+LISTED_P = listed("p")
+LISTED_TP = listed("tp")
+
 
 def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, Any]:
     """Compute all live stats and badge-qualifying contexts for a given user."""
@@ -183,11 +190,12 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 2. Viral discoveries (songs first discovered by user that appear in 2+ OTHER users' playlists)
     cur.execute(
-        """
+        f"""
         SELECT s.video_id, s.title, COUNT(DISTINCT pt.added_by_user_id) AS other_curators
         FROM songs s
         JOIN playlist_tracks pt ON pt.video_id = s.video_id AND pt.added_by_user_id != s.first_added_by_user_id
-        WHERE s.first_added_by_user_id = ?
+        JOIN playlists tp ON tp.id = pt.playlist_id
+        WHERE s.first_added_by_user_id = ? AND {LISTED_TP}
         GROUP BY s.video_id
         HAVING other_curators >= 2
         """,
@@ -203,13 +211,15 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 3. Tracks taken FROM me by other users
     cur.execute(
-        """
-        SELECT pt.id, s.title, u.username AS taker_username, p.title AS source_playlist_title
+        f"""
+        SELECT pt.id, s.title, u.username AS taker_username,
+               CASE WHEN {LISTED_P} THEN p.title END AS source_playlist_title
         FROM playlist_tracks pt
         JOIN songs s ON s.video_id = pt.video_id
         JOIN users u ON u.id = pt.added_by_user_id
+        JOIN playlists tp ON tp.id = pt.playlist_id
         LEFT JOIN playlists p ON p.id = pt.source_playlist_id
-        WHERE pt.source_user_id = ? AND pt.added_by_user_id != ?
+        WHERE pt.source_user_id = ? AND pt.added_by_user_id != ? AND {LISTED_TP}
         ORDER BY pt.created_at ASC
         """,
         (user_id, user_id),
@@ -225,13 +235,13 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 4. Tracks taken BY me from other users
     cur.execute(
-        """
+        f"""
         SELECT pt.id, s.title, u.username AS source_username, p.title AS my_playlist_title, p.id AS my_playlist_id, p.plays AS my_playlist_plays
         FROM playlist_tracks pt
         JOIN songs s ON s.video_id = pt.video_id
         JOIN users u ON u.id = pt.source_user_id
         JOIN playlists p ON p.id = pt.playlist_id
-        WHERE pt.added_by_user_id = ? AND pt.source_user_id IS NOT NULL AND pt.source_user_id != ?
+        WHERE pt.added_by_user_id = ? AND pt.source_user_id IS NOT NULL AND pt.source_user_id != ? AND {LISTED_P}
         ORDER BY pt.created_at ASC
         """,
         (user_id, user_id),
@@ -246,14 +256,14 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 5. Alchemist playlists: playlists owned by user that took >=1 track from another user AND reached >=5 plays
     cur.execute(
-        """
+        f"""
         SELECT p.id, p.title, p.plays,
                GROUP_CONCAT(DISTINCT u.username) AS source_usernames,
                COUNT(DISTINCT pt.source_user_id) AS distinct_sources
         FROM playlists p
         JOIN playlist_tracks pt ON pt.playlist_id = p.id
         JOIN users u ON u.id = pt.source_user_id
-        WHERE p.user_id = ?
+        WHERE p.user_id = ? AND {LISTED_P}
           AND pt.source_user_id IS NOT NULL
           AND pt.source_user_id != ?
           AND p.plays >= 5
@@ -283,11 +293,11 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 7. Likes received across playlists owned by user + songs first discovered by user (summing multi-loves)
     cur.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(pl.count), 0) AS cnt
         FROM playlist_likes pl
         JOIN playlists p ON p.id = pl.playlist_id
-        WHERE p.user_id = ?
+        WHERE p.user_id = ? AND {LISTED_P}
         """,
         (user_id,),
     )
@@ -332,11 +342,11 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
             superlove_context = f"Bestowed {max_single_superlove}× Superlove on '{top_song_love['title']}'"
 
         cur.execute(
-            """
+            f"""
             SELECT pl.count, p.title
             FROM playlist_likes pl
             JOIN playlists p ON p.id = pl.playlist_id
-            WHERE pl.user_id = ?
+            WHERE pl.user_id = ? AND {LISTED_P}
             ORDER BY pl.count DESC
             LIMIT 1
             """,
@@ -361,7 +371,7 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 8. Max plays on any single playlist & total plays
     cur.execute(
-        "SELECT COALESCE(MAX(plays), 0) AS max_plays, COALESCE(SUM(plays), 0) AS total_plays, COUNT(*) AS playlist_count FROM playlists WHERE user_id = ?",
+        f"SELECT COALESCE(MAX(plays), 0) AS max_plays, COALESCE(SUM(plays), 0) AS total_plays, COUNT(*) AS playlist_count FROM playlists p WHERE p.user_id = ? AND {LISTED_P}",
         (user_id,),
     )
     play_row = cur.fetchone()
@@ -371,11 +381,11 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
     # 9. Annotated playlists (description non-empty and >=3 tracks with non-empty track_note)
     cur.execute(
-        """
+        f"""
         SELECT p.id, p.title, COUNT(pt.id) AS noted_tracks
         FROM playlists p
         JOIN playlist_tracks pt ON pt.playlist_id = p.id
-        WHERE p.user_id = ?
+        WHERE p.user_id = ? AND {LISTED_P}
           AND TRIM(COALESCE(p.description, '')) != ''
           AND TRIM(COALESCE(pt.track_note, '')) != ''
         GROUP BY p.id
