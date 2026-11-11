@@ -8,7 +8,7 @@ import './core.js';
 import './routes.js';
 import './editing/index.js';
 import './discovery/index.js';
-// import './share/index.js';
+import './share/index.js';
 
 import { state, onChange } from './store.js';
 import * as api from './api.js';
