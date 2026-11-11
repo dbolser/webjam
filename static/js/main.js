@@ -6,7 +6,7 @@
 
 import './core.js';
 import './routes.js';
-// import './editing/index.js';
+import './editing/index.js';
 // import './discovery/index.js';
 // import './share/index.js';
 
