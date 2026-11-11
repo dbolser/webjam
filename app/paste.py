@@ -163,6 +163,18 @@ def _rows_as_items(conn: sqlite3.Connection, pl: sqlite3.Row, track_id: Optional
     return out
 
 
+_WORDLIKE = re.compile(r"^(?:[A-Za-z][a-z]{10}|[A-Z]{11})$")
+
+
+def _looks_like_video_id(token: str) -> bool:
+    """An 11-character id that isn't shaped like an English word (all lower case, Capitalised or ALL CAPS).
+
+    A real id is all letters in one of those shapes with odds of roughly 1 in 10,000; those can
+    still be pasted as a youtu.be / watch URL.
+    """
+    return is_valid_video_id(token) and not _WORDLIKE.match(token)
+
+
 async def resolve_paste(
     conn: sqlite3.Connection,
     text: str,
@@ -268,12 +280,14 @@ async def resolve_paste(
             if list_id:
                 source("youtube_playlist")
                 pointers.append(_playlist_pointer(list_id, token))
-        if not items and not pointers and not unresolved:
-            for token in bare_tokens:
-                for part in re.split(r"[\s,]+", token):
-                    if is_valid_video_id(part):
-                        source("video_id")
-                        add([_item(part, source="video_id")], part)
+        # Bare ids only when the whole paste is ids (separated by spaces / commas), and none of
+        # them looks like a word: free text ("really interesting information") stays empty and
+        # costs no lookups.
+        parts = [p for token in bare_tokens for p in re.split(r"[\s,]+", token) if p]
+        if not items and not pointers and not unresolved and parts and all(_looks_like_video_id(p) for p in parts):
+            for part in parts:
+                source("video_id")
+                add([_item(part, source="video_id")], part)
 
     # Metadata: Webjam's cached row when the song is on Webjam, else a (TTL-cached) YouTube lookup.
     meta: Dict[str, Dict[str, Any]] = {}

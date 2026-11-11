@@ -505,7 +505,7 @@ def _fn(name):
 
 def test_frontend_follows_the_backend_changes():
     # Phase 1a: undo goes through the server-side op log; the snapshot endpoint is gone.
-    assert "/api/ops/undo" in _fn("undoLastPlaylistChange")
+    assert "/api/ops/undo" in _fn("runUndo") and "runUndo(" in _fn("undoLastPlaylistChange")
     assert "/snapshot" not in APP_JS and "capturePlaylistSnapshot" not in APP_JS
     assert "Array.isArray(data.detail)" in _fn("api")
     assert "res.counted" in _fn("incrementPlaylistSpin") and "res.counted" in _fn("simulateExtraSpin")

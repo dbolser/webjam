@@ -162,13 +162,16 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     display_title TEXT DEFAULT NULL,  -- per-row title override; songs.title stays YouTube's
     source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
     source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    source_track_id INTEGER REFERENCES playlist_tracks(id) ON DELETE SET NULL,
+    -- No FK on purpose: an FK would SET NULL other users' links whenever a row is deleted or moved,
+    -- and undo could never put them back. Readers treat a dangling id as no link.
+    source_track_id INTEGER,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pt_order ON playlist_tracks(playlist_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_pt_video ON playlist_tracks(video_id);
 CREATE INDEX IF NOT EXISTS idx_pt_source_user ON playlist_tracks(source_user_id);
 CREATE INDEX IF NOT EXISTS idx_pt_source_playlist ON playlist_tracks(source_playlist_id);
+CREATE INDEX IF NOT EXISTS idx_pt_source_track ON playlist_tracks(source_track_id);
 
 -- The op log: one row per per-playlist effect of an op batch. The undo stack is per user.
 CREATE TABLE IF NOT EXISTS playlist_ops (
@@ -178,7 +181,7 @@ CREATE TABLE IF NOT EXISTS playlist_ops (
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id TEXT NOT NULL,          -- undo unit; defaults to batch_id
-    kind TEXT NOT NULL CHECK (kind IN ('insert', 'delete', 'move', 'update', 'set_meta')),
+    kind TEXT NOT NULL CHECK (kind IN ('insert', 'delete', 'move', 'update', 'set_meta', 'reorder')),
     forward_json TEXT NOT NULL,
     inverse_json TEXT NOT NULL,
     request_hash TEXT NOT NULL,
@@ -241,6 +244,7 @@ CREATE TABLE IF NOT EXISTS user_badges (
     badge_key TEXT NOT NULL,
     context_note TEXT DEFAULT '',
     awarded_at TEXT NOT NULL,
+    op_group_key TEXT NULL,  -- "<actor id>:<group id>" when an undoable op group earned it (undo revokes it)
     UNIQUE(user_id, badge_key)
 );
 
@@ -257,7 +261,7 @@ CREATE TABLE IF NOT EXISTS activity_log (
 CREATE INDEX IF NOT EXISTS idx_activity_group ON activity_log(actor_user_id, op_group_id);
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_CHANGED_MESSAGE = (
     "Webjam Phase 1 changed the schema. Delete the database file (WEBJAM_DB_PATH) and restart; "
     "it will be reseeded."

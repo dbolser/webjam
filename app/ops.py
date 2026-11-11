@@ -46,7 +46,10 @@ ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 VIDEO_ID_REGEX = r"^[A-Za-z0-9_-]{11}$"
 
 ROLE_RANK = {"viewer": 1, "contributor": 2, "editor": 3, "owner": 4}
-OP_MIN_ROLE = {"insert": "editor", "delete": "editor", "move": "editor", "update": "editor", "set_meta": "owner"}
+OP_MIN_ROLE = {"insert": "editor", "delete": "editor", "move": "editor", "update": "editor", "set_meta": "owner",
+               "reorder": "editor"}
+# Batch and group ids the server mints. A client op_id / group_id may not start with one.
+RESERVED_ID_PREFIXES = ("srv-", "fork-", "promote-")
 
 TRACK_COLS = (
     "id", "playlist_id", "video_id", "position", "added_by_user_id", "track_note",
@@ -189,6 +192,21 @@ class SetMetaOp(_Strict):
 
 Op = Annotated[Union[InsertOp, DeleteOp, MoveOp, UpdateOp, SetMetaOp], Field(discriminator="kind")]
 OPS_ADAPTER = TypeAdapter(List[Op])
+
+
+class ReorderOp(_Strict):
+    """Server-only (PUT /api/playlists/{id}/reorder): the playlist's whole new order as ONE effect.
+
+    Not part of the client Op union. Its inverse is the previous order, so a reorder of n tracks
+    costs one op row and one O(n) pass instead of up to n single-track moves.
+    """
+    kind: Literal["reorder"] = "reorder"
+    playlist_id: DbId
+    track_ids: Annotated[List[DbId], Field(max_length=MAX_TRACKS_PER_PLAYLIST)]
+
+
+def is_reserved_id(value: Optional[str]) -> bool:
+    return bool(value) and value.lower().startswith(RESERVED_ID_PREFIXES)
 
 
 def parse_ops(raw: List[Dict[str, Any]]) -> List[Any]:
@@ -390,12 +408,15 @@ def _insert_track(conn: sqlite3.Connection, row: Dict[str, Any], position: float
 
 
 def _sanitize_refs(conn: sqlite3.Connection, row: Dict[str, Any]) -> Dict[str, Any]:
-    """Null out references to rows that were deleted since a snapshot was taken (FKs)."""
+    """Null out FK references to rows that were deleted since a snapshot was taken.
+
+    source_track_id has no FK (ids are AUTOINCREMENT, never reused): it is kept as is, so a
+    restored row links again as soon as its source row is back, and readers ignore dangling ids.
+    """
     out = dict(row)
     checks = (
         ("source_playlist_id", "SELECT 1 FROM playlists WHERE id = ?"),
         ("source_user_id", "SELECT 1 FROM users WHERE id = ?"),
-        ("source_track_id", "SELECT 1 FROM playlist_tracks WHERE id = ?"),
     )
     for col, sql in checks:
         if out.get(col) is not None and not conn.execute(sql, (out[col],)).fetchone():
@@ -514,7 +535,9 @@ def render_track_rows(
                o.migrated_from_video_id, o.migrated_from_title,
                CASE WHEN sp.id IS NOT NULL AND {linkable('sp')} THEN sp.id END AS source_playlist_id,
                o.source_user_id,
-               CASE WHEN sp.id IS NOT NULL AND {linkable('sp')} THEN o.source_track_id END AS source_track_id,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp')} AND EXISTS (
+                   SELECT 1 FROM playlist_tracks st WHERE st.id = o.source_track_id AND st.playlist_id = sp.id)
+                 THEN o.source_track_id END AS source_track_id,
                o.created_at,
                COALESCE(o.display_title, s.title) AS title, s.title AS song_title, o.display_title,
                s.channel_title, s.thumbnail_url, s.total_plays,
@@ -636,14 +659,18 @@ def _next_redo_group(conn: sqlite3.Connection, user_id: int) -> Optional[str]:
 
 def undo_state(conn: sqlite3.Connection, user_id: int) -> Dict[str, Any]:
     if not user_id:
-        return {"can_undo": False, "undo_label": None, "can_redo": False, "redo_label": None}
+        return {"can_undo": False, "undo_label": None, "undo_group_id": None,
+                "can_redo": False, "redo_label": None, "redo_group_id": None}
     top = _top_undo_group(conn, user_id)
     nxt = _next_redo_group(conn, user_id)
+    # The group ids let a client assert which group it means (409 stack_moved otherwise).
     return {
         "can_undo": top is not None,
         "undo_label": _group_label(conn, user_id, top) if top else None,
+        "undo_group_id": top,
         "can_redo": nxt is not None,
         "redo_label": _group_label(conn, user_id, nxt) if nxt else None,
+        "redo_group_id": nxt,
     }
 
 
@@ -666,11 +693,15 @@ class _Effect:
 
 
 class _Batch:
-    def __init__(self, conn: sqlite3.Connection, actor: Actor, group_id: str, ts: str) -> None:
+    def __init__(self, conn: sqlite3.Connection, actor: Actor, group_id: str, ts: str,
+                 origin: Optional[str] = None) -> None:
         self.conn = conn
         self.actor = actor
         self.group_id = group_id
         self.ts = ts
+        # Who composed the batch: None (client or legacy endpoint), "fork" or "promote". Passed
+        # explicitly by the server, never inferred from a (client-choosable) id.
+        self.origin = origin
         self.effects: List[_Effect] = []
         self.provenance: Dict[int, str] = {}
         self.rendered_ids: List[int] = []
@@ -690,7 +721,7 @@ def _post_effect(ctx: _Batch, eff: _Effect) -> None:
     if eff.kind == "insert":
         tids = fwd.get("track_ids") or []
         # A fork logs one "forked" line instead of a grab line for its copy-all insert.
-        log_line = not ctx.group_id.startswith("fork-")
+        log_line = ctx.origin != "fork"
         if is_listed(pl) and tids:
             rows = conn.execute(
                 f"""
@@ -998,6 +1029,31 @@ def _apply_move(ctx: _Batch, op: MoveOp, op_index: int) -> Dict[str, Any]:
             "moved": [{"from_track_id": a, "track_id": b} for a, b in zip(block, new_ids)]}
 
 
+def _set_order(conn: sqlite3.Connection, pid: int, ids: List[int]) -> None:
+    for i, tid in enumerate(ids, start=1):
+        conn.execute("UPDATE playlist_tracks SET position = ? WHERE id = ?", (float(i), tid))
+
+
+def _apply_reorder(ctx: _Batch, op: ReorderOp, op_index: int) -> Dict[str, Any]:
+    conn, pid = ctx.conn, op.playlist_id
+    current = _order_ids(conn, pid)
+    wanted = [int(t) for t in op.track_ids]
+    if len(set(wanted)) != len(wanted) or set(wanted) != set(current):
+        raise ApiError(400, "bad_op", "A reorder must list every track of the playlist exactly once.",
+                       op_index=op_index)
+    result = {"kind": "reorder", "playlist_id": pid, "track_ids": wanted}
+    if wanted == current:
+        return result  # no effect, no undo entry
+    _set_order(conn, pid, wanted)
+    eff = _Effect(pid, "reorder",
+                  {"kind": "reorder", "playlist_id": pid, "track_ids": wanted,
+                   "label": f"Reordered '{_playlist_title(conn, pid)}'"},
+                  {"kind": "reorder", "playlist_id": pid, "track_ids": current})
+    ctx.effects.append(eff)
+    _post_effect(ctx, eff)
+    return result
+
+
 _TRACK_SET_COLUMNS = {"note": "track_note", "start_seconds": "start_seconds", "end_seconds": "end_seconds",
                       "display_title": "display_title", "video_id": "video_id"}
 
@@ -1103,6 +1159,50 @@ def _apply_set_meta(ctx: _Batch, op: SetMetaOp, op_index: int) -> Dict[str, Any]
     return result
 
 
+def _effect_summary(fwd: Dict[str, Any]) -> Optional[Tuple[str, int, int]]:
+    """(verb, playlist id, track count) for the group label; None for the source half of a move."""
+    kind, pid = fwd["kind"], int(fwd["playlist_id"])
+    n = len(fwd.get("track_ids") or [])
+    if kind == "insert":
+        return ("moved_to" if fwd.get("via") == "move" else "added", pid, n)
+    if kind == "delete":
+        return None if fwd.get("via") == "move" else ("removed", pid, n)
+    if kind == "move":
+        return ("moved_in", pid, n)
+    if kind == "update":
+        return ("swapped" if "video_id" in (fwd.get("set") or {}) else "edited", pid, 1)
+    return (kind, pid, 1)  # set_meta, reorder
+
+
+_LABEL_TEMPLATES = {
+    "added": "Added {n} to {where}", "removed": "Removed {n} from {where}", "moved_to": "Moved {n} to {where}",
+    "moved_in": "Moved {n} in {where}", "swapped": "Swapped {n} in {where}", "edited": "Edited {n} in {where}",
+}
+
+
+def _compose_label(conn: sqlite3.Connection, fwds: List[Dict[str, Any]]) -> Optional[str]:
+    """One undo label for a whole group: it must describe everything one undo reverts."""
+    if not fwds:
+        return None
+    own = [f.get("effect_label") or f.get("label") for f in fwds]
+    parts = [(s, lbl) for s, lbl in ((_effect_summary(f), lbl) for f, lbl in zip(fwds, own)) if s]
+    if not parts:
+        return own[0]
+    if len(parts) == 1:
+        return parts[0][1]
+    verbs = {s[0] for s, _ in parts}
+    pids = list(dict.fromkeys(s[1] for s, _ in parts))
+    verb = next(iter(verbs))
+    if len(verbs) == 1 and verb in _LABEL_TEMPLATES:
+        n = sum(s[2] for s, _ in parts)
+        count = "a track" if n == 1 else _plural(n)
+        where = f"'{_playlist_title(conn, pids[0])}'" if len(pids) == 1 else f"{len(pids)} playlists"
+        return _LABEL_TEMPLATES[verb].format(n=count, where=where)
+    if len(pids) == 1:
+        return f"Changed '{_playlist_title(conn, pids[0])}'"
+    return f"Changed {len(pids)} playlists"
+
+
 def _request_hash(group_id: Optional[str], ops: List[Any], expected_versions: Optional[Dict[int, int]]) -> str:
     payload = {
         "group_id": group_id,
@@ -1176,12 +1276,30 @@ def _retention(conn: sqlite3.Connection, user_id: int, ts: str) -> None:
                  (user_id, cutoff))
 
 
-def _evaluate_badges(conn: sqlite3.Connection, actor: Actor, credited: Set[int], finders: Set[int]) -> List[Dict[str, Any]]:
-    new_badges = evaluate_and_award_badges(conn, actor.user_id)
+def badge_group_key(user_id: int, group_id: str) -> str:
+    """user_badges.op_group_key / activity_log.op_group_id of badges an undo group earned.
+
+    ':' can't occur in an op id, so these never collide with plain group ids.
+    """
+    return f"{int(user_id)}:{group_id}"
+
+
+def _evaluate_badges(conn: sqlite3.Connection, actor: Actor, credited: Set[int], finders: Set[int],
+                     group_key: Optional[str] = None) -> List[Dict[str, Any]]:
+    new_badges = evaluate_and_award_badges(conn, actor.user_id, op_group_key=group_key)
     for uid in (credited | finders) - {actor.user_id}:
         if conn.execute("SELECT 1 FROM users WHERE id = ?", (uid,)).fetchone():
-            evaluate_and_award_badges(conn, uid)
+            evaluate_and_award_badges(conn, uid, op_group_key=group_key)
     return new_badges
+
+
+def _revoke_group_badges(conn: sqlite3.Connection, group_key: str) -> List[int]:
+    """Inside the undo transaction: drop the badges (and their feed lines) a group earned."""
+    users = [int(r[0]) for r in conn.execute(
+        "SELECT DISTINCT user_id FROM user_badges WHERE op_group_key = ?", (group_key,))]
+    conn.execute("DELETE FROM user_badges WHERE op_group_key = ?", (group_key,))
+    conn.execute("DELETE FROM activity_log WHERE action_type = 'earned_badge' AND op_group_id = ?", (group_key,))
+    return users
 
 
 def _replay(conn: sqlite3.Connection, actor: Actor, rows: List[sqlite3.Row]) -> OpsOutcome:
@@ -1202,6 +1320,32 @@ def _replay(conn: sqlite3.Connection, actor: Actor, rows: List[sqlite3.Row]) -> 
     )
 
 
+def check_batch_shape(ops: List[Any], max_items: int = MAX_ENTRIES_PER_REQUEST) -> List[int]:
+    """The request caps, before any DB or network work. Returns the touched playlist ids.
+
+    Server-composed batches (max_items > 50: promote, fork, import) may use one op per item.
+    """
+    max_ops = MAX_OPS_PER_BATCH if max_items <= MAX_ENTRIES_PER_REQUEST else max_items
+    if not ops:
+        raise ApiError(400, "bad_op", "No ops to apply.")
+    if len(ops) > max_ops:
+        raise ApiError(400, "batch_too_large", f"Send at most {max_ops} ops at a time.")
+    if _count_items(ops) > max_items:
+        raise ApiError(400, "batch_too_large", f"Change at most {max_items} items at a time.")
+    touched = _touched_ids(ops)
+    if len(touched) > MAX_PLAYLISTS_PER_BATCH:
+        raise ApiError(400, "batch_too_large", f"Touch at most {MAX_PLAYLISTS_PER_BATCH} playlists at a time.")
+    return touched
+
+
+def authorise_batch(conn: sqlite3.Connection, actor: Actor, ops: List[Any]) -> None:
+    """Role check for every op (read-only; also run before any YouTube lookups)."""
+    for i, op in enumerate(ops):
+        require_playlist_role(conn, op.playlist_id, actor, OP_MIN_ROLE[op.kind], op_index=i)
+        if op.kind == "move" and op.to_playlist_id and op.to_playlist_id != op.playlist_id:
+            require_playlist_role(conn, op.to_playlist_id, actor, OP_MIN_ROLE["move"], op_index=i)
+
+
 def apply_ops(
     conn: sqlite3.Connection,
     actor: Actor,
@@ -1214,26 +1358,18 @@ def apply_ops(
     skip_unavailable: bool = False,
     max_items: int = MAX_ENTRIES_PER_REQUEST,
     undoable: bool = True,
+    origin: Optional[str] = None,
 ) -> OpsOutcome:
     """Apply a batch in one transaction. Joins the caller's transaction if one is open.
 
     Commits on success (badges are evaluated after the commit) and rolls back on any error.
+    `origin` ("fork" / "promote") is set only by the server-side composers, never from a request.
     """
     explicit_group = group_id is not None
     group_id = group_id or batch_id
     song_meta = song_meta or {}
-    # 1. Shape caps (Pydantic already checked kinds and fields). Server-composed batches
-    # (max_items > 50: promote, fork, import, reorder) may use one op per moved track.
-    max_ops = MAX_OPS_PER_BATCH if max_items <= MAX_ENTRIES_PER_REQUEST else max_items
-    if not ops:
-        raise ApiError(400, "bad_op", "No ops to apply.")
-    if len(ops) > max_ops:
-        raise ApiError(400, "batch_too_large", f"Send at most {max_ops} ops at a time.")
-    if _count_items(ops) > max_items:
-        raise ApiError(400, "batch_too_large", f"Change at most {max_items} items at a time.")
-    touched = _touched_ids(ops)
-    if len(touched) > MAX_PLAYLISTS_PER_BATCH:
-        raise ApiError(400, "batch_too_large", f"Touch at most {MAX_PLAYLISTS_PER_BATCH} playlists at a time.")
+    # 1. Shape caps (Pydantic already checked kinds and fields).
+    touched = check_batch_shape(ops, max_items)
     req_hash = _request_hash(group_id if explicit_group else None, ops, expected_versions)
     ts = now_str()
 
@@ -1249,10 +1385,7 @@ def apply_ops(
             return outcome
 
         # 4. Load and authorise.
-        for i, op in enumerate(ops):
-            require_playlist_role(conn, op.playlist_id, actor, OP_MIN_ROLE[op.kind], op_index=i)
-            if op.kind == "move" and op.to_playlist_id and op.to_playlist_id != op.playlist_id:
-                require_playlist_role(conn, op.to_playlist_id, actor, OP_MIN_ROLE["move"], op_index=i)
+        authorise_batch(conn, actor, ops)
 
         # 5. Versions.
         if expected_versions:
@@ -1270,14 +1403,17 @@ def apply_ops(
                                conflicts=conflicts, versions={str(k): v for k, v in current.items()})
 
         # 6. Group check: a reused group must still be the top of the user's live stack.
+        joined: List[sqlite3.Row] = []
         if explicit_group:
             exists = conn.execute("SELECT 1 FROM playlist_ops WHERE user_id = ? AND group_id = ? LIMIT 1",
                                   (actor.user_id, group_id)).fetchone()
             if exists and _top_undo_group(conn, actor.user_id) != group_id:
                 raise ApiError(409, "group_closed", "That undo group is closed; start a new one.")
+            if exists:
+                joined = _group_rows(conn, actor.user_id, group_id, undone=False)
 
         # 7. Apply in order.
-        ctx = _Batch(conn, actor, group_id, ts)
+        ctx = _Batch(conn, actor, group_id, ts, origin)
         results: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         for i, op in enumerate(ops):
@@ -1289,12 +1425,25 @@ def apply_ops(
                 results.append(_apply_move(ctx, op, i))
             elif op.kind == "update":
                 results.append(_apply_update(ctx, op, i, song_meta))
+            elif op.kind == "reorder":
+                results.append(_apply_reorder(ctx, op, i))
             else:
                 results.append(_apply_set_meta(ctx, op, i))
 
-        # 8. Op rows.
+        # 8. Op rows. The label describes the whole group (this batch plus any batch it joins).
         effect_pids = list(dict.fromkeys(e.playlist_id for e in ctx.effects))
-        label = ctx.effects[0].forward.get("label") if ctx.effects else None
+        for eff in ctx.effects:
+            eff.forward["effect_label"] = eff.forward.get("label")
+            if origin:
+                eff.forward["origin"] = origin
+        label = None
+        if ctx.effects:
+            joined_fwds = [json.loads(r["forward_json"]) for r in joined]
+            label = _compose_label(conn, joined_fwds + [e.forward for e in ctx.effects])
+            for r, f in zip(joined, joined_fwds):
+                if f.get("label") != label:
+                    f["label"] = label
+                    conn.execute("UPDATE playlist_ops SET forward_json = ? WHERE id = ?", (json.dumps(f), r["id"]))
         for n, eff in enumerate(ctx.effects):
             fwd = dict(eff.forward)
             fwd["label"] = label
@@ -1332,10 +1481,12 @@ def apply_ops(
         conn.rollback()
         raise
 
-    # 14. Badges, only when a LISTED playlist was involved.
+    # 14. Badges, only when a LISTED playlist was involved. Badges an undoable group earns are
+    # tagged with it, so undoing the group revokes them (paste-then-undo can't farm badges).
     new_badges: List[Dict[str, Any]] = []
     if ctx.effects and any(is_listed(ctx.playlist(p)) for p in effect_pids):
-        new_badges = _evaluate_badges(conn, actor, ctx.credited_users, ctx.finders)
+        new_badges = _evaluate_badges(conn, actor, ctx.credited_users, ctx.finders,
+                                      badge_group_key(actor.user_id, group_id) if undoable else None)
 
     rendered = _render_rows(conn, actor.user_id, ctx.rendered_ids)
     for tid, prov in ctx.provenance.items():
@@ -1423,12 +1574,23 @@ def _exec_internal(conn: sqlite3.Connection, op: Dict[str, Any], redo_rows: bool
             _move_block(conn, pid, [int(m["track_id"])], m.get("after_track_id"), m.get("index", 0))
             ids.append(int(m["track_id"]))
         return {"kind": "move_each", "playlist_id": pid, "track_ids": ids}
+    if kind == "reorder":
+        ids = [int(t) for t in op["track_ids"]]
+        current = _order_ids(conn, pid)
+        present = set(current)
+        for t in ids:
+            if t not in present:
+                raise _Conflict(pid, t, "track gone")
+        listed_ids = set(ids)
+        _set_order(conn, pid, ids + [t for t in current if t not in listed_ids])
+        return {"kind": "reorder", "playlist_id": pid, "track_ids": ids}
     if kind == "update":
         tid = int(op["track_id"])
         row = conn.execute("SELECT * FROM playlist_tracks WHERE id = ? AND playlist_id = ?", (tid, pid)).fetchone()
         if not row:
             raise _Conflict(pid, tid, "track gone")
-        for c, v in (op.get("expect") or {}).items():
+        # An FK may have nulled an expected source_* id since (a deleted playlist): compare like for like.
+        for c, v in _sanitize_refs(conn, dict(op.get("expect") or {})).items():
             if not _same(row[c], v):
                 raise _Conflict(pid, tid, f"{c} changed")
         values = _sanitize_refs(conn, dict(op["set"]))
@@ -1569,9 +1731,10 @@ def undo_group(conn: sqlite3.Connection, actor: Actor, expect_group_id: Optional
         conn.execute("DELETE FROM activity_log WHERE actor_user_id = ? AND op_group_id = ?", (actor.user_id, gid))
         for r in reversed(rows):
             revert_claims(conn, json.loads(r["forward_json"]).get("claims") or [])
+        revoked = _revoke_group_badges(conn, badge_group_key(actor.user_id, gid))
         _upsert_dock(conn, actor.user_id, touched, ts)
         notes = []
-        if gid.startswith("promote-"):
+        if json.loads(rows[0]["forward_json"]).get("origin") == "promote":
             for r in rows:
                 fwd = json.loads(r["forward_json"])
                 if fwd["kind"] == "insert" and fwd.get("via") == "move" and not _order_ids(conn, r["playlist_id"]):
@@ -1580,6 +1743,9 @@ def undo_group(conn: sqlite3.Connection, actor: Actor, expect_group_id: Optional
     except BaseException:
         conn.rollback()
         raise
+    # A revoked badge whose criteria still hold without the group comes back, silently.
+    for uid in revoked:
+        evaluate_and_award_badges(conn, uid, record_activity=False)
     return _stack_response(conn, actor.user_id, gid, label, results, touched, rendered, notes)
 
 
@@ -1603,7 +1769,7 @@ def redo_group(conn: sqlite3.Connection, actor: Actor, expect_group_id: Optional
             conn.commit()
             return {"group_id": gid, "label": label, "skipped": True, "results": [], "notes": [],
                     "undo": undo_state(conn, actor.user_id)}
-        ctx = _Batch(conn, actor, gid, ts)
+        ctx = _Batch(conn, actor, gid, ts, json.loads(rows[0]["forward_json"]).get("origin"))
         results, rendered = [], []
         try:
             _require_editor(conn, actor, rows)
@@ -1630,7 +1796,7 @@ def redo_group(conn: sqlite3.Connection, actor: Actor, expect_group_id: Optional
         raise
     new_badges: List[Dict[str, Any]] = []
     if any(is_listed(ctx.playlist(p)) for p in touched if ctx.playlist(p)):
-        new_badges = _evaluate_badges(conn, actor, ctx.credited_users, ctx.finders)
+        new_badges = _evaluate_badges(conn, actor, ctx.credited_users, ctx.finders, badge_group_key(actor.user_id, gid))
     return _stack_response(conn, actor.user_id, gid, label, results, touched, rendered, [],
                            {"new_badges": new_badges})
 
@@ -1690,12 +1856,15 @@ def create_playlist(conn: sqlite3.Connection, actor: Actor, title: str, descript
 
 
 def fork_playlist(conn: sqlite3.Connection, actor: Actor, source_id: int, title: Optional[str],
-                  visibility: str) -> Dict[str, Any]:
+                  visibility: Optional[str] = None) -> Dict[str, Any]:
     src = conn.execute("SELECT * FROM playlists WHERE id = ?", (int(source_id),)).fetchone()
     if not is_visible(src, actor.user_id):
         raise ApiError(404, "playlist_not_found", "Playlist not found")
     if src["kind"] == "crate":
         raise ApiError(400, "use_promote", "Promote your crate instead of forking it.")
+    # By default a fork keeps its source's audience: an unlisted or private source (whose title
+    # the fork copies) is not published unless the forker asks for public explicitly.
+    visibility = visibility or src["visibility"]
     new_title = (title if title is not None else src["title"]).strip()[:MAX_TITLE]
     if not new_title:
         raise ApiError(400, "bad_title", "Playlist title is required")
@@ -1709,9 +1878,14 @@ def fork_playlist(conn: sqlite3.Connection, actor: Actor, source_id: int, title:
         fid = _create_playlist_row(conn, actor.user_id, new_title, src["description"] or "", visibility, ts,
                                    forked_from=src["id"])
         if visibility == "public":
-            _log_activity(conn, actor.user_id, "forked_playlist",
-                          f"forked '{src['title']}' from @{owner['username'] if owner else 'someone'}",
-                          "playlist", fid, None, ts)
+            if is_listed(src):
+                _log_activity(conn, actor.user_id, "forked_playlist",
+                              f"forked '{src['title']}' from @{owner['username'] if owner else 'someone'}",
+                              "playlist", fid, None, ts)
+            else:
+                # An unlisted or private source may never be named or linked from a public page (§4.1).
+                _log_activity(conn, actor.user_id, "created_playlist", f"published playlist '{new_title}'",
+                              "playlist", fid, None, ts)
         _upsert_dock(conn, actor.user_id, [fid], ts)
         new_badges: List[Dict[str, Any]] = []
         if rows:
@@ -1720,7 +1894,7 @@ def fork_playlist(conn: sqlite3.Connection, actor: Actor, source_id: int, title:
                       "display_title": r["display_title"], "ref": {"track_id": r["id"]}} for r in rows]
             ops = parse_ops([{"kind": "insert", "playlist_id": fid, "items": items}])
             outcome = apply_ops(conn, actor, ops, batch_id=f"fork-{new_ulid()}", max_items=SERVER_MAX_ITEMS,
-                                undoable=False)
+                                undoable=False, origin="fork")
             new_badges = outcome.new_badges
         else:
             conn.commit()
@@ -1768,7 +1942,8 @@ def promote_crate(conn: sqlite3.Connection, actor: Actor, title: str, descriptio
             _log_activity(conn, actor.user_id, "created_playlist", f"published playlist '{new_title}'",
                           "playlist", pid, None, ts)
         ops = parse_ops([{"kind": "move", "playlist_id": crate_id, "track_ids": block, "to_playlist_id": pid}])
-        outcome = apply_ops(conn, actor, ops, batch_id=gid, group_id=gid, max_items=SERVER_MAX_ITEMS)
+        outcome = apply_ops(conn, actor, ops, batch_id=gid, group_id=gid, max_items=SERVER_MAX_ITEMS,
+                            origin="promote")
     except BaseException:
         if conn.in_transaction:
             conn.rollback()

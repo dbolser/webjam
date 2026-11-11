@@ -24,6 +24,7 @@ const state = {
   queue: [], // Array of track objects
   queueIndex: -1,
   queuePlaylistId: null,
+  queuePlaylistKind: 'playlist',
   queuePlaylistTitle: '',
   queuePlaylistOwner: '',
   queuePlaylistLiked: false,
@@ -289,8 +290,10 @@ async function api(path, options = {}) {
   if (!res.ok) {
     let errText = `Request failed (${res.status})`;
     let errCode = '';
+    let errData = null;
     try {
       const data = await res.json();
+      errData = data && typeof data === 'object' ? data : null;
       errCode = typeof data.code === 'string' ? data.code : '';
       // FastAPI validation errors (422) carry a list of {msg, ...}.
       if (Array.isArray(data.detail)) {
@@ -302,6 +305,7 @@ async function api(path, options = {}) {
     const err = new Error(errText);
     err.status = res.status;
     err.code = errCode;
+    err.data = errData; // machine-readable extras (e.g. group_id on undo_conflict / stack_moved)
     err.retryAfter = Number(res.headers.get('Retry-After')) || 0;
     throw err;
   }
@@ -588,6 +592,7 @@ async function playPlaylistFromIndex(playlist, startIndex = 0) {
     song_liked_by_me: Boolean(t.song_liked_by_me),
   }));
   state.queuePlaylistId = playlist.id;
+  state.queuePlaylistKind = playlist.kind || 'playlist';
   state.queuePlaylistTitle = playlist.title;
   state.queuePlaylistOwner = playlist.username || '';
   state.queuePlaylistLiked = Boolean(playlist.liked_by_me);
@@ -614,6 +619,7 @@ async function playSingleSong(songObj, sourcePlaylistId = null, sourceUserId = n
     },
   ];
   state.queuePlaylistId = sourcePlaylistId;
+  state.queuePlaylistKind = (sourcePlaylistId && playlistCache[sourcePlaylistId] && playlistCache[sourcePlaylistId].kind) || 'playlist';
   state.queuePlaylistTitle = songObj.playlist_title || 'Single Track Spin';
   state.queuePlaylistOwner = songObj.username || songObj.finder_username || '';
   state.queuePlaylistLiked = false;
@@ -712,7 +718,7 @@ async function likeCurrentlyPlayingSong(event = null) {
 }
 
 async function likeActiveQueuePlaylist(event = null) {
-  if (!state.queuePlaylistId) return;
+  if (!state.queuePlaylistId || state.queuePlaylistKind === 'crate') return;
   await toggleLikePlaylist(state.queuePlaylistId, event);
 }
 
@@ -786,7 +792,8 @@ function updatePlayerDeckUI() {
   }
 
   if (likePlaylistBtn) {
-    if (state.queuePlaylistId) {
+    // A crate can't be liked (the server answers 400 not_likeable).
+    if (state.queuePlaylistId && state.queuePlaylistKind !== 'crate') {
       const cachedPl = playlistCache[state.queuePlaylistId];
       const plMyLikes = cachedPl
         ? Number(cachedPl.my_likes ?? (cachedPl.liked_by_me ? 1 : 0))
@@ -2398,6 +2405,7 @@ async function syncQueueWithPlaylistIfActive(playlistId) {
       song_liked_by_me: Boolean(t.song_liked_by_me),
     }));
     state.queuePlaylistTitle = pl.title;
+    state.queuePlaylistKind = pl.kind || 'playlist';
     state.queuePlaylistLiked = Boolean(pl.liked_by_me);
     state.queuePlaylistMyLikes = Number(pl.my_likes ?? (pl.liked_by_me ? 1 : 0));
     state.queuePlaylistLikeCount = Number(pl.like_count ?? 0);
@@ -2417,22 +2425,67 @@ async function syncQueueWithPlaylistIfActive(playlistId) {
   } catch (_) {}
 }
 
-async function undoLastPlaylistChange(skip = false) {
+let undoInFlight = false;
+
+// One undo per press: the request names the group the UI showed (409 stack_moved if the stack
+// moved meanwhile), and presses while a request is in flight are dropped.
+async function undoLastPlaylistChange(skip = false, groupId = undefined) {
   if (!state.currentUserId) {
     showToast('Sign in to undo.');
     return;
   }
+  if (undoInFlight) return;
+  undoInFlight = true;
+  try {
+    await runUndo(skip, groupId);
+  } finally {
+    undoInFlight = false;
+  }
+}
+
+async function runUndo(skip, groupId) {
+  const shown = state.currentUser && state.currentUser.undo ? state.currentUser.undo.undo_group_id : null;
+  const expect = groupId !== undefined ? groupId : shown;
   let res;
   try {
     res = await api('/api/ops/undo', {
       method: 'POST',
-      body: JSON.stringify({ user_id: state.currentUserId, skip: Boolean(skip) }),
+      body: JSON.stringify({ user_id: state.currentUserId, skip: Boolean(skip), group_id: expect || null }),
     });
   } catch (err) {
-    if (err.status === 409 && err.code === 'undo_conflict' && !skip) {
+    const conflictGroup = err.data && typeof err.data.group_id === 'string' ? err.data.group_id : null;
+    if (err.status === 409 && err.code === 'undo_conflict' && !skip && conflictGroup) {
       if (window.confirm("Can't undo that: the playlist was changed afterwards. Skip it and undo the step before?")) {
-        await undoLastPlaylistChange(true);
+        // Skip exactly the group that conflicted, then undo the one before it.
+        let skipped;
+        try {
+          skipped = await api('/api/ops/undo', {
+            method: 'POST',
+            body: JSON.stringify({ user_id: state.currentUserId, skip: true, group_id: conflictGroup }),
+          });
+        } catch (skipErr) {
+          showToast(`Undo failed: ${esc(skipErr.message)}`);
+          await refreshBootstrapSilently();
+          return;
+        }
+        if (state.currentUser && skipped.undo) state.currentUser.undo = skipped.undo;
+        const next = skipped.undo && skipped.undo.can_undo ? skipped.undo.undo_group_id : null;
+        if (!next) {
+          showToast(`Skipped: ${esc(skipped.label || 'last change')}. Nothing earlier to undo.`);
+          await renderCurrentRoute();
+          return;
+        }
+        await runUndo(false, next);
       }
+      return;
+    }
+    if (err.status === 409 && err.code === 'stack_moved') {
+      try {
+        await refreshBootstrapSilently();
+        await renderCurrentRoute();
+      } catch (_) {}
+      const latest = err.data && typeof err.data.label === 'string' ? ` (${esc(err.data.label)})` : '';
+      showToast(`Nothing was undone: your undo history changed. Press Ctrl+Z again to undo the latest step${latest}.`);
       return;
     }
     showToast(`Undo failed: ${esc(err.message)}`);
@@ -2569,6 +2622,7 @@ window.addEventListener('keydown', (e) => {
     }
     if (state.currentUserId) {
       e.preventDefault();
+      if (e.repeat) return; // holding the keys must not undo several groups
       undoLastPlaylistChange();
     }
   }
@@ -3815,6 +3869,8 @@ async function autoMigrateAuditedPlaylist(playlistId) {
 
   let migratedCount = 0;
   let failedCount = 0;
+  // All swaps of one run share an undo group, so one Ctrl+Z reverts the whole migration.
+  const groupId = `mig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
   for (const t of pl.tracks) {
     const audit = state.embedAuditByVideoId[t.video_id];
@@ -3831,6 +3887,7 @@ async function autoMigrateAuditedPlaylist(playlistId) {
             user_id: state.currentUserId,
             new_video_id: match.video_id,
             custom_title: match.title,
+            group_id: groupId,
           }),
         });
         state.embedAuditByVideoId[match.video_id] = { embeddable: true, status: 'OK', reason: null };

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import sqlite3
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.visibility import listed
 
@@ -325,13 +325,17 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
     superlove_context = ""
     loves_given = 0
     try:
+        # The badge note is public (feed, profile): only name a song that is in a LISTED playlist.
+        # A love on a song that only sits in a crate or a private playlist still counts, unnamed.
         cur.execute(
-            """
-            SELECT sl.count, s.title
+            f"""
+            SELECT sl.count, s.title,
+                   EXISTS (SELECT 1 FROM playlist_tracks xpt JOIN playlists xp ON xp.id = xpt.playlist_id
+                           WHERE xpt.video_id = sl.video_id AND {listed('xp')}) AS is_public
             FROM song_likes sl
             JOIN songs s ON s.video_id = sl.video_id
             WHERE sl.user_id = ?
-            ORDER BY sl.count DESC
+            ORDER BY sl.count DESC, is_public DESC
             LIMIT 1
             """,
             (user_id,),
@@ -339,7 +343,10 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
         top_song_love = cur.fetchone()
         if top_song_love and top_song_love["count"] > max_single_superlove:
             max_single_superlove = top_song_love["count"]
-            superlove_context = f"Bestowed {max_single_superlove}× Superlove on '{top_song_love['title']}'"
+            if top_song_love["is_public"]:
+                superlove_context = f"Bestowed {max_single_superlove}× Superlove on '{top_song_love['title']}'"
+            else:
+                superlove_context = f"Bestowed {max_single_superlove}× Superlove"
 
         cur.execute(
             f"""
@@ -442,11 +449,14 @@ def compute_user_metrics(conn: sqlite3.Connection, user_id: int) -> Dict[str, An
 
 
 def evaluate_and_award_badges(
-    conn: sqlite3.Connection, user_id: int, record_activity: bool = True
+    conn: sqlite3.Connection, user_id: int, record_activity: bool = True, op_group_key: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Evaluate all badges for `user_id`, insert any newly earned badges into `user_badges`,
     and return the list of newly awarded badge objects.
+
+    `op_group_key` tags badges (and their feed lines) earned by an undoable op group, so that
+    undoing the group can revoke them.
     """
     metrics = compute_user_metrics(conn, user_id)
     contexts = metrics["_contexts"]
@@ -467,10 +477,10 @@ def evaluate_and_award_badges(
             ctx = contexts.get(bkey) or badge["description"]
             cur.execute(
                 """
-                INSERT OR IGNORE INTO user_badges (user_id, badge_key, context_note, awarded_at)
-                VALUES (?, ?, ?, ?)
+                INSERT OR IGNORE INTO user_badges (user_id, badge_key, context_note, awarded_at, op_group_key)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (user_id, bkey, ctx, now_iso),
+                (user_id, bkey, ctx, now_iso, op_group_key),
             )
             awarded_item = {
                 **badge,
@@ -481,14 +491,16 @@ def evaluate_and_award_badges(
             if record_activity:
                 cur.execute(
                     """
-                    INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-                    VALUES (?, 'earned_badge', ?, 'profile', ?, ?)
+                    INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at,
+                                              op_group_id)
+                    VALUES (?, 'earned_badge', ?, 'profile', ?, ?, ?)
                     """,
                     (
                         user_id,
                         f"earned the \"{badge['name']}\" badge ({ctx})",
                         str(user_id),
                         now_iso,
+                        op_group_key,
                     ),
                 )
 

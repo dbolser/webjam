@@ -546,6 +546,8 @@ class UpdateTrackRequest(BaseModel):
     direction: Optional[Annotated[str, Field(max_length=8)]] = None  # 'up' or 'down'
     new_video_id: Optional[VideoRef] = None
     custom_title: Optional[Title] = None
+    # Optional undo group shared by several calls (auto-migrate: one Ctrl+Z reverts the whole run).
+    group_id: Optional[OpIdStr] = None
 
 
 class InspectPlaylistImportRequest(BaseModel):
@@ -635,7 +637,7 @@ class ResolvePasteRequest(BaseModel):
 class ForkRequest(BaseModel):
     user_id: Optional[int] = None
     title: Optional[Annotated[str, Field(max_length=1000)]] = None
-    visibility: Visibility = "public"
+    visibility: Optional[Visibility] = None  # default: the source's visibility
 
 
 # --- Helper query functions ---
@@ -938,6 +940,17 @@ def update_user_profile(
     return {"ok": True}
 
 
+def _song_visible_sql(video_expr: str, viewer: int) -> str:
+    """song_visible() as SQL: in a LISTED playlist, or in one of the viewer's own.
+
+    Claims are sticky (badge counts keep them), but a song is only listed where its page exists.
+    """
+    return (
+        f"EXISTS (SELECT 1 FROM playlist_tracks vpt JOIN playlists vp ON vp.id = vpt.playlist_id "
+        f"WHERE vpt.video_id = {video_expr} AND ({listed('vp')} OR vp.user_id = {int(viewer or 0)}))"
+    )
+
+
 def _public_song_sql(video_expr: str) -> str:
     """EXISTS a LISTED playlist containing the video (a song anyone may see named)."""
     return (
@@ -1038,7 +1051,7 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
         FROM songs s
         LEFT JOIN users u ON u.id = s.first_added_by_user_id
         LEFT JOIN playlists p ON p.id = s.first_added_playlist_id
-        WHERE s.first_added_at IS NOT NULL
+        WHERE s.first_added_at IS NOT NULL AND {_song_visible_sql('s.video_id', user_id)}
         ORDER BY s.first_added_at DESC
         """,
         (user_id,),
@@ -1264,6 +1277,7 @@ async def update_playlist_track(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     uid = resolve_actor(request, req.user_id)
+    reject_reserved_ids(req.group_id)
     actor = Actor(uid)
     pl = require_playlist_role(conn, playlist_id, actor, "editor")
     swapping = bool(req.new_video_id and req.new_video_id.strip())
@@ -1308,7 +1322,8 @@ async def update_playlist_track(
             raw_ops.append({"kind": "move", "playlist_id": playlist_id, "track_ids": [track_id], "position": target})
     new_badges: List[Dict[str, Any]] = []
     if raw_ops:
-        outcome = apply_ops(conn, actor, parse_ops(raw_ops), batch_id=server_batch_id(), song_meta=meta)
+        outcome = apply_ops(conn, actor, parse_ops(raw_ops), batch_id=server_batch_id(), group_id=req.group_id,
+                            song_meta=meta)
         new_badges = outcome.new_badges
     row = ops.render_track_rows(conn, pl, uid, [track_id])[0]
     return {
@@ -1536,7 +1551,7 @@ def reorder_moves(current: List[int], wanted: List[int]) -> List[Dict[str, Any]]
     return moves
 
 
-@app.put("/api/playlists/{playlist_id}/reorder")
+@app.put("/api/playlists/{playlist_id}/reorder", dependencies=[rate_limit("ops")])
 def reorder_playlist_tracks(
     playlist_id: int, req: ReorderTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
@@ -1558,10 +1573,13 @@ def reorder_playlist_tracks(
             ordered_ids.append(tid)
 
     moves = reorder_moves(existing_ids, ordered_ids)
-    if moves:
-        for m in moves:
-            m["playlist_id"] = playlist_id
-        apply_ops(conn, actor, parse_ops(moves), batch_id=server_batch_id(), max_items=ops.SERVER_MAX_ITEMS)
+    if len(moves) == 1:  # a single drag: one move op
+        moves[0]["playlist_id"] = playlist_id
+        apply_ops(conn, actor, parse_ops(moves), batch_id=server_batch_id())
+    elif moves:
+        # Anything bigger is ONE reorder effect (one op row, one O(n) pass), not one move per track.
+        reorder = ops.ReorderOp(playlist_id=playlist_id, track_ids=ordered_ids)
+        apply_ops(conn, actor, [reorder], batch_id=server_batch_id())
     final = [r["id"] for r in conn.execute(
         "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC", (playlist_id,))]
     return {"ok": True, "ordered_track_ids": final, "version": playlist_version(conn, playlist_id)}
@@ -1572,9 +1590,21 @@ def reorder_playlist_tracks(
 
 # --- Ops, undo/redo, crate, dock, paste, delete, fork (Phase 1a) -----------------------------
 
+def reject_reserved_ids(*ids: Optional[str]) -> None:
+    """srv-, fork- and promote- ids are minted by the server; a client may not borrow them."""
+    for value in ids:
+        if ops.is_reserved_id(value):
+            raise ApiError(400, "bad_op", "That op_id / group_id prefix is reserved.")
+
+
 @app.post("/api/ops", dependencies=[rate_limit("ops")])
 async def post_ops(req: OpsRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
     uid = resolve_actor(request, req.user_id)
+    reject_reserved_ids(req.op_id, req.group_id)
+    # Caps and roles first (read-only), so a batch that will be refused costs no YouTube lookups.
+    # The caps also bound the lookups: at most 50 items, so at most 50 unknown videos.
+    ops.check_batch_shape(req.ops)
+    ops.authorise_batch(conn, Actor(uid), req.ops)
     video_ids = [it.video_id for op in req.ops if op.kind == "insert" for it in op.items]
     video_ids += [op.set.video_id for op in req.ops if op.kind == "update" and op.set.video_id]
     meta: Dict[str, Dict[str, Any]] = {}
@@ -1631,7 +1661,7 @@ def get_my_crate(request: Request, user_id: Optional[int] = Query(None), conn: s
     return detail
 
 
-@app.post("/api/me/crate/promote", status_code=201)
+@app.post("/api/me/crate/promote", status_code=201, dependencies=[rate_limit("ops")])
 def promote_my_crate(req: PromoteRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
     uid = resolve_actor(request, req.user_id)
     return ops.promote_crate(conn, Actor(uid), req.title, req.description or "", req.visibility, req.track_ids)
@@ -1668,7 +1698,7 @@ def delete_playlist(
     return ops.delete_playlist(conn, Actor(uid), playlist_id)
 
 
-@app.post("/api/playlists/{playlist_id}/fork", status_code=201)
+@app.post("/api/playlists/{playlist_id}/fork", status_code=201, dependencies=[rate_limit("ops")])
 def fork_playlist(playlist_id: int, req: ForkRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
     uid = resolve_actor(request, req.user_id)
     return ops.fork_playlist(conn, Actor(uid), playlist_id, req.title, req.visibility)
@@ -2055,6 +2085,10 @@ def get_user_profile(
     playlists = []
     for prow in cur.fetchall():
         pl = dict(prow)
+        if pl.get("forked_from_playlist_id"):
+            src = conn.execute("SELECT * FROM playlists WHERE id = ?", (pl["forked_from_playlist_id"],)).fetchone()
+            if not is_linkable(src, viewer_id):  # same rule as the detail endpoint's forked_from
+                pl["forked_from_playlist_id"] = None
         pl["my_likes"] = int(pl.get("my_likes") or 0)
         pl["liked_by_me"] = bool(pl["my_likes"] > 0)
         cur.execute(
@@ -2097,7 +2131,7 @@ def get_user_profile(
                (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = s.video_id AND sl.user_id = ?) AS my_likes
         FROM songs s
         LEFT JOIN playlists p ON p.id = s.first_added_playlist_id
-        WHERE s.first_added_by_user_id = ?
+        WHERE s.first_added_by_user_id = ? AND {_song_visible_sql('s.video_id', viewer_id)}
         ORDER BY s.first_added_at DESC
         """,
         (viewer_id, profile_user_id),

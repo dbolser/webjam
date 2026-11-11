@@ -100,7 +100,7 @@ def test_fresh_db_has_one_crate_per_user(demo):
                      "VALUES (2, 'crate', 'public', 'x', 'now', 'now')")
     conn.close()
     assert len(q("SELECT 1 FROM playlists WHERE kind = 'crate'")) == 4
-    assert q("SELECT value FROM meta WHERE key = 'schema_version'")[0][0] == "2"
+    assert q("SELECT value FROM meta WHERE key = 'schema_version'")[0][0] == "3"
     # Seeded dock: dan pins playlist 4.
     assert [tuple(r) for r in q("SELECT user_id, playlist_id, pinned FROM user_dock")] == [(1, 4, 1)]
 
@@ -110,7 +110,8 @@ def test_new_users_get_a_crate(demo):
     assert len(q("SELECT 1 FROM playlists WHERE user_id = ? AND kind = 'crate'", uid)) == 1
     boot = ok(demo.get(f"/api/bootstrap?user_id={uid}"))["current_user"]
     assert boot["crate_id"] and boot["playlists"][0]["kind"] == "crate"
-    assert boot["undo"] == {"can_undo": False, "undo_label": None, "can_redo": False, "redo_label": None}
+    assert boot["undo"] == {"can_undo": False, "undo_label": None, "undo_group_id": None,
+                            "can_redo": False, "redo_label": None, "redo_group_id": None}
 
 
 def test_pre_phase1_database_is_refused(tmp_path, monkeypatch):

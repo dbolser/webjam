@@ -29,10 +29,12 @@ The DB is recreated from `SCHEMA_SQL`. `init_db()` must work on an empty file an
 
 ```sql
 -- meta(key, value) already exists
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '2');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3');
 ```
 
-`init_db()`: if `users` has rows but `meta.schema_version` is missing or `< 2`, raise
+Version 3 (Phase 1a review fixes): `playlist_tracks.source_track_id` lost its FK, `playlist_ops.kind` allows `'reorder'`, and `user_badges` gained `op_group_key`. A version-2 file is refused like any older one: wipe and reseed.
+
+`init_db()`: if `users` has rows but `meta.schema_version` is missing or `< 3`, raise
 `RuntimeError("Webjam Phase 1 changed the schema. Delete the database file (WEBJAM_DB_PATH) and restart; it will be reseeded.")`.
 No ALTER-based migration is written for Phase 1. `ensure_playlist_track_clip_columns` and `migrate_legacy_seed_videos` are only for pre-Phase 1 DBs, so they become dead code and can be deleted. (`ensure_initial_song_likes` is still called by the seed.)
 
@@ -80,14 +82,17 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     display_title TEXT DEFAULT NULL,
     source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
     source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    source_track_id INTEGER REFERENCES playlist_tracks(id) ON DELETE SET NULL,
+    source_track_id INTEGER,                      -- no FK on purpose, see below
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pt_order ON playlist_tracks(playlist_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_pt_video ON playlist_tracks(video_id);
 CREATE INDEX IF NOT EXISTS idx_pt_source_user ON playlist_tracks(source_user_id);
 CREATE INDEX IF NOT EXISTS idx_pt_source_playlist ON playlist_tracks(source_playlist_id);
+CREATE INDEX IF NOT EXISTS idx_pt_source_track ON playlist_tracks(source_track_id);
 ```
+
+**`source_track_id` has no FK.** With `ON DELETE SET NULL`, every `delete` op and every cross-playlist `move` silently nulled the links of other users' rows (grabs, crates), and undo could not put them back. Ids are `AUTOINCREMENT` and never reused, so a dangling id can't point at the wrong row: readers show `source_track_id` only while that row still exists **in** the (LINKABLE) `source_playlist_id`. Delete-then-undo and move-then-undo give back the exact provenance state, because `restore` brings the row back under its original id.
 
 **Ordering** is always `ORDER BY position ASC, id ASC`. There is no unique constraint on position.
 
@@ -136,7 +141,7 @@ CREATE TABLE IF NOT EXISTS playlist_ops (
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id TEXT NOT NULL,                         -- undo unit; defaults to batch_id
-    kind TEXT NOT NULL CHECK (kind IN ('insert', 'delete', 'move', 'update', 'set_meta')),
+    kind TEXT NOT NULL CHECK (kind IN ('insert', 'delete', 'move', 'update', 'set_meta', 'reorder')),
     forward_json TEXT NOT NULL,                     -- the op AS APPLIED (normalised, with created ids), plus "label"
     inverse_json TEXT NOT NULL,                     -- server-generated, may use internal kinds (see 2.6)
     request_hash TEXT NOT NULL,                     -- sha256 of canonical JSON {group_id, ops, expected_versions}
@@ -152,6 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_ops_playlist ON playlist_ops(playlist_id, id);
 
 - One row per **per-playlist effect**. A cross-playlist move writes two rows in the same batch and group: a `delete` on the source and an `insert` on the destination, both with `forward_json.via = "move"`.
 - `op_id`, `batch_id` and `group_id` are 1–64 characters of `[A-Za-z0-9_-]`. Clients should use ULIDs or UUIDv4. Uniqueness is global, so a different user can't replay or squat someone else's op_id (§3.1).
+- The prefixes `srv-`, `fork-` and `promote-` (any case) are **reserved** for ids the server mints. A client `op_id` or `group_id` that starts with one is `400 bad_op`. The server never infers behaviour from an id: fork and promote pass an explicit `origin` to `apply_ops`, stored as `forward_json.origin` (`"fork"` suppresses the grab line, `"promote"` enables the `playlist_left_empty` undo note).
+- `forward_json.label` is the label of the **whole group** (every row of a group carries the same one, recomputed when a later batch joins the group); `forward_json.effect_label` is the row's own.
 - Retention: after each batch, if the user has more than 500 groups, set `discarded_at` on the oldest groups' rows and delete rows older than 90 days that are discarded. Discarded groups can't be undone.
 
 ### 1.6 `user_dock`
@@ -232,7 +239,7 @@ class OpsOutcome:
 
 ### 2.1 Pipeline (one call = one transaction)
 
-1. **Validate the shape** (Pydantic, before any DB work):
+1. **Validate the shape** (Pydantic plus `check_batch_shape`, before any DB work; `POST /api/ops` also runs it and the read-only role check of step 4 **before** any YouTube lookup):
    - op kinds and fields;
    - at most 20 ops;
    - at most `max_items` items in total (insert items + delete ids + move ids + 1 per update or set_meta);
@@ -249,13 +256,13 @@ class OpsOutcome:
    - derive provenance (2.5);
    - compute the inverse (2.6);
    - check the cap: after the op, the playlist has at most 1000 tracks, otherwise `400 playlist_full`.
-8. **Write `playlist_ops` rows.** `op_id = f"{batch_id}#{n}"`, with `forward_json` holding the applied form (created ids, resolved anchors) and a server-made `label` such as `"Pasted 1 track into 'Basement Velvet'"`.
+8. **Write `playlist_ops` rows.** `op_id = f"{batch_id}#{n}"`, with `forward_json` holding the applied form (created ids, resolved anchors) and a server-made `label` such as `"Added 1 track to 'Basement Velvet'"`. The label describes everything one undo of the group reverts: one effect keeps its own label; effects of one kind are summed (`"Added 3 tracks to 3 playlists"`, `"Swapped 2 tracks in 'X'"`; the source half of a cross-playlist move doesn't count); mixed kinds give `"Changed 'X'"` or `"Changed N playlists"`. When the batch joins an existing group, the label is recomputed over the whole group and written to its earlier rows too.
 9. **Bump** `version = version + 1` and `updated_at = now` on every touched playlist.
 10. **Discard the redo branch.** If this batch is a new user action (not a redo), set `discarded_at = now` on this user's rows where `undone_at IS NOT NULL AND discarded_at IS NULL`.
 11. **Discovery claims and activity**, for LISTED targets only (2.8). Activity lines are tagged `op_group_id`.
 12. **Dock.** Upsert `user_dock(actor, pid, last_used_at=now)` for every touched playlist the actor owns, then prune.
 13. `COMMIT`.
-14. **Badges**, after the commit, only if at least one touched playlist is LISTED after the batch. Evaluate the actor, every `source_user_id` credited by rows placed in LISTED playlists, and the `first_added_by_user_id` of inserted videos. Return only the actor's new badges.
+14. **Badges**, after the commit, only if at least one touched playlist is LISTED after the batch. Evaluate the actor, every `source_user_id` credited by rows placed in LISTED playlists, and the `first_added_by_user_id` of inserted videos. Return only the actor's new badges. For an undoable batch, every badge it awards (to anyone) is tagged `user_badges.op_group_key = "<actor id>:<group_id>"`, and so is its `earned_badge` activity line (`activity_log.op_group_id`); see 2.8.
 
 ### 2.2 Op kinds (request form)
 
@@ -407,6 +414,9 @@ The inverse is computed while applying, against the exact pre-state. It is store
 | cross-move | the inverse of its `delete` row (`restore` on the source) and of its `insert` row (`delete` on the destination) |
 | `update` with old values `o` and new values `n` | `{"kind":"update","playlist_id":P,"track_id":T,"set":o,"expect":n}`. For a swap, `set` also restores `video_id`, `migrated_from_*` and `source_*` |
 | `set_meta` with old `o` and new `n` | `{"kind":"set_meta","playlist_id":P,"set":o,"expect":n}` |
+| `reorder` (server-only, from `PUT /api/playlists/{id}/reorder`; never a client op kind) with the new full order `[t1..tn]` | `{"kind":"reorder","playlist_id":P,"track_ids":[previous order]}`. Applying it sets positions `1..n` in one pass; a listed id that is gone is a conflict, rows that aren't listed keep their relative order at the end |
+
+When an `update`'s `expect` names a `source_playlist_id` / `source_user_id` that an FK has since nulled (a deleted playlist), it is compared as NULL, so that undo or redo doesn't conflict over a change nobody made through the op log.
 
 `restore` re-inserts with the **original `id`**. That is safe because SQLite `AUTOINCREMENT` never reissues an id, so client references and later inverses stay valid.
 
@@ -423,8 +433,10 @@ If an anchor is missing at undo time, the row goes back at its recorded `index` 
 | Ops per batch | 20 | `400 batch_too_large` |
 | Playlists touched per batch | 10 | `400 batch_too_large` |
 | Server-composed batches (promote, fork, import commit) | `max_items=1000`, still subject to the per-playlist cap | n/a |
+| Legacy reorder | one `reorder` effect (one op row) for any reorder bigger than a single drag | n/a |
+| YouTube lookups per `/api/ops` request | bounded by the 50-item cap, which is checked (with the role check) before any lookup | `400 batch_too_large`, `403`/`404` |
 | Body | 256 KB (existing middleware) | `413` |
-| Rate limit | new bucket `"ops": (120, 2.0)` on `/api/ops`, undo and redo. The existing `"add"` bucket is charged once per batch that needs any YouTube lookup | `429` + `Retry-After` |
+| Rate limit | new bucket `"ops": (120, 2.0)` on `/api/ops`, undo, redo, `PUT /api/playlists/{id}/reorder`, `POST /api/playlists/{id}/fork` and `POST /api/me/crate/promote`. The existing `"add"` bucket is charged once per batch that needs any YouTube lookup | `429` + `Retry-After` |
 
 ### 2.8 Discovery, activity and badges: only for LISTED playlists
 
@@ -432,7 +444,8 @@ If an anchor is missing at undo time, the row goes back at its recorded `index` 
 - Runs only when `LISTED(playlist_row)`.
 - For each video with `songs.first_added_by_user_id IS NULL`, sets `first_added_by_user_id = playlist owner`, `first_added_playlist_id`, `first_added_at = now`, and logs `discovered_song`.
 - Claims are sticky. Deleting a track doesn't revoke them, which matches today.
-- Undoing the group that made a claim **does** revert it, so a paste-then-undo can't farm Crate Digger. The claim is recorded in `forward_json.claims`. Undo resets those songs to NULL, then re-runs the claim against the earliest remaining LISTED row of that video (`ORDER BY pt.created_at, pt.id`).
+- Undoing the group that made a claim **does** revert it. The claim is recorded in `forward_json.claims`. Undo resets those songs to NULL, then re-runs the claim against the earliest remaining LISTED row of that video (`ORDER BY pt.created_at, pt.id`).
+- Undoing a group also **revokes the badges it earned**, so a paste-then-undo can't farm the first-finder badges (or Spark / Trendsetter for the credited users). Undo deletes the `user_badges` rows tagged `op_group_key = "<actor id>:<group_id>"` and their `earned_badge` activity lines, then re-evaluates each affected user with `record_activity=False`, so a badge whose criteria still hold without the group comes back silently. Redo awards (and tags) them again. Badges from non-undoable batches (a fork) are never revoked.
 
 Activity, written only when the target is LISTED, with one line per op (not per track):
 
@@ -441,7 +454,7 @@ Activity, written only when the target is LISTED, with one line per op (not per 
 | insert/move-in, all rows credited to one other user | `grabbed_track` | `grabbed 'Tycho - …' from @maya into 'Basement Velvet'` (`… and 2 more` for n > 1) |
 | insert/move-in, otherwise | `added_track` | `added 'Tycho - …' to 'Basement Velvet'` |
 | first LISTED placement of a song | `discovered_song` | unchanged wording |
-| `set_meta` making a playlist LISTED, or `POST /api/playlists` / promote / fork creating a LISTED one | `published_playlist` / `created_playlist` / `forked_playlist` | `forked 'Sunday Morning…' from @lucas` |
+| `set_meta` making a playlist LISTED, or `POST /api/playlists` / promote / fork creating a LISTED one | `published_playlist` / `created_playlist` / `forked_playlist` | `forked 'Sunday Morning…' from @lucas`. A public fork of an unlisted or private source never names it: it logs `created_playlist` `published playlist '<fork title>'` (§4.1) |
 
 Nothing is logged for `delete`, within-playlist `move`, `update`, crate writes, or writes to unlisted or private playlists.
 
@@ -484,7 +497,7 @@ Request:
   "order": { "3": [17, 18, 42, 1202, 19], "8": [905, 906] },
   "rows": { "1202": { "id": 1202, "playlist_id": 3, "video_id": "c_56qQqxvm4", "position": 4, "title": "Tycho - Full Performance (Live on KEXP)", "track_note": "", "start_seconds": null, "end_seconds": null, "source_user_id": 3, "source_username": "maya", "source_playlist_id": 2, "source_playlist_title": "2AM Terminal Glow (Coding Mix)", "source_track_id": 4, "added_by_user_id": 1, "created_at": "2026-11-11 10:02:11", "provenance": "kept" } },
   "skipped": [],
-  "undo": { "can_undo": true, "undo_label": "Moved 1 track to 'Basement Velvet'", "can_redo": false, "redo_label": null },
+  "undo": { "can_undo": true, "undo_label": "Moved 1 track to 'Basement Velvet'", "undo_group_id": "01JCX4M2Q8H7ZK3V5T1N0B9AWE", "can_redo": false, "redo_label": null, "redo_group_id": null },
   "new_badges": []
 }
 ```
@@ -495,7 +508,7 @@ Errors:
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `bad_op`, `bad_clip`, `bad_placement`, `batch_too_large`, `playlist_full`, `crate_visibility_fixed`, `video_not_found` | validation. The body includes `op_index` (and `item_index`) |
+| 400 | `bad_op`, `bad_clip`, `bad_placement`, `batch_too_large`, `playlist_full`, `crate_visibility_fixed`, `video_not_found` | validation. The body includes `op_index` (and `item_index`). `bad_op` also for an `op_id` / `group_id` with a reserved prefix (`srv-`, `fork-`, `promote-`) |
 | 401 | `signed_out` | google mode with no session |
 | 403 | `not_allowed` | the playlist is visible but the actor's role is too low |
 | 404 | `playlist_not_found`, `track_not_found` | missing **or not visible**. The body includes `op_index` |
@@ -507,6 +520,8 @@ Errors:
 | 422 | n/a | Pydantic shape errors (list `detail`, as today) |
 | 429 | n/a | rate limit |
 | 503 | `youtube_unavailable` | a metadata lookup failed transiently; `Retry-After: 30` |
+
+Order of checks: shape caps (2.1 step 1), reserved ids and the role check for every touched playlist all run **before** the YouTube lookups for unknown videos, so a batch that will be refused costs no outbound calls. The 50-item cap also bounds the lookups per request.
 
 **Client contract:**
 - Send ops through a **single serial queue**, one request in flight per tab.
@@ -524,7 +539,7 @@ The stack is per user, spans all of that user's playlists, is stored on the serv
 3. sets `undone_at = now`;
 4. bumps `version` on the touched playlists;
 5. deletes the group's `activity_log` rows (`op_group_id`);
-6. reverts the group's discovery claims (2.8).
+6. reverts the group's discovery claims and revokes the badges it earned (2.8).
 
 Badges are never revoked.
 
@@ -532,7 +547,9 @@ Badges are never revoked.
 
 Request: `{}`. In demo mode, `{"user_id": 1}`. Optional fields:
 - `group_id`: an assertion that this group is the expected one, so a double keypress can't undo twice. On mismatch: `409 stack_moved` with the current top.
-- `skip: true`: mark the top group discarded without applying it. This is the escape hatch after an `undo_conflict`.
+- `skip: true`: mark the top group discarded without applying it. This is the escape hatch after an `undo_conflict`. Skip only discards; it undoes nothing. A client that offers "skip it and undo the step before" sends `skip` with the conflicting `group_id` (from the `undo_conflict` body), then a normal undo with the new `undo.undo_group_id`.
+
+Clients should send `group_id` on every undo, redo and skip, taken from `undo.undo_group_id` / `undo.redo_group_id`, ignore key auto-repeat, and keep at most one undo request in flight. Then a held Ctrl+Z or a double click undoes one group and the extra presses get a harmless `409 stack_moved`.
 
 200 response (same reconcile fields as `/api/ops`):
 
@@ -548,7 +565,7 @@ Request: `{}`. In demo mode, `{"user_id": 1}`. Optional fields:
   "order": { "3": [17, 18, 42, 19], "8": [901, 905, 906] },
   "rows": { "901": { "id": 901, "playlist_id": 8, "position": 1, "…": "…" } },
   "notes": [],
-  "undo": { "can_undo": true, "undo_label": "Pasted 1 track into 'Crate'", "can_redo": true, "redo_label": "Moved 1 track to 'Basement Velvet'" }
+  "undo": { "can_undo": true, "undo_label": "Added 1 track to 'Crate'", "undo_group_id": "01JCX3…", "can_redo": true, "redo_label": "Moved 1 track to 'Basement Velvet'", "redo_group_id": "01JCX4M2Q8H7ZK3V5T1N0B9AWE" }
 }
 ```
 
@@ -563,7 +580,7 @@ When the stack is empty: `200 {"group_id": null, "reason": "nothing_to_undo", "u
 
 With owner-only writes and stack order, the "another user" branch can't fire yet. It is written now so that Phase 5 only adds members.
 
-`GET /api/me/undo` returns `{"can_undo", "undo_label", "can_redo", "redo_label"}`. The same object is also embedded in `GET /api/bootstrap` as `current_user.undo`.
+`GET /api/me/undo` returns `{"can_undo", "undo_label", "undo_group_id", "can_redo", "redo_label", "redo_group_id"}`. The same object is also embedded in `GET /api/bootstrap` as `current_user.undo`.
 
 ### 3.3 `GET /api/me/crate`
 
@@ -664,7 +681,7 @@ Recognition order. The result is a union of everything found, in text order, **k
    - A target that is missing or not `VISIBLE` goes to `unresolved` with `not_found`. Private and missing look the same.
 3. **YouTube video URLs** (watch, youtu.be, shorts, embed, music): `t=`, `start=` and `end=` become the clip. For `watch?v=X&list=PL…`, the result is item X **and** a `youtube_playlist` pointer.
 4. **YouTube playlist URLs** (`/playlist?list=` or a bare `PL…` / `OLAK5uy_…` id, through `extract_playlist_id`): a pointer only, never expanded. The client feeds `pointer.source_input` into the existing `POST /api/playlists/import/inspect`, aimed at the crate.
-5. **Bare 11-character ids**, one per token, but only if steps 2–4 found nothing (today's rule).
+5. **Bare 11-character ids**, only if steps 2–4 found nothing, and only when the **whole** paste is ids separated by whitespace or commas, none of them shaped like a word (`^[A-Za-z][a-z]{10}$` or `^[A-Z]{11}$`, e.g. `programming`, `Information`, `INFORMATION`). So free text such as "really interesting information about programming" returns empty lists and makes no lookups (and charges no `add`). A real id of that shape (about 1 in 10,000) can still be pasted as a URL.
 6. **Anything else**: no items.
 
 200 response:
@@ -711,7 +728,7 @@ Owner only: `404` if not visible, `403` if visible but not the owner's. The crat
 In one transaction:
 1. Mark `discarded_at` on **every row of every group** that has a row on this playlist, including that group's rows on other playlists. For example, undoing a crate→P move after P is deleted is no longer possible.
 2. `DELETE FROM comments WHERE target_type='playlist' AND target_id=?` and `DELETE FROM activity_log WHERE link_type='playlist' AND link_id=?`. These have no FK.
-3. `DELETE FROM playlists WHERE id=?`. This cascades to `playlist_tracks`, `playlist_likes`, `play_events`, `playlist_ops` and `user_dock`. It sets NULL in other rows' `source_playlist_id` and `source_track_id`, in `songs.first_added_playlist_id`, and in `playlists.forked_from_playlist_id`.
+3. `DELETE FROM playlists WHERE id=?`. This cascades to `playlist_tracks`, `playlist_likes`, `play_events`, `playlist_ops` and `user_dock`. It sets NULL in other rows' `source_playlist_id`, in `songs.first_added_playlist_id`, and in `playlists.forked_from_playlist_id`. Other rows' `source_track_id` keep the (now dangling) id, which readers ignore (§1.3).
 
 Credits to the user (`source_user_id`, `first_added_by_user_id`) and awarded badges remain.
 
@@ -721,7 +738,7 @@ Response: `200 {"ok": true, "playlist_id": 7, "discarded_undo_groups": 3}`.
 
 "Copy all", credited "via".
 
-Request: `{"title": null, "visibility": "public"}`. A null title means the source title. The source must be `VISIBLE` to the actor, else `404`. Forking a crate is `400 use_promote`.
+Request: `{"title": null, "visibility": null}`. A null title means the source title. A null (omitted) visibility means **the source's visibility**, so forking an unlisted or private playlist doesn't publish its title by default; `"public"` must be asked for explicitly. The source must be `VISIBLE` to the actor, else `404`. Forking a crate is `400 use_promote`. Rate limited by the `ops` bucket.
 
 Server steps:
 1. Create playlist F with `forked_from_playlist_id = id` and the source description.
@@ -729,7 +746,7 @@ Server steps:
    - for someone else's playlist, the credit is the source owner, row by row;
    - for your own playlist, the original provenance is kept.
    Track notes, clips and display titles are copied.
-3. Log `forked_playlist` if F is LISTED.
+3. Log `forked_playlist` (`forked '<source title>' from @owner`) if F is LISTED **and the source is LISTED**. If F is LISTED but the source is unlisted or private, log `created_playlist` (`published playlist '<F title>'`) instead: the feed must not name or link a non-LISTED playlist (§4.1, the same rule that blanks `forked_from`).
 4. Run badges as in 2.1 step 14.
 
 The fork is not on the undo stack; delete the fork to reverse it.
@@ -759,9 +776,9 @@ Every one of these keeps its current request and response shape and adds `versio
 | `POST /api/playlists` (1230) | Create the row; new optional `visibility` (default `'public'`). `initial_urls` becomes one `insert` with `skip_unavailable=True`. `created_playlist` is logged only if LISTED |
 | `PUT /api/playlists/{id}` (1287) | `set_meta {title, description}` |
 | `POST /api/playlists/{id}/tracks` (1338) | `insert`, append, `skip_unavailable=True`. `source_playlist_id` becomes `ref: {playlist_id}`. A bare `source_user_id` keeps today's "first finder" path in `derive_grab_source`, plus the `VISIBLE` check. `custom_title` becomes `display_title` when there is one entry |
-| `PUT /api/playlists/{id}/tracks/{tid}` (1414) | `update {note, start/end, display_title, video_id}`. `direction: up/down` becomes `move` with `position = index ∓ 1`. Both go in one batch |
+| `PUT /api/playlists/{id}/tracks/{tid}` (1414) | `update {note, start/end, display_title, video_id}`. `direction: up/down` becomes `move` with `position = index ∓ 1`. Both go in one batch. Optional `group_id` (same rules as `/api/ops`, reserved prefixes refused): calls that share it form one undo group, which the old UI's auto-migrate uses so one Ctrl+Z reverts the whole run |
 | `DELETE /api/playlists/{id}/tracks/{tid}` (1759) | `delete`. The manual renumbering loop goes away |
-| `PUT /api/playlists/{id}/reorder` (1784) | Diff the current order against the requested one. Keep the longest increasing subsequence and emit one `move` per remaining track, each `after_track_id` = its new predecessor. A single drag gives one move. The batch is capped at 1000 items (server-composed) |
+| `PUT /api/playlists/{id}/reorder` (1784) | Diff the current order against the requested one (longest increasing subsequence). A single drag (one track out of place) is one `move` op. Anything bigger is **one** server-only `reorder` effect: one op row whose inverse is the previous order, applied in one O(n) pass (2.6). Rate limited by the `ops` bucket |
 | `POST /api/playlists/import/commit` (1605) | Create the playlist if needed, then one `insert` with `skip_unavailable=True`. Item `migrated_from_*` is accepted **only** on this internal path, as today. `target_playlist_id` may be the crate |
 | `PUT /api/playlists/{id}/snapshot` (1820) | **Deleted in Phase 1a**; see below |
 
@@ -820,7 +837,7 @@ def song_visible(conn, video_id, viewer) -> bool  # EXISTS a row in a VISIBLE pl
 | 5 | `get_community_feed` 1013 | playlists | `WHERE LISTED(p)` |
 | 6 | same, 1020 | `times_grabbed_from` subquery | target `LISTED` |
 | 7 | same, 1044 | per-playlist tracks | `LEFT JOIN users fu` (nullable finder). `source_*` projection per 2.5 |
-| 8 | same, 1074 | `recent_songs` | `WHERE s.first_added_at IS NOT NULL`. `debut_playlist_title` only if `LINKABLE`. `playlist_count` subquery: count only `LISTED` playlists |
+| 8 | same, 1074 | `recent_songs` | `WHERE s.first_added_at IS NOT NULL` **and the song is visible to the viewer** (`EXISTS` a row in a `LISTED` playlist or one the viewer owns, i.e. `song_visible`). Claims stay sticky for badge counts, but a song whose public placements were all made private or moved to a crate drops out of the list, like its activity lines and its page. `debut_playlist_title` only if `LINKABLE`. `playlist_count` subquery: count only `LISTED` playlists |
 | 9 | same, 1102 | `activity` | `WHERE a.link_type != 'playlist' OR EXISTS (SELECT 1 FROM playlists p WHERE p.id = CAST(a.link_id AS INTEGER) AND LISTED(p))`. This hides lines about playlists that later went private (writes already skip non-LISTED) |
 | 10 | same, 1115 | curators | covered by #1. Badges unaffected |
 | 11 | `get_playlist_detail` 1136 | header | `require_visible_playlist`, 404 otherwise. Add `kind`, `visibility`, `version`, `forked_from`. `times_grabbed_from` target `LISTED` |
@@ -835,8 +852,8 @@ def song_visible(conn, video_id, viewer) -> bool  # EXISTS a row in a VISIBLE pl
 | 20 | `record_playlist_play` 2162 | target | `require_visible_playlist`. Crate or private: never increment `playlists.plays` **or** `songs.total_plays` |
 | 21 | `get_song_page` 2228 | song | 404 unless `song_visible`. `JOIN users u` (finder) → `LEFT JOIN`, so finder fields can be null. `debut_playlist_title` only if `LINKABLE` |
 | 22 | same, 2269 | `appearances` | `LISTED(p) OR (p.user_id = :viewer AND p.kind = 'playlist')`. `sp` title `LINKABLE`. `position` = ordinal |
-| 23 | `get_user_profile` 2312 | `playlists` | viewer is the profile owner: `p.kind = 'playlist'` (any visibility, with a `visibility` field). Otherwise `LISTED(p)` |
-| 24 | same, 2355 | `discovered_songs` | as #8 (`debut_playlist_title` `LINKABLE`, `playlist_count` `LISTED`) |
+| 23 | `get_user_profile` 2312 | `playlists` | viewer is the profile owner: `p.kind = 'playlist'` (any visibility, with a `visibility` field). Otherwise `LISTED(p)`. `forked_from_playlist_id` is nulled unless the source is `LINKABLE` to the viewer (as on the detail endpoint) |
+| 24 | same, 2355 | `discovered_songs` | as #8 (visible-to-viewer filter, `debut_playlist_title` `LINKABLE`, `playlist_count` `LISTED`) |
 | 25 | same, 2379 | `liked_songs` | for non-owners, only songs where `song_visible(…, viewer)` |
 | 26 | same, 2404 | `liked_playlists` | `LISTED(p)`, or `VISIBLE(p)` when the viewer is the profile owner |
 | 27 | same, 2427 | `grabs_from_user` | `LISTED(tp)`. `sp` title `LINKABLE` |
@@ -856,7 +873,7 @@ def song_visible(conn, video_id, viewer) -> bool  # EXISTS a row in a VISIBLE pl
 | B5 | 251 | `alchemist` / `multi_source` | `LISTED(p)` |
 | B6 | 287 | `playlist_likes_received` | `LISTED(p)` |
 | B7 | 299 | `song_likes_received` | unchanged (finder credit is LISTED-only) |
-| B8 | 319 / 336 | `max_single_superlove` | playlist branch: `LISTED(p)` (the context shows the title) |
+| B8 | 319 / 336 | `max_single_superlove` | playlist branch: `LISTED(p)` (the context shows the title). Song branch: the love still counts, but the context names the song only if it is in a `LISTED` playlist; otherwise it is `Bestowed N× Superlove` (a crate-only or private-only song must not reach the feed) |
 | B9 | 364 | `max_playlist_plays` / `total_playlist_plays` / `playlist_count` | `WHERE user_id = ? AND kind = 'playlist' AND visibility = 'public'` |
 | B10 | 375 | `annotated_playlists` | `LISTED(p)` |
 | B11 | 391 | `comments_written` | no filter needed (it counts your own comments) |
@@ -931,11 +948,11 @@ Only the `paste` event is handled, never `navigator.clipboard.read()`, so no per
   - `version`
   - `forked_from` (detail only)
 - **Track rows** gain:
-  - `source_track_id`
+  - `source_track_id` (null unless that row still exists in the `LINKABLE` source playlist)
   - `position` as the 1-based ordinal (it already looks like that today)
 - **`current_user` in bootstrap** gains:
   - `crate_id`
-  - `undo: {can_undo, undo_label, can_redo, redo_label}`
+  - `undo: {can_undo, undo_label, undo_group_id, can_redo, redo_label, redo_group_id}`
 - `songs.first_added_*` fields may be `null`, along with the finder fields derived from them.
 
 ---
@@ -955,7 +972,7 @@ Only the `paste` event is handled, never `navigator.clipboard.read()`, so no per
 
 ## 8. Minimal frontend changes in Phase 1a (old UI keeps working)
 
-1. **Undo.** `undoLastPlaylistChange` (`app.js:2458`) calls `POST /api/ops/undo`. The Undo buttons (`app.js:1429`, `1466`) and Ctrl+Z (`app.js:2614`) use `state.currentUser.undo`. The snapshot payload in `capturePlaylistSnapshot` (`app.js:2379`) and its call sites are removed. (Required, because `PUT /snapshot` is deleted.)
+1. **Undo.** `undoLastPlaylistChange` calls `POST /api/ops/undo` with `group_id = state.currentUser.undo.undo_group_id`, drops presses while a request is in flight, and Ctrl+Z ignores key auto-repeat (`e.repeat`). On `undo_conflict` "skip it and undo the step before" skips the conflicting `group_id`, then undoes the new top. On `stack_moved` it refreshes and asks for another press. The Undo buttons and Ctrl+Z use `state.currentUser.undo`. The snapshot payload in `capturePlaylistSnapshot` and its call sites are removed. (Required, because `PUT /snapshot` is deleted.) Auto-migrate sends one shared `group_id` with all of its swap PUTs, so it stays one undo step. The player deck's "Love Mix" stays disabled while a crate is playing.
 2. **Quick drop.** The `__new__` path in `handleQuickDrop` (`app.js:2170`) no longer creates an ordinary playlist titled "X's Crate". It targets `state.currentUser.crate_id`, and the select lists the crate first. (Recommended; without it users get confusing fake crates.)
 3. **Path routes.** At boot, map `location.pathname` `/p/{id}` (with an optional `?track=`) to `#playlist/{id}`, and `/t/{vid}` to `#song/{vid}`. (Needed only for the clipboard text links in §5.2.)
 4. **Crate playlist view.** Opening the crate with the old playlist view must not call like or comment. Hide those controls when `pl.kind === 'crate'`. (Small; otherwise the user sees a 400 toast.)
