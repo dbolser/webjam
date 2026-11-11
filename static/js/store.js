@@ -9,7 +9,7 @@ export const state = {
   playlists: new Map(), // id -> { meta, version, order: [trackId], related_count, kind, ownerId, loadedAt }
   tracks: new Map(), // trackId -> row (GET /api/playlists/{id} row shape)
   dock: null, // GET /api/me/dock shape
-  home: null, // GET /api/me/home shape (or the fallback built by views/home.js)
+  home: null, // GET /api/me/home shape
   undo: null, // { can_undo, undo_label, undo_group_id, can_redo, redo_label, redo_group_id }
   selection: { playlistId: null, ids: new Set(), anchorId: null, cursorId: null, insertAfterId: undefined },
   clipboard: { items: [], mode: 'copy', fromPlaylistId: null },

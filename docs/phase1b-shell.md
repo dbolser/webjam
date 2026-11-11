@@ -856,3 +856,53 @@ Each lane's PR must tick its list, run `python -m pytest -q` green, and run `nod
 - **Single-key bindings and accessibility.** Bare-letter keys act only when a list or the player has focus, never on the page body, so screen-reader quick navigation keeps working.
 - **Performance of overlap queries.** At invite-only scale the per-card `related_count` subquery is fine. If a page exceeds ~50 ms server time, cache `related_count` per playlist keyed by `version` in memory, without changing the API.
 - **Clipboard formats.** Custom MIME types are Chromium-only; plain text with Webjam URLs is always sufficient, and `/api/resolve-paste` restores refs from it.
+
+## 10. Foundation notes for view lanes
+
+Written after F-back and F-front merged (`t3/phase1b-shell`). Where this differs from §§2–4, this section wins.
+
+### 10.1 Entry, routes and views
+- `static/js/main.js` imports `core.js` and `routes.js`, then one commented line per lane: `// import './editing/index.js';` (A), `// import './discovery/index.js';` (B), `// import './share/index.js';` (C). Create your `index.js` and uncomment only your own line.
+- Routes: `router.register(name, pattern, () => import('./views/x.js'))`. Registering an existing name replaces it. Patterns are `'/p/:ref'` strings or RegExps with named groups. B replaces `track`, `profile` and `search` (they point at `views/interim.js` now) and overwrites `views/discover.js`. The `profile` regex accepts mixed case; `userUrl()` always emits lowercase and the API folds case.
+- Server side, `/`, `/discover`, `/search`, `/crate`, `/p/…`, `/t/{vid}` and `/u/{handle}` serve `static/index.html` (`Cache-Control: no-cache`). A new top-level page path needs a matching shell route in `app/main.py`. The old UI lives at `/legacy/` (`static/legacy/`).
+- A view module exports `load(ctx)` (async; throw an `ApiError` 404 for not-found), `render(ctx)` (sync, from the store; runs again on every store change), and optionally `title(ctx)` and `unmount()`. `ctx = { name, params, query, hash, path, signal, rerender() }`.
+
+### 10.2 Store (`store.js`)
+```
+auth      { mode: null|'google'|'demo', signedIn, user /* bootstrap current_user, has needs_handle */, crateId, users, youtubeConnected, badgeCatalog }
+route     { name, params, query, path }
+playlists Map id -> { meta /* GET /api/playlists/{id} minus tracks */, version, order: [trackId], related_count, kind, ownerId, loadedAt }
+tracks    Map trackId -> row (playlist row shape + playlist_id)
+dock      GET /api/me/dock      home  GET /api/me/home      undo  { can_undo, undo_label, undo_group_id, can_redo, redo_label, redo_group_id }
+selection { playlistId, ids: Set, anchorId, cursorId, insertAfterId }
+clipboard { items, mode, fromPlaylistId }
+player    { queue, index, status, time, duration, seam, source }
+ui        { theme, cratePanel, newPlaylist: 'home'|'dock'|null, notice }
+landed    Set of track ids rendered with .is-new;   dead  Set of video ids YouTube refused
+```
+- Mutate only with `update(fn, reason)`; listen with `subscribe(selector, cb)` or `onChange(cb)`. Helpers: `rowsOf(id)`, `isMine(id)`, `loadPlaylist(id, { force })`, `ingestPlaylist`, `forgetPlaylist`, `markLanded(ids)`.
+- Edits: `const token = optimistic(op)`, then `api.ops.send(ops, { token, groupId, expectedVersions, quiet })`; it reconciles on success and rolls back on failure. Never re-fetch a whole page after an edit. `api.undo()`/`api.redo()` share the ops queue; wrap other writes in `api.queued(fn)`.
+- `api.get(path, query, { quiet })`, `api.post/put/del(path, body, { quiet })`. Writes always carry `X-Webjam: 1`; demo mode adds `user_id`, Google mode never does. `quiet` stops a 401 from prompting sign-in.
+
+### 10.3 Actions, keys, slots, paste
+- `registerActions({ name: (el, event, ctx) => … })`; duplicate names throw. Clicks reach `button`/`a[data-action]`; submits reach `form[data-action]` (already `preventDefault`ed); change/input reach fields that carry `data-action`. `ctx = { trackId, playlistId, videoId, row, card, list }`. `data-cancel-action` on a form runs on Esc. Never use inline handlers or `innerHTML` with data.
+- F's names beyond the spec list: `crate-remove`, `new-playlist-submit`, `new-playlist-cancel`, `omnibox-submit`, `menu-item`, `sheet-close`, `confirm-yes`/`confirm-no`, `toast-close`, `pl-related-basic`, `discover-more`. C must register `import-open` (the home empty state shows it when the `import.open` slot exists).
+- Keys: `registerKeys([{ combo, when, label, group, run }])`; later registrations win; `run` returning `false` passes the key on. `?` is a "coming soon" toast for A to replace.
+- Slots: `slots.register(name, fn, { order })`, `render`, `call`, `has`. Includes `home.top`, `player.like`, `rail.context`, `playlist.actions`, `crate.actions`, `playlist.related`, `auth.required`, and menu slots `row.menu`, `crate.row.menu`, `playlist.menu` that return `{ label, icon, run | href, danger, kbd }` or `'sep'`.
+- Paste: `pasteRouter.register({ name, priority, handle(payload, event) })`, `payload = { json, html, text, target, inOmnibox }`; return `true` or a promise to claim it.
+- Rows: `trackList(rows, { key, context, editable, playlistId, label, source })` and `compactList(...)`; `listRows(key)` returns `{ rows, source }`. Dock chips carry `data-drop-target` (`crate:{id}`, `playlist:{id}`, `new`) and `data-slot`.
+- URLs: every bound `href` goes through `trackUrl`, `playlistUrl`, `userUrl`, `localUrl` or `iconHref`; every `src` through `thumbSrc`. Action-triggered sign-in links use `signInUrl(location.pathname + location.search)`, which adds a validated `?next=`. The top-bar link stays bare. `tests/test_frontend_safety.py` enforces these rules.
+
+### 10.4 Styles
+- Write only in your own stylesheet: `editing.css` (`.ed-*`), `discovery.css` (`.dc-*`), `share-import.css` and `mobile.css` (`.sh-*`). All are already linked from `index.html`. New tokens go in `tokens.css` in a separate `shared:` commit. Do not use `style=` attributes, because CSP `style-src 'self'` blocks them. Set CSS variables with `el.style.setProperty` from a `ref`.
+- A new stylesheet or vendored file must be same-origin under `static/`. The CSP allows scripts from `'self'` and `www.youtube.com`/`s.ytimg.com`, frames from YouTube, images from `'self'`, `data:` and `*.ytimg.com`, and fonts and styles from `'self'` only.
+
+### 10.5 Endpoint field names (as implemented)
+- **PlaylistCard** (home, discover, related, song `playlists`): `{ id, kind, visibility, version, title, description, track_count, like_count, plays, related_count, updated_at, user: UserMini, preview?: [TrackMini ×≤3] }`. `UserMini = { id, username, display_name, avatar_color }`. `TrackMini = { id, video_id, position, title, channel_title, thumbnail_url, start_seconds, end_seconds }`.
+- **`GET /api/me/home`** (401 `signed_out` in Google mode): `user {…UserMini, bio, needs_handle}`, `playlists [PlaylistCard]` (mine, any visibility, newest edit first), `crate { id, version, track_count, recent: [TrackMini + source_username] }`, `dock`, `undo`, `neighbours [{ user, shared_count, sample: [{ video_id, title, thumbnail_url }] }]` (≤6), `fresh [{ track: TrackMini, playlist: { id, title }, user, added_at, playlist_count }]` (≤10), `about_you [{ type: 'grab', at, user, video_id, title, playlist: {id, title} } | { type: 'comment', at, user, body, playlist }]` (≤10), `activity [{ id, actor_user_id, action_type, summary, link_type, link_id, created_at, username, display_name, avatar_color }]` (≤20, no badge lines).
+- **`GET /api/discover?tab=playlists|tracks|people&sort=fresh|popular&offset&limit`**: `{ tab, sort, offset, next_offset /* null at the end */, playlists | tracks | people, … }`. It skips empty playlists, has no `badges` key, and uses the `find` rate bucket.
+- **`GET /api/search?q&type&limit`**: `q` is trimmed to 1–100 chars, else 422. Returns `{ query, playlists?, tracks?, people? }`; which lists appear depends on `type` (`all` returns all three). `people` items are `{ user, playlist_count }`. `%`, `_` and `\` match literally. Uses the `find` bucket.
+- **`GET /api/playlists/{id}/related?limit&offset`**: `{ playlist_id, total, next_offset, related: [{ playlist: PlaylistCard (no preview), shared_count, shared: [{ video_id, title, thumbnail_url, position } ×≤4] }] }`. It works on my private playlists and my crate, and only ever names listed playlists.
+- **`GET /api/playlists/{id}`** adds `related_count`. **`GET /api/songs/{vid}`** keeps `appearances` and adds `playlist_count`, `playlists [{ playlist: PlaylistCard, occurrences, first_position, note }]`, `curators [{ user, playlist_count }]` and `alongside [{ video_id, title, channel_title, thumbnail_url, together_count }]`.
+- **`GET /api/users/{id}`** and **`GET /api/users/by-handle/{handle}`** (lowercased; old handles resolve; a bad shape is 404): `user`, `playlists` (each with `related_count` and `preview`), `neighbours` (same shape as home, listed-only), `shared_with_viewer { shared_count, sample } | null`, plus the older keys (`metrics`, `earned_badges`, `comments`, …).
+- **`/api/bootstrap`** `current_user.needs_handle`. **`/auth/google/login?next=`** returns you to `next` after the callback when it passes validation, otherwise to `/`.
