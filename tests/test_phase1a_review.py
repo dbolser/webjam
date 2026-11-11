@@ -15,7 +15,11 @@ from test_security_backend import db, db_path, demo, fakes  # noqa: F401  (fixtu
 from test_ops import ok, order, post_ops, q, redo, row, undo
 
 ROOT = Path(__file__).resolve().parent.parent
-APP_JS = (ROOT / "static" / "legacy" / "app.js").read_text(encoding="utf-8")
+JS = ROOT / "static" / "js"
+
+
+def js(path):
+    return (JS / path).read_text(encoding="utf-8")
 
 
 def feed_text(client, viewer):
@@ -241,18 +245,26 @@ def test_undo_state_exposes_group_ids_and_stale_undo_is_refused(demo):
 
 
 def test_frontend_undo_sends_group_id_and_guards_repeats():
-    assert "if (e.repeat) return;" in APP_JS
-    assert "if (undoInFlight) return;" in APP_JS
-    assert "group_id: expect || null" in APP_JS
-    assert ".undo_group_id" in APP_JS
+    # Phase 1b: held keys are dropped in keys.js, editing/undo.js keeps one request in flight, and
+    # api.undo() names the group it expects.
+    assert re.search(r"if \(e\.repeat && !arrow\) return;", js("keys.js"))
+    undo_js = js("editing/undo.js")
+    assert undo_js.count("if (inFlight) return;") >= 2
+    api_js = js("api.js")
+    body = api_js[api_js.index("export function undo("):]
+    body = body[:body.index("\n}\n")]
+    assert "state.undo.undo_group_id" in body and "body.group_id = gid" in body
 
 
 def test_frontend_skip_then_undoes_the_step_before():
-    body = APP_JS[APP_JS.index("async function runUndo"):]
+    undo_js = js("editing/undo.js")
+    body = undo_js[undo_js.index("async function handleError"):]
     body = body[:body.index("\n}\n")]
-    assert "skip: true, group_id: conflictGroup" in body
-    assert "await runUndo(false, next)" in body
-    assert "err.data = errData" in APP_JS
+    assert "err.code === 'undo_conflict'" in body
+    assert "api.undo({ skip: true, groupId: gid })" in body
+    assert "doUndo();" in body
+    # The 409 body reaches the handler as err.data (api.js keeps the parsed payload).
+    assert "new ApiError(res.status, data && data.code, detailString(data, res.status), data || {})" in js("api.js")
 
 
 # --- 10 / 15. Auto-migrate is one undo step --------------------------------------------------------
@@ -272,12 +284,6 @@ def test_legacy_swaps_sharing_a_group_undo_together(demo):
 def test_legacy_swap_rejects_reserved_group_id(demo):
     res = demo.put("/api/playlists/4/tracks/12", json={"user_id": 1, "track_note": "n", "group_id": "srv-x"})
     assert res.status_code == 400
-
-
-def test_frontend_auto_migrate_shares_one_group():
-    body = APP_JS[APP_JS.index("async function autoMigrateAuditedPlaylist"):]
-    body = body[:body.index("\n}\n")]
-    assert "const groupId = `mig-" in body and "group_id: groupId" in body
 
 
 # --- 12. /api/ops checks caps and roles before any YouTube lookup ---------------------------------
@@ -352,10 +358,16 @@ def test_profile_hides_private_fork_source_id(demo):
 
 # --- 18. The player deck can't like a crate ------------------------------------------------------------
 
-def test_frontend_deck_love_mix_is_off_for_crates():
-    assert "state.queuePlaylistId && state.queuePlaylistKind !== 'crate'" in APP_JS
-    assert re.search(r"likeActiveQueuePlaylist\(event = null\) \{\n  if \(!state\.queuePlaylistId \|\| state\.queuePlaylistKind === 'crate'\) return;", APP_JS)
-    assert "state.queuePlaylistKind = playlist.kind || 'playlist';" in APP_JS
+def test_frontend_like_control_is_off_for_crates():
+    # The crate page renders crate.actions instead of playlist.actions (where the playlist ♡ lives),
+    # the ♡ slot refuses crates on its own, and the player bar's ♡ likes the song, never the crate.
+    view = js("views/playlist.js")
+    assert "crate ? slots.render('crate.actions', { crateId: id, rows }) : slots.render('playlist.actions', sctx)" in view
+    likes = js("discovery/likes.js")
+    assert "if (!ctx || ctx.crate || !ctx.playlist || ctx.playlist.kind === 'crate') return null;" in likes
+    player_like = likes[likes.index("slots.register('player.like'"):]
+    player_like = player_like[:player_like.index("\n});")]
+    assert "likeButton('song'" in player_like and "'playlist'" not in player_like
 
 
 def test_fork_defaults_to_the_source_visibility(demo):

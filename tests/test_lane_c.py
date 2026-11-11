@@ -8,7 +8,8 @@ The client flows checked here, step by step as static/js performs them:
   - crate "Make it a playlist" for a selection, then Undo with the response's group_id after
     reading /api/me/undo (crate/crate-actions.js submitPromote);
   - "Clear unloaded": /api/me/crate also_in, then one delete op (crate/crate-actions.js);
-  - playlist settings: a set_meta op, undone by the toast's Undo (share/settings.js);
+  - playlist details: a set_meta op, undone by the toast's Undo (editing/inline-edit.js after the
+    cutover; Lane C's settings sheet was folded into it);
   - "Copy all": the fork response carries what the toast says (share/fork.js).
 Seed facts: see tests/test_ops.py (dan=1 owns playlist 4 and crate 5 = rows 16, 17).
 """

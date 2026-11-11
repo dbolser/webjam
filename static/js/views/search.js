@@ -1,7 +1,7 @@
 // Search (/search?q=, §2.4): Playlists, Tracks and People on webjam (GET /api/search), 10 each with
 // "More" (up to 25). Signed-in visitors also get a quiet "On YouTube" section whose button calls
 // /api/youtube/search only when pressed, because every search spends shared quota. Results are
-// track rows with + (crate) and, in the ⋯ menu, "Add to playlist…" (discovery/add-to.js).
+// track rows with + (crate) and, in the ⋯ menu, "Send to…" (editing/index.js).
 
 import { html, nothing, repeat } from '../lit.js';
 import { state } from '../store.js';

@@ -11,4 +11,3 @@ import '../import/import-sheet.js';
 import '../import/paste-to-crate.js';
 import './share-popover.js';
 import './fork.js';
-import './settings.js';

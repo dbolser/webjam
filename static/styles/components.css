@@ -633,3 +633,22 @@
   .chip { width: auto; max-width: 160px; flex: none; }
 }
 .dur-inline { display: none; }
+
+/* Dock: a quiet import link under "New playlist" (integration). Hidden on the phone strip. */
+.dock-import { margin: var(--sp-2) 0 0 var(--sp-2); }
+.dock-import-btn { font-size: var(--fs-xs); color: var(--ink-3); }
+@media (max-width: 759px) { .dock-import { display: none; } }
+
+/* Player bar toggles (repeat, small video): the accent marks "on", nothing else changes. */
+.pbar-extra .icon-btn.is-on { color: var(--accent); }
+
+/* Small video, low data (ported from the classic UI's audio mode). YouTube's minimum is 200x200. */
+body.video-small .video-tile {
+  width: 200px;
+  height: 200px;
+  min-height: 200px;
+  aspect-ratio: auto;
+}
+@media (max-width: 759px) {
+  body.video-small .video-tile { width: 200px; left: auto; }
+}

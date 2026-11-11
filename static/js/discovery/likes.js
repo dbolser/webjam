@@ -39,7 +39,7 @@ function path(kind, id) {
 /** add: Shift-click (one more). Otherwise a toggle: like once, or take my likes back. */
 export function toggleLike(kind, id, { add = false, fallback } = {}) {
   if (!state.auth.signedIn) {
-    askSignIn({ action: 'like', payload: { kind, id } }, kind === 'playlist' ? 'like playlists' : 'like tracks');
+    askSignIn({ action: 'like', payload: kind === 'playlist' ? { playlist_id: Number(id) } : { video_id: id } }, kind === 'playlist' ? 'like playlists' : 'like tracks');
     return Promise.resolve(null);
   }
   if (kind === 'song' && !isVideoId(id)) return Promise.resolve(null);

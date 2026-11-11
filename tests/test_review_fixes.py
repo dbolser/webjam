@@ -31,7 +31,11 @@ from test_security_backend import (  # noqa: F401  (fixtures are used by name)
 ROOT = Path(__file__).resolve().parent.parent
 # The `fakes` fixture swaps httpx.AsyncClient (module-wide) for a fake Google client.
 REAL_ASYNC_CLIENT = httpx.AsyncClient
-APP_JS = (ROOT / "static" / "legacy" / "app.js").read_text(encoding="utf-8")
+JS = ROOT / "static" / "js"
+
+
+def js(path):
+    return (JS / path).read_text(encoding="utf-8")
 
 
 def sign_in_as(client, sub, email, name):
@@ -497,22 +501,22 @@ def test_wal_sidecars_are_gitignored():
 
 # --- frontend -------------------------------------------------------------------------
 
-def _fn(name):
-    m = re.search(r"^(?:async )?function " + re.escape(name) + r"\(.*?^\}", APP_JS, re.S | re.M)
-    assert m, name
-    return m.group(0)
-
-
 def test_frontend_follows_the_backend_changes():
+    """Rewritten at the Phase 1b cutover against the new modules. Dropped with the classic UI:
+    the audit-embeds button, the auto-migrate group and "+1 Spin" (those features no longer exist)."""
+    every = "\n".join(p.read_text(encoding="utf-8") for p in JS.rglob("*.js"))
     # Phase 1a: undo goes through the server-side op log; the snapshot endpoint is gone.
-    assert "/api/ops/undo" in _fn("runUndo") and "runUndo(" in _fn("undoLastPlaylistChange")
-    assert "/snapshot" not in APP_JS and "capturePlaylistSnapshot" not in APP_JS
-    assert "Array.isArray(data.detail)" in _fn("api")
-    assert "res.counted" in _fn("incrementPlaylistSpin") and "res.counted" in _fn("simulateExtraSpin")
-    assert "youtube_connected" in _fn("loadMyYouTubePlaylists")
-    assert "has_more" in _fn("renderCommentsSection") or "hasMore" in _fn("renderCommentsSection")
-    assert re.search(r"\$\{isOwner \? `<button[^`]*auditPlaylistEmbeds", APP_JS)
-    for fn in ("autoMigrateAllImportTracks", "autoMigrateAuditedPlaylist"):
-        assert "apiWithRetry" in _fn(fn)
-    for fn in ("handleQuickDrop", "handleDropIntoPlaylist", "submitCommitPlaylistImport"):
-        assert "skipped" in _fn(fn)
+    assert "'/api/ops/undo'" in js("api.js") and "api.undo(" in js("editing/undo.js")
+    assert "/snapshot" not in every and "capturePlaylistSnapshot" not in every
+    # A FastAPI validation error (a list `detail`) becomes one readable string.
+    api_js = js("api.js")
+    body = api_js[api_js.index("function detailString"):]
+    assert "Array.isArray(d)" in body[:body.index("\n}\n")]
+    # "Your YouTube playlists" stays hidden until the account has YouTube access.
+    assert "youtube_connected" in js("session.js")
+    assert "state.auth.youtubeConnected ?" in js("import/import-sheet.js")
+    # Comments page with before_id and know when there is more.
+    comments = js("discovery/comments.js")
+    assert "before_id" in comments and "hasMore" in comments
+    # Imports report what the server skipped.
+    assert "res.skipped" in js("import/import-sheet.js")

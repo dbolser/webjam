@@ -906,3 +906,30 @@ landed    Set of track ids rendered with .is-new;   dead  Set of video ids YouTu
 - **`GET /api/playlists/{id}`** adds `related_count`. **`GET /api/songs/{vid}`** keeps `appearances` and adds `playlist_count`, `playlists [{ playlist: PlaylistCard, occurrences, first_position, note }]`, `curators [{ user, playlist_count }]` and `alongside [{ video_id, title, channel_title, thumbnail_url, together_count }]`.
 - **`GET /api/users/{id}`** and **`GET /api/users/by-handle/{handle}`** (lowercased; old handles resolve; a bad shape is 404): `user`, `playlists` (each with `related_count` and `preview`), `neighbours` (same shape as home, listed-only), `shared_with_viewer { shared_count, sample } | null`, plus the older keys (`metrics`, `earned_badges`, `comments`, …).
 - **`/api/bootstrap`** `current_user.needs_handle`. **`/auth/google/login?next=`** returns you to `next` after the callback when it passes validation, otherwise to `/`.
+
+## 11. Cutover notes (integration of A, B and C)
+
+Written when the three lanes merged into `t3/phase1b-shell`. Where this differs from earlier sections, this section wins.
+
+- **Classic UI deleted:** `static/legacy/`, the `/legacy/` route, its relaxed CSP and `tests/test_legacy_frontend_safety.py` are gone. Every path now gets the strict CSP. `/api/feed` stays but is marked deprecated.
+- **Static assets revalidate:** every `/static/` response carries `Cache-Control: no-cache` (ETag gives cheap 304s), because ES modules are imported without a `?v=`. Still bump `main.js?v=` in `index.html` when boot changes.
+- **One set of playlist-menu items:** Lane A's "Edit details" and "Delete playlist…" (always last, order 1000). Lane C's settings sheet (`share/settings.js`) was removed. F's "Copy link" now sits near the top, after "Play from the start".
+- **One "Send to…" item:** Lane A's row-menu item works in every list. Lane B's search-only "Add to playlist…" (`discovery/add-to.js`) was removed.
+- **Routes:** `routes.js` points `search`, `track` and `profile` at the real views. `views/interim.js` and F's `pl-related-basic` fallback were removed.
+- **Track page Share:** Lane C registers it in Lane B's `track.actions` slot.
+- **Like intents:** Lane B sends `{ action: 'like', payload: { playlist_id } | { video_id } }`. Lane C's replay goes through `toggleLike(…, { add: true })`, so the ♡ on screen updates.
+- **`ui/sheet.js` fix:** opening a sheet while another is open swaps its content in place. A pending `close` event from an earlier sheet no longer closes the new one.
+- **Import entry points:** the import sheet now opens from the dock ("Import from YouTube…" under New playlist) and from the omnibox (typing a YouTube link and pressing Enter).
+- **Ported from the classic UI at cutover:**
+  - "Your YouTube playlists" picker in the import sheet, shown only when `youtube_connected` is true.
+  - Repeat one track (player bar).
+  - "Small video, low data", which replaces the old audio-only mode. The tile is 200×200, the minimum YouTube allows, and the setting is remembered per browser.
+  - "Add to crate" for the track that is playing (player bar).
+- **Dropped with the classic UI, per §7.3:**
+  - audit-embeds;
+  - the auto-migrate group and the per-track migrate search (replaced by "Swap video…" with a pasted link);
+  - "+1 Spin", love particles and the badges directory page (badges live on profiles).
+- **Tests:**
+  - `tests/test_frontend_safety.py` now also checks that the classic UI is gone, that every lane entry is imported, that routes point at the real views and that `href` literals keep a fixed origin.
+  - It also checks `target=_blank` with `noopener`, and the owner's vocabulary (no "audition").
+  - It runs `tests/js/wiring_smoke.mjs`, which loads every module and checks that each `data-action` used in a template has a handler.

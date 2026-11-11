@@ -242,6 +242,14 @@ slots.register('playlist.actions', (ctx = {}) => {
     aria-haspopup="dialog"><svg class="i"><use href="#i-share"></use></svg>Share</button>`;
 }, { order: 50 });
 
+// Share on the track page (Lane B renders the 'track.actions' slot in its header).
+slots.register('track.actions', (ctx = {}) => {
+  if (!isVideoId(ctx.videoId)) return null;
+  return html`<button type="button" class="btn btn-quiet" data-action="share-open" data-share="track"
+    data-video-id=${ctx.videoId} data-start=${ctx.start ?? ''} data-end=${ctx.end ?? ''}
+    aria-haspopup="dialog"><svg class="i"><use href="#i-share"></use></svg>Share</button>`;
+}, { order: 50 });
+
 // 'share.open' for other lanes: slots.call('share.open', anchorEl, target).
 slots.register('share.open', (anchor, target) => {
   openShare(anchor, target);

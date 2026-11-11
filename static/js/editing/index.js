@@ -231,8 +231,11 @@ slots.register('playlist.menu', (m) => {
   return [
     { label: 'Edit details', run: () => openMetaEditor(m.playlistId) },
     { label: 'Keyboard shortcuts', kbd: '?', run: () => openCheatsheet() },
-    'sep',
-    { label: 'Delete playlist…', danger: true, run: () => deletePlaylist(m.playlistId) },
   ];
 });
+// The destructive item always comes last, after every lane's entries.
+slots.register('playlist.menu', (m) => {
+  if (!m.mine || m.crate) return [];
+  return ['sep', { label: 'Delete playlist…', icon: 'close', danger: true, run: () => deletePlaylist(m.playlistId) }];
+}, { order: 1000 });
 

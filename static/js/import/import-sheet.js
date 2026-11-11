@@ -4,8 +4,10 @@
 //
 //   openImport({ source, target: 'crate' | 'new', autoInspect })
 //
-// Opened from the home empty state, the crate actions, the 'import.open' slot, and pasted
-// YouTube playlist links (paste-to-crate.js).
+// Opened from the home empty state, the crate actions, the dock, the omnibox, the 'import.open'
+// slot, and pasted YouTube playlist links (paste-to-crate.js). When the account has connected
+// YouTube access (bootstrap youtube_connected), a "Your YouTube playlists" picker fills the link
+// field from GET /api/youtube/my-playlists (ported from the classic UI at cutover).
 
 import { html, nothing } from '../lit.js';
 import { state, update, loadPlaylist } from '../store.js';
@@ -38,8 +40,61 @@ function sourceTpl() {
         .value=${st.source}></textarea>
     </label>
     <p class="quiet-line">A YouTube playlist, or video links one per line. Up to ${MAX_TRACKS} tracks; each is checked for playback here.</p>
+    ${myYouTubeTpl()}
     ${st.error ? html`<p class="sh-err" role="alert">${st.error}</p>` : nothing}
   </form>`;
+}
+
+function myYouTubeTpl() {
+  const yt = st.yt;
+  if (!yt) return nothing;
+  if (yt.status === 'loading') return html`<p class="quiet-line">Loading your YouTube playlists…</p>`;
+  if (yt.status === 'error') return html`<p class="quiet-line">${yt.error}</p>`;
+  if (!yt.items.length) return nothing;
+  return html`<label class="sh-field">
+    <span class="label">Or one of yours</span>
+    <select class="input" name="my-youtube" data-action="import-my-youtube" ?disabled=${st.busy}>
+      <option value="">Your YouTube playlists…</option>
+      ${yt.items.map((p) => html`<option value=${p.id}>${p.title} (${plural(Number(p.item_count) || 0, 'video')}${p.privacy ? `, ${p.privacy}` : ''})</option>`)}
+    </select>
+  </label>`;
+}
+
+async function loadMyYouTube() {
+  if (!st || !st.yt) return;
+  try {
+    const res = await api.get('/api/youtube/my-playlists', undefined, { quiet: true });
+    if (st && st.yt) st.yt = { status: 'ready', items: res.playlists || [], error: '' };
+  } catch (err) {
+    if (st && st.yt) st.yt = { status: 'error', items: [], error: err.detail || 'YouTube did not return your playlists.' };
+  }
+  rerenderSheet();
+}
+
+async function useMyYouTube(id) {
+  if (!st || !id || st.busy) return;
+  const pick = (st.yt && st.yt.items.find((p) => p.id === id)) || null;
+  st.busy = true;
+  st.error = '';
+  rerenderSheet();
+  try {
+    const res = await api.get(`/api/youtube/my-playlists/${encodeURIComponent(id)}/videos`, { limit: MAX_TRACKS });
+    if (!st) return;
+    const ids = res.video_ids || [];
+    if (!ids.length) {
+      st.error = 'That playlist has no videos.';
+      return;
+    }
+    st.source = ids.map((v) => `https://www.youtube.com/watch?v=${v}`).join('\n');
+    st.pendingTitle = pick ? pick.title : '';
+  } catch (err) {
+    if (st) st.error = err.detail || 'YouTube did not return that playlist.';
+  } finally {
+    if (st) {
+      st.busy = false;
+      rerenderSheet();
+    }
+  }
 }
 
 function itemTpl(t, i) {
@@ -78,7 +133,7 @@ function reviewTpl() {
       <label class="sh-radio"><input type="radio" name="dest" value="crate" data-action="import-dest" .checked=${st.dest === 'crate'} />
         <span>Your crate</span><span class="sh-hint">sort them later</span></label>
       <label class="sh-radio"><input type="radio" name="dest" value="new" data-action="import-dest" .checked=${st.dest === 'new'} />
-        <span>A new playlist</span><span class="sh-hint">public; change it in settings</span></label>
+        <span>A new playlist</span><span class="sh-hint">public; change it with Edit details</span></label>
     </fieldset>
     ${st.dest === 'new'
       ? html`<label class="sh-field"><span class="label">Title</span>
@@ -126,8 +181,11 @@ function start({ source, target, autoInspect }) {
     title: '',
     error: '',
     busy: false,
+    pendingTitle: '',
+    yt: state.auth.youtubeConnected ? { status: 'loading', items: [], error: '' } : null,
   };
   openSheet({ title: 'Import from YouTube', body, foot, onClose: () => { st = null; } });
+  if (st.yt) loadMyYouTube();
   if (autoInspect && st.source.trim()) inspect();
 }
 
@@ -148,7 +206,8 @@ async function inspect() {
     const tracks = report.tracks || [];
     st.report = report;
     st.picked = new Set(tracks.map((t, i) => (t.embeddable ? i : -1)).filter((i) => i >= 0));
-    st.title = report.source_type === 'youtube_playlist' && report.title ? report.title : '';
+    st.title = report.source_type === 'youtube_playlist' && report.title ? report.title : (st.pendingTitle || '');
+    if (st.pendingTitle && !report.title) report.title = st.pendingTitle;
     st.step = 'review';
   } catch (err) {
     if (st) st.error = err.detail || 'Could not read that link.';
@@ -216,7 +275,13 @@ registerActions({
     openImport({ target });
   },
   'import-source': (el, e) => {
-    if (st && e.type === 'input') st.source = el.value;
+    if (st && e.type === 'input') {
+      st.source = el.value;
+      st.pendingTitle = '';
+    }
+  },
+  'import-my-youtube': (el, e) => {
+    if (e.type === 'change') useMyYouTube(el.value);
   },
   'import-inspect': (form) => {
     if (!st) return;

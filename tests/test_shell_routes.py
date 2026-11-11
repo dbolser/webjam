@@ -14,7 +14,6 @@ STRICT_CSP = (
     "connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
     "frame-ancestors 'none'"
 )
-LEGACY_CSP = "frame-ancestors 'none'"
 
 
 # --- page routes ---------------------------------------------------------------------------
@@ -41,21 +40,12 @@ def test_strict_csp(google, path):
     assert google.get(path).headers["content-security-policy"] == STRICT_CSP
 
 
-@pytest.mark.parametrize("path", ["/legacy/", "/static/legacy/app.js"])
-def test_legacy_ui_keeps_the_old_csp(google, path):
+@pytest.mark.parametrize("path", ["/legacy/", "/static/legacy/app.js", "/static/app.js", "/static/styles.css"])
+def test_classic_ui_is_gone(google, path):
+    """Cutover (§7.3): the classic UI and its relaxed CSP no longer exist."""
     res = google.get(path)
-    assert res.headers["content-security-policy"] == LEGACY_CSP
-    assert res.headers["x-frame-options"] == "DENY"
-
-
-def test_legacy_route_serves_the_old_ui_when_present(demo):
-    from app.main import STATIC_DIR
-
-    res = demo.get("/legacy/")
-    if (STATIC_DIR / "legacy" / "index.html").is_file():
-        assert res.status_code == 200 and res.headers["cache-control"] == "no-cache"
-    else:
-        assert res.status_code == 404  # the F-front PR moves the old UI there
+    assert res.status_code == 404
+    assert res.headers["content-security-policy"] == STRICT_CSP
 
 
 # --- sign-in return path ---------------------------------------------------------------------
@@ -147,3 +137,12 @@ def test_guarded_alter_is_idempotent_on_an_existing_database(demo):
         assert conn.execute("SELECT COUNT(*) FROM users WHERE handle_chosen_at IS NULL").fetchone()[0] == 4
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("path", ["/static/js/main.js", "/static/js/editing/undo.js", "/static/styles/tokens.css"])
+def test_static_assets_revalidate(demo, path):
+    """Modules are imported without ?v=, so the browser must revalidate them (ETag -> 304)."""
+    res = demo.get(path)
+    assert res.status_code == 200
+    assert res.headers["cache-control"] == "no-cache"
+    assert res.headers.get("etag")

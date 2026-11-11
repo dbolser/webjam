@@ -204,6 +204,11 @@ registerActions({
   'omnibox-submit': (form) => {
     const q = (form.querySelector('input[name="q"]').value || '').trim();
     if (!q) return;
+    // A YouTube link typed (not pasted) into the omnibox opens the import sheet instead of a search.
+    if (/^(?:https?:\/\/)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\//i.test(q) && slots.has('import.open')) {
+      slots.call('import.open', { source: q, target: 'crate', autoInspect: true });
+      return;
+    }
     navigate(`/search?q=${encodeURIComponent(q)}`);
   },
 
@@ -211,6 +216,23 @@ registerActions({
   'player-prev': () => player.prev(),
   'player-next': () => player.next(),
   'player-seam': () => player.previewSeam(state.player.index + 1),
+  'player-repeat': () => player.toggleRepeat(),
+  'player-small-video': () => player.toggleSmallVideo(),
+  'player-crate': () => {
+    const it = player.current();
+    if (!it) return;
+    const fromCrate = state.player.source && state.player.source.kind === 'crate';
+    addToCrate([{
+      id: fromCrate ? null : it.trackId,
+      playlist_id: fromCrate ? null : it.playlistId,
+      video_id: it.video_id,
+      start_seconds: it.start ?? null,
+      end_seconds: it.end ?? null,
+      title: it.title,
+      channel_title: it.channel,
+      thumbnail_url: it.thumb,
+    }]);
+  },
   'player-seek': (el, e) => {
     if (e.type === 'change' || e.type === 'input') player.seekFraction(Number(el.value) / 1000);
   },
@@ -238,13 +260,12 @@ registerActions({
       const p = state.playlists.get(pid);
       if (!p) return;
       const crate = p.kind === 'crate';
-      const items = [
-        { label: 'Play from the start', icon: 'play', run: () => playPlaylist(pid) },
-        ...slots.render('playlist.menu', { playlistId: pid, playlist: p.meta, crate, mine: p.ownerId === (state.auth.user && state.auth.user.id) }),
-      ];
+      const items = [{ label: 'Play from the start', icon: 'play', run: () => playPlaylist(pid) }];
       if (!crate && p.meta.visibility !== 'private') {
-        items.push('sep', { label: 'Copy link', icon: 'link', run: () => copyText(absoluteUrl(playlistUrl(pid, p.meta.title))) });
+        items.push({ label: 'Copy link', icon: 'link', run: () => copyText(absoluteUrl(playlistUrl(pid, p.meta.title))) });
       }
+      const extra = slots.render('playlist.menu', { playlistId: pid, playlist: p.meta, crate, mine: p.ownerId === (state.auth.user && state.auth.user.id) });
+      if (extra.length) items.push('sep', ...extra);
       openMenu(el, items, { label: 'Playlist actions' });
     }
   },
@@ -274,9 +295,6 @@ registerKeys([
     box.focus();
     box.select();
     return true;
-  } },
-  { combo: '?', when: 'always', label: 'Keyboard shortcuts', group: 'General', run: () => {
-    toast.show('The shortcut sheet is coming soon.');
   } },
   { combo: 'escape', when: 'always', label: 'Close', group: 'General', run: () => {
     if (state.ui.cratePanel) {

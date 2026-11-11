@@ -391,15 +391,6 @@ CONTENT_SECURITY_POLICY = "; ".join([
     "form-action 'self'",
     "frame-ancestors 'none'",
 ])
-# The old UI (moved under /legacy/ until cutover) still needs its inline handlers.
-LEGACY_CONTENT_SECURITY_POLICY = "frame-ancestors 'none'"
-LEGACY_PATH_PREFIXES = ("/legacy/", "/static/legacy/")
-
-
-def _is_legacy_path(path: str) -> bool:
-    return path == "/legacy" or path.startswith(LEGACY_PATH_PREFIXES)
-
-
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -424,8 +415,10 @@ class SecurityHeadersMiddleware:
                 for name, value in SECURITY_HEADERS.items():
                     if name not in headers:
                         headers[name] = value
-                if _is_legacy_path(scope.get("path") or ""):
-                    headers["Content-Security-Policy"] = LEGACY_CONTENT_SECURITY_POLICY
+                # ES modules are imported without a version query, so make browsers revalidate
+                # them (a cheap 304 via ETag) instead of heuristically caching a stale module.
+                if (scope.get("path") or "").startswith("/static/") and "Cache-Control" not in headers:
+                    headers["Cache-Control"] = "no-cache"
                 if get_config().base_url.startswith("https://") and "Strict-Transport-Security" not in headers:
                     headers["Strict-Transport-Security"] = "max-age=15552000"
             await send(message)
@@ -983,6 +976,8 @@ def _public_song_sql(video_expr: str) -> str:
     return public_song_sql(video_expr)
 
 
+# Deprecated (Phase 1b cutover): the classic UI was its only client; /api/me/home and
+# /api/discover replace it. Kept because tests and old scripts still call it.
 @app.get("/api/feed")
 def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
     user_id = resolve_viewer(request, user_id)
@@ -2522,15 +2517,6 @@ def serve_profile_page(handle: str):
     if not _HANDLE_ROUTE.match(handle.lower()):
         raise HTTPException(status_code=404, detail="Not found")
     return serve_shell()
-
-
-@app.get("/legacy/")
-def serve_legacy_ui():
-    """The old UI, kept for comparison until the Phase 1b cutover (served with the legacy CSP)."""
-    legacy = STATIC_DIR / "legacy" / "index.html"
-    if not legacy.is_file():
-        raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(str(legacy), headers={"Cache-Control": "no-cache"})
 
 
 # Page routes for the plain-text clipboard links (§5.2): the SPA maps the path onto its hash routes.

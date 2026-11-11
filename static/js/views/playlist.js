@@ -11,7 +11,6 @@ import { html, nothing } from '../lit.js';
 import { state, update, rowsOf, loadPlaylist, isMine } from '../store.js';
 import * as api from '../api.js';
 import * as slots from '../slots.js';
-import { registerActions } from '../actions.js';
 import { replaceUrl } from '../router.js';
 import { trackList, registerList } from '../components/track-row.js';
 import { isEditingMeta, metaForm, resetMetaEditor } from '../editing/inline-edit.js';
@@ -20,8 +19,6 @@ import { empty } from '../components/empty.js';
 import { playlistUrl, userUrl, relTime, isoTs, plural, signInUrl, localUrl } from '../format.js';
 
 const FRESH_MS = 30000;
-const related = new Map(); // playlistId -> { open, items, error, loading } (F's interim list)
-let rerender = () => {};
 
 export function playlistIdFrom(ctx) {
   if (ctx.name === 'crate') return state.auth.crateId;
@@ -30,7 +27,6 @@ export function playlistIdFrom(ctx) {
 }
 
 export async function load(ctx) {
-  rerender = ctx.rerender;
   if (ctx.name === 'crate' && !state.auth.signedIn) return;
   const id = playlistIdFrom(ctx);
   if (!id) throw new api.ApiError(404, 'playlist_not_found', 'Playlist not found');
@@ -57,7 +53,6 @@ export async function load(ctx) {
       }
     });
   }
-  if (ctx.hash === 'related' && !slots.has('playlist.related')) openRelated(id);
 }
 
 export function title(ctx) {
@@ -65,40 +60,6 @@ export function title(ctx) {
   const p = id && state.playlists.get(id);
   if (!p) return ctx.name === 'crate' ? 'Crate' : 'Playlist';
   return p.kind === 'crate' ? 'Crate' : p.meta.title;
-}
-
-async function openRelated(id) {
-  const cur = related.get(id) || {};
-  related.set(id, { ...cur, open: true, loading: !cur.items });
-  rerender();
-  if (cur.items) return;
-  try {
-    const res = await api.get(`/api/playlists/${id}/related`, { limit: 12 });
-    related.set(id, { open: true, items: res.related || [], loading: false });
-  } catch (err) {
-    related.set(id, { open: true, items: [], loading: false, error: err.status === 404 ? 'soon' : err.detail });
-  }
-  rerender();
-}
-
-function relatedInterim(id, count) {
-  const r = related.get(id) || {};
-  const label = `${plural(count, 'playlist')} share${count === 1 ? 's' : ''} these tracks`;
-  return html`<div class="related-line" id="related">
-    <button type="button" class="link-btn" data-action="pl-related-basic" data-playlist-id=${id}
-      aria-expanded=${r.open ? 'true' : 'false'}>${label}</button>
-    ${r.open
-      ? r.loading
-        ? html`<p class="loading">Loading…</p>`
-        : r.error
-          ? html`<p class="quiet-line">${r.error === 'soon' ? 'Related playlists are on their way.' : r.error}</p>`
-          : html`<ul class="lines section">${(r.items || []).map((it) => html`<li class="line">
-              <span class="line-text"><a href=${playlistUrl(it.playlist.id, it.playlist.title)}>${it.playlist.title}</a>
-                ${it.playlist.user ? html`<span class="muted"> by </span><a class="hop" href=${userUrl(it.playlist.user.username)}>@${it.playlist.user.username}</a>` : nothing}</span>
-              <span class="num muted">${it.shared_count} shared</span>
-            </li>`)}</ul>`
-      : nothing}
-  </div>`;
 }
 
 function signedOutCrate() {
@@ -150,9 +111,7 @@ export function render(ctx) {
           <svg class="i"><use href="#i-more"></use></svg></button>
         ${mine ? undoButtons() : nothing}
       </div>
-      ${!crate && relatedCount > 0
-        ? slots.has('playlist.related') ? slots.render('playlist.related', { ...sctx, relatedCount }) : relatedInterim(id, relatedCount)
-        : nothing}
+      ${!crate && relatedCount > 0 ? slots.render('playlist.related', { ...sctx, relatedCount }) : nothing}
     </header>
     <section class="section" aria-label="Tracks">
       ${rows.length
@@ -185,17 +144,5 @@ function emptyEditable(id, key, crate, title) {
 }
 
 export function unmount() {
-  related.clear();
   resetMetaEditor();
 }
-
-registerActions({
-  'pl-related-basic': (el, e, ctx) => {
-    const id = Number(el.dataset.playlistId || ctx.playlistId);
-    const r = related.get(id);
-    if (r && r.open) {
-      related.set(id, { ...r, open: false });
-      rerender();
-    } else openRelated(id);
-  },
-});

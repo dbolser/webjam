@@ -5,6 +5,8 @@
 //   toggle()  next()  prev()  seek(seconds)  jumpToEnd(lead = 10)  previewSeam(bIndex)
 //   current() -> the item playing (or null)
 //   renderBar()                           draws the player bar (main.js calls it on store changes)
+//   toggleRepeat()  toggleSmallVideo()    ported from the classic UI at cutover: repeat one track,
+//                                         and a small, low-data video tile (remembered per browser)
 
 import { html, render, nothing, ref } from '../lit.js';
 import { state, update } from '../store.js';
@@ -30,6 +32,44 @@ let pendingTail = null; // lead seconds: seek to (end ?? duration) - lead once t
 let playedMs = 0;
 let lastTick = 0;
 const counted = new Set();
+let repeatOne = false;
+let smallVideo = readPref('webjam.smallVideo');
+
+function readPref(key) {
+  try { return localStorage.getItem(key) === '1'; } catch { return false; }
+}
+
+function writePref(key, on) {
+  try { localStorage.setItem(key, on ? '1' : '0'); } catch { /* private mode */ }
+}
+
+function applySmallVideo() {
+  document.body.classList.toggle('video-small', smallVideo);
+  if (yt && smallVideo) {
+    try { yt.setPlaybackQuality('small'); } catch { /* not supported */ }
+  }
+}
+
+export function isRepeating() {
+  return repeatOne;
+}
+
+export function isSmallVideo() {
+  return smallVideo;
+}
+
+export function toggleRepeat() {
+  repeatOne = !repeatOne;
+  update(null, 'player');
+  toast.show(repeatOne ? 'Repeating this track' : 'Repeat off');
+}
+
+export function toggleSmallVideo() {
+  smallVideo = !smallVideo;
+  writePref('webjam.smallVideo', smallVideo);
+  applySmallVideo();
+  update(null, 'player');
+}
 
 export function current() {
   const p = state.player;
@@ -50,7 +90,10 @@ function ensurePlayer() {
       height: '100%',
       playerVars: { playsinline: 1, rel: 0, modestbranding: 1, origin: location.origin },
       events: {
-        onReady: () => resolve(yt),
+        onReady: () => {
+          applySmallVideo();
+          resolve(yt);
+        },
         onStateChange: (e) => onState(e.data),
         onError: (e) => onError(e.data),
       },
@@ -146,6 +189,14 @@ function onError(code) {
 function handleEnd() {
   const item = current();
   if (item) countPlay(item);
+  if (repeatOne && item && yt) {
+    endedToken = -1;
+    try {
+      yt.seekTo(item.start || 0, true);
+      yt.playVideo();
+    } catch { /* ignore */ }
+    return;
+  }
   const p = state.player;
   if (p.index < p.queue.length - 1) {
     next({ auto: true });
@@ -412,6 +463,14 @@ export function renderBar() {
         : nothing}
     </div>
     <div class="pbar-extra">
+      <button type="button" class="icon-btn" data-action="player-crate" aria-label="Add this track to your crate"
+        title="Add to crate"><svg class="i"><use href="#i-crate"></use></svg></button>
+      <button type="button" class="icon-btn ${repeatOne ? 'is-on' : ''}" data-action="player-repeat"
+        aria-pressed=${repeatOne ? 'true' : 'false'} aria-label="Repeat this track" title="Repeat this track">
+        <svg class="i"><use href="#i-repeat"></use></svg></button>
+      <button type="button" class="icon-btn ${smallVideo ? 'is-on' : ''}" data-action="player-small-video"
+        aria-pressed=${smallVideo ? 'true' : 'false'} aria-label="Small video, low data" title="Small video, low data">
+        <svg class="i"><use href="#i-small-video"></use></svg></button>
       <button type="button" class="icon-btn" data-action="player-seam" aria-label="Preview the seam into the next track"
         title="Preview the seam (N)" ?disabled=${p.index >= p.queue.length - 1}>
         <svg class="i"><use href="#i-seam"></use></svg></button>

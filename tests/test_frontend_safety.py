@@ -4,7 +4,10 @@ They guard static/index.html and every static/js/**/*.js file:
 templates are lit-html (auto-escaping), there are no HTML sinks, no inline handlers or styles,
 fetch goes through api.js (which adds the X-Webjam CSRF header), imports are relative and
 resolve, the vendored lit-html is pinned, and every href binding goes through a URL helper.
-The legacy UI keeps its own checks in tests/test_legacy_frontend_safety.py until cutover.
+
+After the Phase 1b cutover (§7.3) this file also checks that the classic UI is gone for good, that
+all three lanes are wired in, and (with node) that every data-action used in a template has a
+handler once every module is loaded (tests/js/wiring_smoke.mjs).
 """
 
 import re
@@ -21,7 +24,9 @@ INDEX_HTML = STATIC / "index.html"
 VENDOR = STATIC / "vendor" / "lit-html"
 
 JS_FILES = sorted(JS_DIR.rglob("*.js"))
-URL_HELPERS = ("trackUrl(", "playlistUrl(", "userUrl(", "localUrl(", "iconHref(")
+URL_HELPERS = ("trackUrl(", "playlistUrl(", "userUrl(", "localUrl(", "iconHref(", "signInUrl(")
+# Literal prefixes allowed before a data binding inside an href (the binding can't change the origin).
+HREF_LITERAL_PREFIXES = ("/", "#", "https://www.youtube.com/", "mailto:")
 
 
 def _rel(path: Path) -> str:
@@ -151,8 +156,39 @@ def sources():
 def test_js_tree_exists():
     for name in ("main.js", "lit.js", "api.js", "store.js", "router.js", "actions.js", "slots.js", "keys.js",
                  "paste-router.js", "format.js", "components/track-row.js", "player/player.js",
-                 "player/youtube.js", "panels/dock.js", "panels/crate.js", "views/home.js", "views/playlist.js"):
+                 "player/youtube.js", "player/seam.js", "panels/dock.js", "panels/crate.js",
+                 "views/home.js", "views/playlist.js", "views/track.js", "views/profile.js",
+                 "views/discover.js", "views/search.js",
+                 "editing/index.js", "editing/selection.js", "editing/clipboard.js", "editing/dnd.js",
+                 "editing/move-to.js", "editing/undo.js", "editing/inline-edit.js", "editing/cheatsheet.js",
+                 "discovery/index.js", "discovery/related.js", "discovery/likes.js", "discovery/comments.js",
+                 "discovery/badges.js",
+                 "share/index.js", "share/share-popover.js", "share/fork.js", "import/import-sheet.js",
+                 "import/paste-to-crate.js", "crate/crate-actions.js", "account/signin-intent.js"):
         assert (JS_DIR / name).is_file(), name
+
+
+# 0. Cutover: the classic UI is gone, and nothing points at it.
+def test_classic_ui_is_deleted():
+    for gone in ("app.js", "styles.css", "classic.html", "legacy"):
+        assert not (STATIC / gone).exists(), f"static/{gone} should be deleted"
+    assert not (JS_DIR / "views" / "interim.js").exists()
+    assert not (ROOT / "tests" / "test_legacy_frontend_safety.py").exists()
+
+
+def test_nothing_outside_static_references_the_classic_ui():
+    rx = re.compile(r"static/(?:legacy/|app\.js|styles\.css|classic\.html)")
+    offenders = []
+    for base in (ROOT / "app", ROOT / "tests"):
+        for path in base.rglob("*"):
+            if path.suffix not in (".py", ".mjs", ".js", ".html", ".toml", ".cfg") or "__pycache__" in path.parts:
+                continue
+            for m in rx.finditer(_read(path)):
+                offenders.append(f"{_rel(path)}:{_line_of(_read(path), m.start())}")
+    # This file names the paths to check they are gone.
+    offenders = [o for o in offenders if not o.startswith("tests/test_frontend_safety.py") and
+                 not o.startswith("tests/test_shell_routes.py")]
+    assert not offenders, offenders
 
 
 # 1. No HTML sinks or string evaluation.
@@ -255,9 +291,12 @@ def test_no_javascript_urls(path):
 # 5. fetch only in api.js, which sends the CSRF header on writes.
 def test_fetch_only_in_api_js(sources):
     for path, src in sources.items():
+        code = _strip_comments(src)
+        for rx in (r"\bXMLHttpRequest\b", r"\bsendBeacon\b", r"\bnew\s+WebSocket\b", r"\bEventSource\b"):
+            assert not re.search(rx, code), f"{_rel(path)}: {rx} bypasses api.js"
         if path == JS_DIR / "api.js":
             continue
-        assert not re.search(r"\bfetch\s*\(", _strip_comments(src)), f"{_rel(path)} calls fetch()"
+        assert not re.search(r"\bfetch\s*\(", code), f"{_rel(path)} calls fetch()"
     api = _read(JS_DIR / "api.js")
     assert re.search(r"""\[\s*['"]X-Webjam['"]\s*\]\s*=\s*['"]1['"]""", api) or "'X-Webjam': '1'" in api
     assert re.search(r"if \(method !== 'GET'\) \{\s*headers\['X-Webjam'\] = '1';", api), \
@@ -328,6 +367,37 @@ def test_href_bindings_use_url_helpers(sources):
     assert not offenders, offenders
 
 
+def test_href_literals_with_bindings_keep_a_fixed_origin(sources):
+    """href="https://www.youtube.com/watch?v=${vid}" is fine; href="${x}/..." or "http${...}" is not."""
+    rx = re.compile(r"""\bhref\s*=\s*(["'])([^"']*?)\$\{""")
+    offenders = []
+    for path, src in sources.items():
+        code = _strip_comments(src)
+        for off, body in _templates(code):
+            for m in rx.finditer(body):
+                prefix = m.group(2)
+                if not prefix.startswith(HREF_LITERAL_PREFIXES) or prefix in ("/",):
+                    offenders.append(f"{_rel(path)}:{_line_of(src, off)}: href={m.group(1)}{prefix}${{…")
+    assert not offenders, offenders
+
+
+def test_new_tab_links_drop_the_opener(sources):
+    offenders = []
+    for path, src in sources.items():
+        code = _strip_comments(src)
+        for off, body in _templates(code):
+            for m in re.finditer(r"<a\b[^>]*target=\"_blank\"[^>]*>", _static_parts(body)):
+                if "noopener" not in m.group(0):
+                    offenders.append(f"{_rel(path)}:{_line_of(src, off)}")
+    assert not offenders, offenders
+
+
+def test_owner_vocabulary():
+    """The owner's brief: say "preview", never "audition"."""
+    for path in JS_FILES + [INDEX_HTML] + sorted((STATIC / "styles").glob("*.css")):
+        assert "audition" not in _read(path).lower(), _rel(path)
+
+
 # 9. Syntax.
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH")
 @pytest.mark.parametrize("path", JS_FILES, ids=lambda p: _rel(p))
@@ -336,14 +406,39 @@ def test_node_check(path):
     assert res.returncode == 0, res.stderr
 
 
-# Lane wiring: main.js imports F's registrations before the (commented) lane entry modules.
+# Lane wiring: main.js imports F's registrations, then every lane entry module (none commented out).
 def test_main_imports_core_before_lanes():
     main = _read(JS_DIR / "main.js")
     core = main.index("import './core.js';")
     routes = main.index("import './routes.js';")
     for lane in ("editing/index.js", "discovery/index.js", "share/index.js"):
-        assert lane in main, lane
-        assert main.index(lane) > max(core, routes), lane
+        m = re.search(r"^import '\./" + re.escape(lane) + r"';", main, re.M)
+        assert m, f"{lane} is not imported"
+        assert m.start() > max(core, routes), lane
+
+
+def test_routes_point_at_the_real_views():
+    routes = _read(JS_DIR / "routes.js")
+    for view in ("home", "discover", "search", "playlist", "track", "profile", "not-found"):
+        assert f"import('./views/{view}.js')" in routes, view
+
+
+def test_main_script_is_cache_busted():
+    html = _read(INDEX_HTML)
+    assert re.search(r'src="/static/js/main\.js\?v=[\w.-]+"', html), "bump ?v= whenever main.js changes"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH")
+def test_every_module_loads_and_every_data_action_has_a_handler(sources):
+    used = set()
+    for src in sources.values():
+        used.update(re.findall(r'data-action="([a-z0-9-]+)"', _strip_comments(src)))
+    res = subprocess.run(
+        ["node", str(ROOT / "tests" / "js" / "wiring_smoke.mjs"), str(JS_DIR), ",".join(sorted(used))],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert res.returncode == 0, res.stderr or res.stdout
+    assert "wiring smoke ok" in res.stdout
 
 
 def test_stylesheets_linked_for_every_lane():

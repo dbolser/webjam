@@ -15,7 +15,6 @@
 // already show them inline.
 
 import { state, subscribe } from '../store.js';
-import * as api from '../api.js';
 import * as slots from '../slots.js';
 import { toast } from '../ui/toast.js';
 import { signInUrl, localUrl, isVideoId } from '../format.js';
@@ -131,9 +130,12 @@ async function replay(intent) {
   }
   if (intent.action === 'like') {
     try {
-      if (p.playlist_id) await api.post(`/api/playlists/${Number(p.playlist_id)}/like`, { count: 1 });
-      else if (p.video_id) await api.post(`/api/songs/${encodeURIComponent(p.video_id)}/like`, { count: 1 });
-      toast.show('Liked');
+      // Through Lane B's likes module so the ♡ on screen updates too.
+      const { toggleLike } = await import('../discovery/likes.js');
+      const res = p.playlist_id
+        ? await toggleLike('playlist', Number(p.playlist_id), { add: true })
+        : p.video_id ? await toggleLike('song', p.video_id, { add: true }) : null;
+      if (res) toast.show('Liked');
     } catch (err) {
       if (!err.handled) toast.show(err.detail || 'Could not like that.');
     }

@@ -8,6 +8,7 @@ import { html, render, nothing } from '../lit.js';
 import { registerActions } from '../actions.js';
 
 let open = null; // { opts, trigger }
+let closing = null; // the entry a pending (async) 'close' event belongs to
 let wired = false;
 
 function dialog() {
@@ -39,20 +40,36 @@ export function openSheet(opts) {
   if (!d) return { close() {}, rerender() {} };
   if (!wired) {
     wired = true;
+    // The dialog's 'close' event is dispatched asynchronously. If another sheet opened in the
+    // meantime, the event belongs to the old one: run its onClose, but leave the new sheet alone.
     d.addEventListener('close', () => {
-      const was = open;
-      open = null;
-      draw();
-      if (was && was.trigger && was.trigger.focus && document.contains(was.trigger)) {
-        was.trigger.focus({ preventScroll: true });
+      const was = closing || open;
+      closing = null;
+      if (open === was) {
+        open = null;
+        draw();
+        if (was && was.trigger && was.trigger.focus && document.contains(was.trigger)) {
+          was.trigger.focus({ preventScroll: true });
+        }
       }
       if (was && typeof was.opts.onClose === 'function') {
         try { was.opts.onClose(d.returnValue); } catch (err) { console.error(err); }
       }
     });
   }
-  if (open && d.open) d.close();
-  open = { opts, trigger: document.activeElement };
+  let trigger = document.activeElement;
+  if (open && d.open) {
+    // Swap the content in place instead of closing and reopening the dialog.
+    const prev = open;
+    trigger = prev.trigger;
+    open = null;
+    if (typeof prev.opts.onClose === 'function') {
+      try { prev.opts.onClose('replaced'); } catch (err) { console.error(err); }
+    }
+  } else if (open && !closing) {
+    closing = open; // closed, but its 'close' event hasn't fired yet
+  }
+  open = { opts, trigger };
   d.setAttribute('aria-labelledby', 'sheet-title');
   draw();
   if (!d.open) d.showModal();
@@ -63,7 +80,10 @@ export function openSheet(opts) {
 
 export function closeSheet(value = '') {
   const d = dialog();
-  if (d && d.open) d.close(value);
+  if (d && d.open) {
+    closing = open;
+    d.close(value);
+  }
 }
 
 export function rerenderSheet() {

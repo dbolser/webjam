@@ -10,6 +10,7 @@ import { html, render, nothing } from '../lit.js';
 import { state, update } from '../store.js';
 import { playlistUrl } from '../format.js';
 import { newPlaylistForm } from '../components/new-playlist.js';
+import * as slots from '../slots.js';
 
 export function chips() {
   const d = state.dock;
@@ -86,6 +87,10 @@ export function renderDock() {
             data-drop-target="new">
             <span class="chip-slot"><svg class="i"><use href="#i-plus"></use></svg></span>
             <span class="chip-label">New playlist</span></button>`}</li>
+      ${slots.has('import.open')
+        ? html`<li class="dock-import"><button type="button" class="link-btn dock-import-btn" data-action="import-open"
+            data-target="crate">Import from YouTube…</button></li>`
+        : nothing}
     </ul>`, el);
 }
 

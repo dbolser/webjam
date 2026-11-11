@@ -51,7 +51,7 @@ for (const n of ['topbar.account', 'home.top', 'playlist.actions', 'playlist.men
 }
 for (const a of ['import-open', 'share-open', 'share-copy', 'share-text', 'crate-unload', 'crate-unload-to',
   'crate-promote', 'crate-promote-submit', 'crate-clear-unloaded', 'crate-fold', 'account-menu', 'handle-save',
-  'handle-keep', 'persona-create', 'settings-save', 'signout']) {
+  'handle-keep', 'persona-create', 'signout']) {
   assert.ok(actions.hasAction(a), `action ${a}`);
 }
 assert.equal(keys.listKeys().filter((k) => k.combo === 's').length, 1, 'S shares');
@@ -87,11 +87,12 @@ assert.equal(handleProblem('dan_b'), '');
 assert.ok(handleProblem('da'));
 assert.ok(handleProblem('dan-b'));
 
-// Menus: fork for everyone (not the crate); settings and delete only for the owner.
+// Menus: fork for everyone (not the crate). Details and delete come from Lane A (editing/index.js).
 state.playlists.set(2, { meta: { id: 2, title: 'T', visibility: 'public', username: 'maya' }, order: [], kind: 'playlist', ownerId: 3 });
 const labels = (ctx) => slots.render('playlist.menu', ctx).map((i) => (typeof i === 'string' ? i : i.label));
 assert.deepEqual(labels({ playlistId: 2, mine: false, crate: false }), ['Copy all to a new playlist']);
-assert.ok(labels({ playlistId: 2, mine: true, crate: false }).includes('Settings…'));
+assert.deepEqual(labels({ playlistId: 2, mine: true, crate: false }), ['Duplicate playlist']);
+assert.equal(slots.render('track.actions', { videoId: 'c_56qQqxvm4' }).length, 1, 'Share on the track page');
 assert.deepEqual(labels({ playlistId: 5, mine: true, crate: true }), []);
 assert.equal(slots.render('playlist.actions', { playlistId: 5, crate: true }).length, 0, 'no Share on the crate');
 
