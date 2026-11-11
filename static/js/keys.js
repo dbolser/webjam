@@ -8,6 +8,8 @@
 //        key whose character needs Shift ('?', '#').
 // when:  'always' | 'list' (focus in a [role=listbox] list) | 'editable' (that list has
 //        data-editable) | 'player' (focus in the player bar), or an array of them.
+// label/group: shown in the ? sheet (omit label to keep a binding out of it); display: optional text
+//        shown instead of the combo.
 // run(event, ctx): return false to pass the key on to the next handler; anything else handles it
 //        (preventDefault). ctx = { row, list, trackId, playlistId, videoId, index }.
 // Later registrations run first, so a lane can extend a key (Esc) by registering it again.
@@ -44,9 +46,10 @@ export function registerKeys(list) {
   }
 }
 
-/** Every registration, for the ? cheat sheet: [{ combo, label, group, when }]. */
+/** Every registration, for the ? cheat sheet: [{ combo, label, group, when, display }].
+ *  `display` (optional) replaces the combo's label in the sheet, e.g. '0–9' for ten digit bindings. */
 export function listKeys() {
-  return bindings.filter((b) => b.label).map(({ combo, label, group, when }) => ({ combo, label, group, when })).reverse();
+  return bindings.filter((b) => b.label).map(({ combo, label, group, when, display }) => ({ combo, label, group, when, display })).reverse();
 }
 
 export function comboLabel(combo) {
