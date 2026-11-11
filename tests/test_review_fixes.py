@@ -31,7 +31,7 @@ from test_security_backend import (  # noqa: F401  (fixtures are used by name)
 ROOT = Path(__file__).resolve().parent.parent
 # The `fakes` fixture swaps httpx.AsyncClient (module-wide) for a fake Google client.
 REAL_ASYNC_CLIENT = httpx.AsyncClient
-APP_JS = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+APP_JS = (ROOT / "static" / "legacy" / "app.js").read_text(encoding="utf-8")
 
 
 def sign_in_as(client, sub, email, name):
