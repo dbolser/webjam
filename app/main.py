@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import ipaddress
 import logging
 import re
@@ -10,13 +11,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
-from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import httpx
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -40,9 +41,35 @@ from app.auth import (
     validate_handle,
 )
 
+from app import ops
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
 from app.database import get_connection, get_db, init_db
+from app.errors import ApiError
 from app.invite import list_invites, seed_invites_from_env
+from app.ops import (
+    Actor,
+    DbId,
+    Op,
+    OpIdStr,
+    VideoLookupFailed,
+    VideoLookupUnavailable,
+    apply_ops,
+    ensure_crate,
+    new_ulid,
+    parse_ops,
+    require_playlist_role,
+    undo_state,
+)
+from app.paste import resolve_paste
+from app.visibility import (
+    is_linkable,
+    is_listed,
+    linkable,
+    listed,
+    require_visible_playlist,
+    song_visible,
+    visible,
+)
 from app.youtube import (
     MAX_CLIP_SECONDS,
     SearchBudgetExceeded,
@@ -72,9 +99,7 @@ MAX_URL_BLOB = 100_000  # urls_or_ids / initial_urls / source_input
 MAX_ENTRIES_PER_REQUEST = 50
 MAX_TRACKS_PER_PLAYLIST = 1000
 MAX_BODY_BYTES = 256 * 1024
-# A 1000-row snapshot (undo) is larger than an ordinary request.
-SNAPSHOT_PATH = re.compile(r"^/api/playlists/\d+/snapshot$")
-MAX_SNAPSHOT_BODY_BYTES = 1024 * 1024
+MAX_PASTE_HTML = 256 * 1024
 COMMENTS_PAGE_SIZE = 50
 
 # --- Rate limits: bucket -> (burst capacity, tokens refilled per second) ---
@@ -87,6 +112,8 @@ RATE_LIMITS: Dict[str, Tuple[float, float]] = {
     "like": (60, 1.0),
     "play": (60, 1.0),
     "audit": (5, 5 / 60),
+    # /api/ops, undo and redo (the "add" bucket is also charged when a batch needs YouTube lookups).
+    "ops": (120, 2.0),
 }
 PLAY_DEDUPE_SECONDS = 30 * 60
 PLAY_BADGE_EVAL_INTERVAL = 60
@@ -313,7 +340,7 @@ class BodySizeLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
             return await self.app(scope, receive, send)
-        limit = MAX_SNAPSHOT_BODY_BYTES if SNAPSHOT_PATH.match(scope.get("path", "")) else MAX_BODY_BYTES
+        limit = MAX_BODY_BYTES
         declared = Headers(scope=scope).get("content-length")
         if declared is not None and (not declared.isdigit() or int(declared) > limit):
             return await _send_json(scope, receive, send, 413, "Request body too large.")
@@ -418,19 +445,24 @@ async def _integer_out_of_range(request: Request, exc: OverflowError):
     return JSONResponse({"detail": "A number in the request is out of range."}, status_code=400)
 
 
+@app.exception_handler(ApiError)
+async def _api_error(request: Request, exc: ApiError):
+    return JSONResponse(exc.body(), status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(ValidationError)
+async def _server_built_op_invalid(request: Request, exc: ValidationError):
+    # A legacy endpoint built an op from out-of-range client values (e.g. a huge source_playlist_id).
+    return JSONResponse({"detail": "A value in the request is out of range.", "code": "bad_op"}, status_code=400)
+
+
 def now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def require_playlist_owner(conn: sqlite3.Connection, playlist_id: int, user_id: int) -> sqlite3.Row:
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if pl["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Only the playlist creator can change this playlist")
-    return pl
+    """Owner-only checks that aren't ops (audit-embeds, import target): 404 if not visible, else 403."""
+    return require_playlist_role(conn, playlist_id, Actor(user_id), "owner")
 
 
 GUEST_USER = {
@@ -476,11 +508,15 @@ class UpdateHandleRequest(BaseModel):
     handle: Annotated[str, Field(max_length=64)]
 
 
+Visibility = Literal["public", "unlisted", "private"]
+
+
 class CreatePlaylistRequest(BaseModel):
     user_id: Optional[int] = None
     title: Title
     description: Optional[LongText] = ""
     initial_urls: Optional[UrlBlob] = ""
+    visibility: Visibility = "public"
 
 
 class UpdatePlaylistRequest(BaseModel):
@@ -510,6 +546,8 @@ class UpdateTrackRequest(BaseModel):
     direction: Optional[Annotated[str, Field(max_length=8)]] = None  # 'up' or 'down'
     new_video_id: Optional[VideoRef] = None
     custom_title: Optional[Title] = None
+    # Optional undo group shared by several calls (auto-migrate: one Ctrl+Z reverts the whole run).
+    group_id: Optional[OpIdStr] = None
 
 
 class InspectPlaylistImportRequest(BaseModel):
@@ -540,31 +578,6 @@ class ReorderTracksRequest(BaseModel):
     track_ids: Annotated[List[int], Field(max_length=MAX_TRACKS_PER_PLAYLIST)]
 
 
-class SnapshotTrackItem(BaseModel):
-    id: Optional[Annotated[int, Field(ge=1, le=2**53)]] = None
-    video_id: Annotated[str, Field(max_length=32)]
-    position: Optional[int] = None
-    track_note: Optional[LongText] = ""
-    start_seconds: ClipSeconds = None
-    end_seconds: ClipSeconds = None
-    migrated_from_video_id: Optional[Annotated[str, Field(max_length=32)]] = None
-    migrated_from_title: Optional[Annotated[str, Field(max_length=500)]] = None
-    display_title: Optional[Title] = None
-    # Attribution fields are accepted for compatibility but never trusted: rows keep
-    # the attribution they already had on the server, new rows get the actor/now.
-    added_by_user_id: Optional[int] = None
-    source_playlist_id: Optional[int] = None
-    source_user_id: Optional[int] = None
-    created_at: Optional[Annotated[str, Field(max_length=64)]] = None
-
-
-class RestorePlaylistSnapshotRequest(BaseModel):
-    user_id: Optional[int] = None
-    title: Title
-    description: Optional[LongText] = ""
-    tracks: List[SnapshotTrackItem]
-
-
 class ToggleLikeRequest(BaseModel):
     user_id: Optional[int] = None
     count: int = 1
@@ -572,6 +585,7 @@ class ToggleLikeRequest(BaseModel):
 
 
 class RecordPlayRequest(BaseModel):
+    user_id: Optional[int] = None  # demo mode: who is listening (private playlists need the owner)
     video_id: Optional[Annotated[str, Field(max_length=32)]] = None
     count: int = 1  # ignored: every play counts once
 
@@ -583,17 +597,61 @@ class CreateCommentRequest(BaseModel):
     body: Annotated[str, Field(max_length=MAX_COMMENT)]
 
 
+class OpsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: Optional[int] = None  # demo mode only
+    op_id: OpIdStr
+    group_id: Optional[OpIdStr] = None
+    expected_versions: Optional[Dict[DbId, Annotated[int, Field(ge=0, le=2**53)]]] = None
+    ops: Annotated[List[Op], Field(min_length=1, max_length=200)]
+
+
+class UndoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: Optional[int] = None
+    group_id: Optional[Annotated[str, Field(max_length=64)]] = None
+    skip: bool = False
+
+
+class PromoteRequest(BaseModel):
+    user_id: Optional[int] = None
+    title: Annotated[str, Field(max_length=1000)]
+    description: Optional[LongText] = ""
+    visibility: Visibility = "public"
+    track_ids: Optional[Annotated[List[DbId], Field(max_length=MAX_TRACKS_PER_PLAYLIST)]] = None
+
+
+class DockRequest(BaseModel):
+    user_id: Optional[int] = None
+    pinned: Annotated[List[DbId], Field(max_length=100)]
+
+
+class ResolvePasteRequest(BaseModel):
+    user_id: Optional[int] = None
+    text: UrlBlob = ""
+    html: Optional[Annotated[str, Field(max_length=MAX_PASTE_HTML)]] = None
+
+
+class ForkRequest(BaseModel):
+    user_id: Optional[int] = None
+    title: Optional[Annotated[str, Field(max_length=1000)]] = None
+    visibility: Optional[Visibility] = None  # default: the source's visibility
+
+
 # --- Helper query functions ---
 
 def fetch_all_users_summary(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT u.id, u.username, u.display_name, u.bio, u.avatar_color, u.created_at,
-               (SELECT COUNT(*) FROM playlists p WHERE p.user_id = u.id) AS playlist_count,
+               (SELECT COUNT(*) FROM playlists p WHERE p.user_id = u.id AND {listed('p')}) AS playlist_count,
                (SELECT COUNT(*) FROM songs s WHERE s.first_added_by_user_id = u.id) AS songs_discovered,
                (SELECT COUNT(*) FROM user_badges ub WHERE ub.user_id = u.id) AS badge_count,
-               (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.source_user_id = u.id AND pt.added_by_user_id != u.id) AS times_grabbed
+               (SELECT COUNT(*) FROM playlist_tracks pt JOIN playlists tp ON tp.id = pt.playlist_id
+                 WHERE pt.source_user_id = u.id AND pt.added_by_user_id != u.id AND {listed('tp')}) AS times_grabbed
         FROM users u
         ORDER BY u.id ASC
         """
@@ -627,237 +685,106 @@ def fetch_comments_page(
     return list(reversed(rows[:limit])), has_more
 
 
-class VideoLookupFailed(Exception):
-    """YouTube had no metadata for this id (deleted, private or never existed)."""
-
-    reason = "not_found"
-
-
-class VideoLookupUnavailable(VideoLookupFailed):
-    """YouTube could not be asked right now (network error, 429/5xx). Worth retrying."""
-
-    reason = "youtube_unavailable"
-
-
-NOT_FOUND_DETAIL = "YouTube couldn't find that video (it may be private, deleted or mistyped)."
-UNAVAILABLE_DETAIL = "YouTube isn't answering right now. Please try again in a moment."
+NOT_FOUND_DETAIL = ops.NOT_FOUND_DETAIL
+UNAVAILABLE_DETAIL = ops.UNAVAILABLE_DETAIL
 
 
 def lookup_failure(exc: VideoLookupFailed) -> HTTPException:
-    if isinstance(exc, VideoLookupUnavailable):
-        return HTTPException(status_code=503, detail=UNAVAILABLE_DETAIL, headers={"Retry-After": "30"})
-    return HTTPException(status_code=400, detail=NOT_FOUND_DETAIL)
+    return ops.lookup_error(exc.reason)
 
 
-async def lookup_new_song_metadata(video_id: str) -> Dict[str, Any]:
-    meta = await fetch_youtube_metadata(video_id)
-    if meta and meta.get("status") == "UNAVAILABLE":
-        raise VideoLookupUnavailable(video_id)
-    if not meta or meta.get("status") == "NOT_FOUND" or not meta.get("title"):
-        raise VideoLookupFailed(video_id)
-    return meta
-
-
-def insert_song_if_new(
-    conn: sqlite3.Connection, video_id: str, meta: Dict[str, Any], user_id: int, playlist_id: int, ts: str
-) -> Tuple[bool, sqlite3.Row]:
-    """Insert a song row unless another request beat us to it. Returns (inserted, row)."""
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-        ON CONFLICT(video_id) DO NOTHING
-        """,
-        (video_id, meta["title"], meta["channel_title"], meta["thumbnail_url"], user_id, playlist_id, ts),
-    )
-    inserted = cur.rowcount > 0
-    row = cur.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,)).fetchone()
-    return inserted, row
-
-
-def clean_display_title(custom_title: Optional[str], song_title: Optional[str]) -> Optional[str]:
-    """A per-row title override, or None when it is empty or the same as the song's real title."""
-    title = (custom_title or "").strip()[:MAX_TITLE]
-    return title if title and title != (song_title or "") else None
-
-
-def ensure_playlist_capacity(conn: sqlite3.Connection, playlist_id: int, adding: int = 1) -> None:
-    row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
-    ).fetchone()
+def ensure_room(conn: sqlite3.Connection, playlist_id: int, adding: int = 1) -> None:
+    """Pre-check the 1000-track cap before spending YouTube lookups (apply_ops checks it again)."""
+    row = conn.execute("SELECT COUNT(*) AS cnt FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)).fetchone()
     if int(row["cnt"]) + adding > MAX_TRACKS_PER_PLAYLIST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Playlists can hold at most {MAX_TRACKS_PER_PLAYLIST} tracks.",
-        )
+        raise ApiError(400, "playlist_full", f"Playlists can hold at most {MAX_TRACKS_PER_PLAYLIST} tracks.")
 
 
 def ensure_entry_count(count: int) -> None:
     if count > MAX_ENTRIES_PER_REQUEST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Add at most {MAX_ENTRIES_PER_REQUEST} videos at a time.",
-        )
+        raise ApiError(400, "batch_too_large", f"Add at most {MAX_ENTRIES_PER_REQUEST} videos at a time.")
 
 
-def verified_source(
-    conn: sqlite3.Connection, source_playlist_id: Optional[int], video_id: str
-) -> Optional[Tuple[int, int]]:
-    """(source_playlist_id, owner_id) if that playlist exists and contains the video, else None."""
-    if not source_playlist_id:
-        return None
-    row = conn.execute(
-        """
-        SELECT p.id, p.user_id FROM playlists p
-        WHERE p.id = ? AND EXISTS (
-            SELECT 1 FROM playlist_tracks pt WHERE pt.playlist_id = p.id AND pt.video_id = ?
-        )
-        """,
-        (source_playlist_id, video_id),
-    ).fetchone()
-    return (row["id"], row["user_id"]) if row else None
+async def fetch_song_meta(conn: sqlite3.Connection, video_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """YouTube metadata for unknown videos, fetched before any write lock is taken.
+
+    Goes through this module's fetch_youtube_metadata (looked up at call time) so tests can fake it.
+    """
+    return await ops.prefetch_song_meta(conn, video_ids, lambda vid: fetch_youtube_metadata(vid))
 
 
-async def add_single_video_to_playlist(
+def server_batch_id() -> str:
+    return f"srv-{new_ulid()}"
+
+
+def legacy_added(conn: sqlite3.Connection, outcome: ops.OpsOutcome, playlist_id: int) -> List[Dict[str, Any]]:
+    """Inserted rows in the old add/import response shape."""
+    out = []
+    claimed_seen = set()
+    for res in outcome.results:
+        if res.get("kind") != "insert":
+            continue
+        for tid in res.get("track_ids") or []:
+            row = outcome.rows.get(tid)
+            if not row:
+                continue
+            occ = conn.execute(
+                "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ? AND video_id = ?",
+                (playlist_id, row["video_id"]),
+            ).fetchone()[0]
+            new_disc = row["video_id"] in outcome.claimed and row["video_id"] not in claimed_seen
+            if new_disc:
+                claimed_seen.add(row["video_id"])
+            out.append({
+                "track_id": tid,
+                "video_id": row["video_id"],
+                "title": row["title"],
+                "already_in_playlist": False,
+                "occurrences_in_playlist": int(occ or 1),
+                "is_new_discovery": new_disc,
+                "start_seconds": row["start_seconds"],
+                "end_seconds": row["end_seconds"],
+            })
+    return out
+
+
+def legacy_skipped(skipped: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [{"video_id": s["video_id"], "reason": s["reason"]} for s in skipped]
+
+
+def playlist_version(conn: sqlite3.Connection, playlist_id: int) -> Optional[int]:
+    row = conn.execute("SELECT version FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+    return int(row["version"]) if row else None
+
+
+def legacy_ref(
     conn: sqlite3.Connection,
-    playlist_id: int,
-    user_id: int,
+    source_playlist_id: Optional[int],
+    claimed_source_user_id: Optional[int],
     video_id: str,
-    track_note: str = "",
-    custom_title: Optional[str] = None,
-    start_seconds: Optional[int] = None,
-    end_seconds: Optional[int] = None,
-    migrated_from_video_id: Optional[str] = None,
-    migrated_from_title: Optional[str] = None,
-    source_playlist_id: Optional[int] = None,
-    source_user_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    cur = conn.cursor()
-    ts = now_str()
+) -> Optional[Dict[str, int]]:
+    """The provenance ref for an old-style grab; apply_ops verifies it (visible, contains the video).
 
-    if start_seconds is not None and end_seconds is not None and end_seconds <= start_seconds:
-        raise HTTPException(
-            status_code=400,
-            detail="End time must be greater than start time.",
-        )
+    A client-sent source_user_id is never stored; on its own it only means "credit the
+    song's first finder", which becomes a ref to the finder's debut playlist.
+    """
+    if source_playlist_id:
+        return {"playlist_id": source_playlist_id}
+    if claimed_source_user_id:
+        song = conn.execute(
+            "SELECT first_added_by_user_id, first_added_playlist_id FROM songs WHERE video_id = ?", (video_id,)
+        ).fetchone()
+        if song and song["first_added_by_user_id"] == claimed_source_user_id and song["first_added_playlist_id"]:
+            return {"playlist_id": song["first_added_playlist_id"]}
+    return None
 
-    ensure_playlist_capacity(conn, playlist_id)
 
-    # Check if song already exists in Webjam
-    cur.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,))
-    song_row = cur.fetchone()
-    is_new_discovery = False
-
-    if not song_row:
-        # songs.title always comes from YouTube; a custom title only applies to this row.
-        # Raises VideoLookupFailed before anything is written when YouTube has no such video.
-        meta = await lookup_new_song_metadata(video_id)
-        # Another request may have added the same new video while we were waiting on YouTube.
-        is_new_discovery, song_row = insert_song_if_new(conn, video_id, meta, user_id, playlist_id, ts)
-        song_title = song_row["title"]
-    else:
-        song_title = song_row["title"]
-
-    if is_new_discovery:
-        cur.execute(
-            """
-            INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-            VALUES (?, 'discovered_song', ?, 'song', ?, ?)
-            """,
-            (
-                user_id,
-                f"was the first on Webjam to add '{song_title}'",
-                video_id,
-                ts,
-            ),
-        )
-
-    display_title = clean_display_title(custom_title, song_title)
-
-    # Determine next position (songs can be added to a playlist as many times as desired!)
-    cur.execute(
-        "SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM playlist_tracks WHERE playlist_id = ?",
-        (playlist_id,),
+def ordinal_sql(alias: str = "pt") -> str:
+    """The 1-based position of a row in its playlist (positions are fractional sort keys)."""
+    return (
+        f"(SELECT COUNT(*) FROM playlist_tracks x WHERE x.playlist_id = {alias}.playlist_id AND "
+        f"(x.position < {alias}.position OR (x.position = {alias}.position AND x.id <= {alias}.id)))"
     )
-    next_pos = cur.fetchone()["next_pos"]
-
-    cur.execute(
-        """
-        INSERT INTO playlist_tracks
-        (playlist_id, video_id, position, added_by_user_id, track_note, start_seconds, end_seconds, migrated_from_video_id, migrated_from_title, display_title, source_playlist_id, source_user_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            playlist_id,
-            video_id,
-            next_pos,
-            user_id,
-            (track_note or "").strip(),
-            start_seconds,
-            end_seconds,
-            migrated_from_video_id if migrated_from_video_id and VIDEO_ID_PATTERN.match(migrated_from_video_id) else None,
-            (migrated_from_title or "").strip()[:500] or None,
-            display_title,
-            source_playlist_id,
-            source_user_id,
-            ts,
-        ),
-    )
-    inserted_track_id = cur.lastrowid
-
-    cur.execute(
-        "SELECT COUNT(*) AS cnt FROM playlist_tracks WHERE playlist_id = ? AND video_id = ?",
-        (playlist_id, video_id),
-    )
-    occurrences_in_playlist = int(cur.fetchone()["cnt"] or 1)
-
-    cur.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (ts, playlist_id))
-    cur.execute("SELECT title FROM playlists WHERE id = ?", (playlist_id,))
-    pl_title_row = cur.fetchone()
-    pl_title = pl_title_row["title"] if pl_title_row else "playlist"
-
-    if source_user_id and source_user_id != user_id:
-        cur.execute("SELECT username FROM users WHERE id = ?", (source_user_id,))
-        src_u = cur.fetchone()
-        src_uname = src_u["username"] if src_u else "someone"
-        cur.execute(
-            """
-            INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-            VALUES (?, 'grabbed_track', ?, 'playlist', ?, ?)
-            """,
-            (
-                user_id,
-                f"grabbed '{song_title}' from @{src_uname} into '{pl_title}'",
-                str(playlist_id),
-                ts,
-            ),
-        )
-    elif not is_new_discovery:
-        cur.execute(
-            """
-            INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-            VALUES (?, 'added_track', ?, 'playlist', ?, ?)
-            """,
-            (
-                user_id,
-                f"added '{song_title}' to '{pl_title}'",
-                str(playlist_id),
-                ts,
-            ),
-        )
-
-    conn.commit()
-    return {
-        "track_id": inserted_track_id,
-        "video_id": video_id,
-        "title": display_title or song_title,
-        "already_in_playlist": False,
-        "occurrences_in_playlist": occurrences_in_playlist,
-        "is_new_discovery": is_new_discovery,
-        "start_seconds": start_seconds,
-        "end_seconds": end_seconds,
-    }
 
 
 # --- API Endpoints ---
@@ -875,15 +802,21 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
         current_user = next((u for u in users if u["id"] == viewer_id), users[0])
     actual_uid = current_user["id"]
 
+    crate_id = None
+    if actual_uid:
+        crate_id = ensure_crate(conn, actual_uid)
+        conn.commit()
+
     badge_info = get_user_badge_progress(conn, actual_uid)
     cur = conn.cursor()
+    # Owner view: all of my playlists, crate first, with kind/visibility/version.
     cur.execute(
         """
-        SELECT p.id, p.title, p.description, p.plays, p.created_at, p.updated_at,
+        SELECT p.id, p.kind, p.visibility, p.version, p.title, p.description, p.plays, p.created_at, p.updated_at,
                (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count
         FROM playlists p
         WHERE p.user_id = ?
-        ORDER BY p.updated_at DESC, p.id DESC
+        ORDER BY (p.kind = 'crate') DESC, p.updated_at DESC, p.id DESC
         """,
         (actual_uid,),
     )
@@ -897,6 +830,8 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
             "badge_progress": badge_info["catalog"],
             "metrics": badge_info["metrics"],
             "playlists": my_playlists,
+            "crate_id": crate_id,
+            "undo": undo_state(conn, actual_uid),
         },
         "badge_catalog": BADGE_CATALOG,
         "auth": {
@@ -964,6 +899,7 @@ def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_
         ),
     )
     new_uid = cur.lastrowid
+    ensure_crate(conn, new_uid)
     conn.commit()
     return {"user_id": new_uid, "created": True, "username": clean_uname}
 
@@ -1004,23 +940,45 @@ def update_user_profile(
     return {"ok": True}
 
 
+def _song_visible_sql(video_expr: str, viewer: int) -> str:
+    """song_visible() as SQL: in a LISTED playlist, or in one of the viewer's own.
+
+    Claims are sticky (badge counts keep them), but a song is only listed where its page exists.
+    """
+    return (
+        f"EXISTS (SELECT 1 FROM playlist_tracks vpt JOIN playlists vp ON vp.id = vpt.playlist_id "
+        f"WHERE vpt.video_id = {video_expr} AND ({listed('vp')} OR vp.user_id = {int(viewer or 0)}))"
+    )
+
+
+def _public_song_sql(video_expr: str) -> str:
+    """EXISTS a LISTED playlist containing the video (a song anyone may see named)."""
+    return (
+        f"EXISTS (SELECT 1 FROM playlist_tracks xpt JOIN playlists xp ON xp.id = xpt.playlist_id "
+        f"WHERE xpt.video_id = {video_expr} AND {listed('xp')})"
+    )
+
+
 @app.get("/api/feed")
 def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
     user_id = resolve_viewer(request, user_id)
     cur = conn.cursor()
 
-    # 1. All playlists with curator info, track count, likes, grabs
+    # 1. Public playlists with curator info, track count, likes, grabs
     cur.execute(
-        """
-        SELECT p.id, p.user_id, p.title, p.description, p.plays, p.created_at, p.updated_at,
+        f"""
+        SELECT p.id, p.user_id, p.kind, p.visibility, p.version, p.title, p.description, p.plays,
+               p.created_at, p.updated_at,
                u.username, u.display_name, u.avatar_color,
                (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count,
                (SELECT COALESCE(SUM(pl.count), 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id) AS like_count,
                (SELECT COALESCE(pl.count, 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id AND pl.user_id = ?) AS my_likes,
-               (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id) AS times_grabbed_from,
+               (SELECT COUNT(*) FROM playlist_tracks pt JOIN playlists tp ON tp.id = pt.playlist_id
+                 WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id AND {listed('tp')}) AS times_grabbed_from,
                (SELECT COUNT(*) FROM comments c WHERE c.target_type = 'playlist' AND c.target_id = CAST(p.id AS TEXT)) AS comment_count
         FROM playlists p
         JOIN users u ON u.id = p.user_id
+        WHERE {listed('p')}
         ORDER BY p.updated_at DESC, p.id DESC
         """,
         (user_id,),
@@ -1042,24 +1000,30 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
         )
         pl["liked_by_users"] = [dict(r) for r in cur.fetchall()]
         cur.execute(
-            """
-            SELECT pt.id, pt.video_id, pt.position, pt.track_note,
-                   pt.start_seconds, pt.end_seconds,
-                   pt.migrated_from_video_id, pt.migrated_from_title,
-                   COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, pt.display_title,
+            f"""
+            WITH ordered AS (
+                SELECT pt.*, ROW_NUMBER() OVER (ORDER BY pt.position ASC, pt.id ASC) AS ordinal
+                FROM playlist_tracks pt WHERE pt.playlist_id = ?
+            )
+            SELECT o.id, o.video_id, o.ordinal AS position, o.track_note,
+                   CAST(o.start_seconds AS INTEGER) AS start_seconds, CAST(o.end_seconds AS INTEGER) AS end_seconds,
+                   o.migrated_from_video_id, o.migrated_from_title,
+                   COALESCE(o.display_title, s.title) AS title, s.title AS song_title, o.display_title,
                    s.channel_title, s.thumbnail_url, s.first_added_by_user_id,
-                   su.username AS source_username,
+                   o.source_user_id, su.username AS source_username,
+                   CASE WHEN sp.id IS NOT NULL AND {linkable('sp', user_id)} THEN sp.id END AS source_playlist_id,
+                   CASE WHEN sp.id IS NOT NULL AND {linkable('sp', user_id)} THEN sp.title END AS source_playlist_title,
                    fu.username AS first_finder_username,
-                   (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = pt.video_id) AS song_like_count,
-                   (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = pt.video_id AND sl.user_id = ?) AS song_my_likes
-            FROM playlist_tracks pt
-            JOIN songs s ON s.video_id = pt.video_id
-            LEFT JOIN users su ON su.id = pt.source_user_id
+                   (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = o.video_id) AS song_like_count,
+                   (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = o.video_id AND sl.user_id = ?) AS song_my_likes
+            FROM ordered o
+            JOIN songs s ON s.video_id = o.video_id
+            LEFT JOIN users su ON su.id = o.source_user_id
             LEFT JOIN users fu ON fu.id = s.first_added_by_user_id
-            WHERE pt.playlist_id = ?
-            ORDER BY pt.position ASC
+            LEFT JOIN playlists sp ON sp.id = o.source_playlist_id
+            ORDER BY o.ordinal ASC
             """,
-            (user_id, pl["id"]),
+            (pl["id"], user_id),
         )
         tracks = []
         for t in cur.fetchall():
@@ -1070,20 +1034,24 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
         pl["tracks"] = tracks
         playlists.append(pl)
 
-    # 2. Recently discovered songs on Webjam
+    # 2. Recently discovered songs on Webjam (only LISTED placements claim discovery)
     cur.execute(
-        """
+        f"""
         SELECT s.video_id, s.title, s.channel_title, s.thumbnail_url,
-               s.first_added_by_user_id, s.first_added_playlist_id, s.first_added_at, s.total_plays,
+               s.first_added_by_user_id,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', user_id)} THEN s.first_added_playlist_id END AS first_added_playlist_id,
+               s.first_added_at, s.total_plays,
                u.username AS finder_username, u.display_name AS finder_display_name, u.avatar_color AS finder_avatar_color,
-               p.title AS debut_playlist_title,
-               (SELECT COUNT(DISTINCT pt.playlist_id) FROM playlist_tracks pt WHERE pt.video_id = s.video_id) AS playlist_count,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', user_id)} THEN p.title END AS debut_playlist_title,
+               (SELECT COUNT(DISTINCT pt.playlist_id) FROM playlist_tracks pt JOIN playlists p2 ON p2.id = pt.playlist_id
+                 WHERE pt.video_id = s.video_id AND {listed('p2')}) AS playlist_count,
                (SELECT COUNT(*) FROM comments c WHERE c.target_type = 'song' AND c.target_id = s.video_id) AS comment_count,
                (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = s.video_id) AS like_count,
                (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = s.video_id AND sl.user_id = ?) AS my_likes
         FROM songs s
-        JOIN users u ON u.id = s.first_added_by_user_id
+        LEFT JOIN users u ON u.id = s.first_added_by_user_id
         LEFT JOIN playlists p ON p.id = s.first_added_playlist_id
+        WHERE s.first_added_at IS NOT NULL AND {_song_visible_sql('s.video_id', user_id)}
         ORDER BY s.first_added_at DESC
         """,
         (user_id,),
@@ -1098,13 +1066,16 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
         sd["song_liked_by_me"] = sd["liked_by_me"]
         recent_songs.append(sd)
 
-    # 3. Community Activity Log
+    # 3. Community Activity Log: lines about playlists only while they are public
     cur.execute(
-        """
+        f"""
         SELECT a.id, a.actor_user_id, a.action_type, a.summary, a.link_type, a.link_id, a.created_at,
                u.username, u.display_name, u.avatar_color
         FROM activity_log a
         JOIN users u ON u.id = a.actor_user_id
+        WHERE (a.link_type != 'playlist'
+               OR EXISTS (SELECT 1 FROM playlists p WHERE p.id = CAST(a.link_id AS INTEGER) AND {listed('p')}))
+          AND (a.link_type != 'song' OR {_public_song_sql('a.link_id')})
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT 25
         """
@@ -1132,33 +1103,38 @@ def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.
     }
 
 
-@app.get("/api/playlists/{playlist_id}")
-def get_playlist_detail(
-    playlist_id: int, request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
-):
-    user_id = resolve_viewer(request, user_id)
+def build_playlist_detail(conn: sqlite3.Connection, pl_row: sqlite3.Row, viewer: int) -> Dict[str, Any]:
     cur = conn.cursor()
+    playlist_id = int(pl_row["id"])
     cur.execute(
-        """
+        f"""
         SELECT p.*, u.username, u.display_name, u.avatar_color, u.bio AS user_bio,
                (SELECT COALESCE(SUM(pl.count), 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id) AS like_count,
                (SELECT COALESCE(pl.count, 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id AND pl.user_id = ?) AS my_likes,
-               (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id) AS times_grabbed_from
+               (SELECT COUNT(*) FROM playlist_tracks pt JOIN playlists tp ON tp.id = pt.playlist_id
+                 WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id AND {listed('tp')}) AS times_grabbed_from
         FROM playlists p
         JOIN users u ON u.id = p.user_id
         WHERE p.id = ?
         """,
-        (user_id, playlist_id),
+        (viewer, playlist_id),
     )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-
-    playlist = dict(row)
+    playlist = dict(cur.fetchone())
     playlist["my_likes"] = int(playlist.get("my_likes") or 0)
     playlist["liked_by_me"] = bool(playlist["my_likes"] > 0)
 
-    # Fetch who liked this playlist
+    forked_from = None
+    if playlist.get("forked_from_playlist_id"):
+        src = cur.execute(
+            "SELECT p.*, u.username FROM playlists p JOIN users u ON u.id = p.user_id WHERE p.id = ?",
+            (playlist["forked_from_playlist_id"],),
+        ).fetchone()
+        if src and is_linkable(src, viewer):
+            forked_from = {"playlist_id": src["id"], "title": src["title"], "username": src["username"]}
+    playlist["forked_from"] = forked_from
+    if forked_from is None:
+        playlist["forked_from_playlist_id"] = None
+
     cur.execute(
         """
         SELECT u.id, u.username, u.display_name, pl.count
@@ -1170,117 +1146,61 @@ def get_playlist_detail(
         (playlist_id,),
     )
     playlist["liked_by_users"] = [dict(r) for r in cur.fetchall()]
-
-    # Fetch tracks with full provenance and song cross-references
-    cur.execute(
-        """
-        SELECT pt.id, pt.playlist_id, pt.video_id, pt.position, pt.added_by_user_id,
-               pt.track_note, pt.start_seconds, pt.end_seconds,
-               pt.migrated_from_video_id, pt.migrated_from_title,
-               pt.source_playlist_id, pt.source_user_id, pt.created_at,
-               COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, pt.display_title,
-               s.channel_title, s.thumbnail_url, s.total_plays,
-               s.first_added_by_user_id, s.first_added_playlist_id, s.first_added_at,
-               fu.username AS first_finder_username, fu.display_name AS first_finder_display_name,
-               su.username AS source_username, su.display_name AS source_display_name,
-               sp.title AS source_playlist_title,
-               (SELECT COUNT(DISTINCT pt2.playlist_id) FROM playlist_tracks pt2 WHERE pt2.video_id = pt.video_id) AS playlist_count,
-               (SELECT COUNT(*) FROM comments c WHERE c.target_type = 'song' AND c.target_id = pt.video_id) AS song_comment_count,
-               (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = pt.video_id) AS song_like_count,
-               (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = pt.video_id AND sl.user_id = ?) AS song_my_likes
-        FROM playlist_tracks pt
-        JOIN songs s ON s.video_id = pt.video_id
-        JOIN users fu ON fu.id = s.first_added_by_user_id
-        LEFT JOIN users su ON su.id = pt.source_user_id
-        LEFT JOIN playlists sp ON sp.id = pt.source_playlist_id
-        WHERE pt.playlist_id = ?
-        ORDER BY pt.position ASC, pt.id ASC
-        """,
-        (user_id, playlist_id),
-    )
-    tracks = []
-    for trow in cur.fetchall():
-        t = dict(trow)
-        t["song_my_likes"] = int(t.get("song_my_likes") or 0)
-        t["song_liked_by_me"] = bool(t["song_my_likes"] > 0)
-        t["is_first_discovery_here"] = (
-            t["first_added_by_user_id"] == playlist["user_id"]
-            and t["first_added_playlist_id"] == playlist["id"]
-        )
-        # Also list other playlists that contain this track
-        cur.execute(
-            """
-            SELECT p2.id AS playlist_id, p2.title AS playlist_title, u2.id AS user_id, u2.username
-            FROM playlist_tracks pt2
-            JOIN playlists p2 ON p2.id = pt2.playlist_id
-            JOIN users u2 ON u2.id = p2.user_id
-            WHERE pt2.video_id = ? AND pt2.playlist_id != ?
-            ORDER BY pt2.created_at ASC
-            """,
-            (t["video_id"], playlist_id),
-        )
-        t["other_playlists"] = [dict(r) for r in cur.fetchall()]
-        tracks.append(t)
-
-    playlist["tracks"] = tracks
-    playlist["comments"], playlist["comments_has_more"] = fetch_comments_page(conn, "playlist", str(playlist_id))
+    playlist["tracks"] = ops.render_track_rows(conn, pl_row, viewer)
+    if pl_row["kind"] == "crate":
+        playlist["comments"], playlist["comments_has_more"] = [], False
+    else:
+        playlist["comments"], playlist["comments_has_more"] = fetch_comments_page(conn, "playlist", str(playlist_id))
     return playlist
+
+
+@app.get("/api/playlists/{playlist_id}")
+def get_playlist_detail(
+    playlist_id: int, request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
+):
+    viewer = resolve_viewer(request, user_id)
+    pl = require_visible_playlist(conn, playlist_id, viewer)
+    return build_playlist_detail(conn, pl, viewer)
 
 
 @app.post("/api/playlists")
 async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
-    req.user_id = resolve_actor(request, req.user_id)
+    uid = resolve_actor(request, req.user_id)
+    actor = Actor(uid)
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Playlist title is required")
     entries = extract_video_entries(req.initial_urls) if (req.initial_urls or "").strip() else []
     ensure_entry_count(len(entries))
+    meta: Dict[str, Dict[str, Any]] = {}
     if entries:
         enforce_rate_limit(request, "add")
+        meta = await fetch_song_meta(conn, [e["video_id"] for e in entries])
 
-    ts = now_str()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO playlists (user_id, title, description, plays, created_at, updated_at)
-        VALUES (?, ?, ?, 0, ?, ?)
-        """,
-        (req.user_id, title, (req.description or "").strip(), ts, ts),
-    )
-    playlist_id = cur.lastrowid
-
-    cur.execute(
-        """
-        INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-        VALUES (?, 'created_playlist', ?, 'playlist', ?, ?)
-        """,
-        (req.user_id, f"published playlist '{title}'", str(playlist_id), ts),
-    )
-    conn.commit()
-
-    added_tracks = []
-    skipped = []
-    for entry in entries:
-        try:
-            res = await add_single_video_to_playlist(
-                conn=conn,
-                playlist_id=playlist_id,
-                user_id=req.user_id,
-                video_id=entry["video_id"],
-                start_seconds=entry["start_seconds"],
-                end_seconds=entry["end_seconds"],
-            )
-        except VideoLookupFailed as exc:
-            skipped.append({"video_id": entry["video_id"], "reason": exc.reason})
-            continue
-        added_tracks.append(res)
-
-    new_badges = evaluate_and_award_badges(conn, req.user_id)
+    playlist_id = ops.create_playlist(conn, actor, title, (req.description or "").strip(), req.visibility)
+    added_tracks: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    new_badges: List[Dict[str, Any]] = []
+    if entries:
+        items = [{"video_id": e["video_id"], "start_seconds": e["start_seconds"], "end_seconds": e["end_seconds"]}
+                 for e in entries]
+        outcome = apply_ops(
+            conn, actor, parse_ops([{"kind": "insert", "playlist_id": playlist_id, "items": items}]),
+            batch_id=server_batch_id(), song_meta=meta, skip_unavailable=True,
+        )
+        added_tracks = legacy_added(conn, outcome, playlist_id)
+        skipped = legacy_skipped(outcome.skipped)
+        new_badges = outcome.new_badges
+    else:
+        conn.commit()
+    if not added_tracks and req.visibility == "public":
+        new_badges = evaluate_and_award_badges(conn, uid)
     return {
         "playlist_id": playlist_id,
         "added_tracks": added_tracks,
         "skipped": skipped,
         "new_badges": new_badges,
+        "version": playlist_version(conn, playlist_id),
     }
 
 
@@ -1288,60 +1208,23 @@ async def create_playlist(req: CreatePlaylistRequest, request: Request, conn: sq
 def update_playlist(
     playlist_id: int, req: UpdatePlaylistRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
-    req.user_id = resolve_actor(request, req.user_id)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM playlists WHERE id = ?", (playlist_id,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if row["user_id"] != req.user_id:
-        raise HTTPException(status_code=403, detail="Only the playlist creator can edit liner notes")
-
-    cur.execute(
-        "UPDATE playlists SET title = ?, description = ?, updated_at = ? WHERE id = ?",
-        (req.title.strip(), req.description.strip(), now_str(), playlist_id),
+    uid = resolve_actor(request, req.user_id)
+    outcome = apply_ops(
+        conn, Actor(uid),
+        parse_ops([{"kind": "set_meta", "playlist_id": playlist_id,
+                    "set": {"title": req.title, "description": req.description}}]),
+        batch_id=server_batch_id(),
     )
-    conn.commit()
-    new_badges = evaluate_and_award_badges(conn, req.user_id)
-    return {"ok": True, "new_badges": new_badges}
-
-
-def derive_grab_source(
-    conn: sqlite3.Connection,
-    source_playlist_id: Optional[int],
-    claimed_source_user_id: Optional[int],
-    video_id: str,
-) -> Optional[Tuple[int, int]]:
-    """Server-side provenance for a grab: (source_playlist_id, source_user_id) or None.
-
-    The source playlist must exist and contain the video, and the credited user is
-    always that playlist's owner; otherwise the track is added with no provenance
-    (a stale page can still grab, it just can't credit anyone). A client-sent
-    source_user_id is never stored; on its own it only means "credit the song's
-    first finder", which is checked against songs.first_added_by_user_id and the
-    finder's debut playlist.
-    """
-    if source_playlist_id:
-        return verified_source(conn, source_playlist_id, video_id)
-    if claimed_source_user_id:
-        song = conn.execute(
-            "SELECT first_added_by_user_id, first_added_playlist_id FROM songs WHERE video_id = ?",
-            (video_id,),
-        ).fetchone()
-        if song and song["first_added_by_user_id"] == claimed_source_user_id:
-            src = verified_source(conn, song["first_added_playlist_id"], video_id)
-            if src and src[1] == claimed_source_user_id:
-                return src
-    return None
+    return {"ok": True, "new_badges": outcome.new_badges, "version": playlist_version(conn, playlist_id)}
 
 
 @app.post("/api/playlists/{playlist_id}/tracks", dependencies=[rate_limit("add")])
 async def add_tracks_to_playlist(
     playlist_id: int, req: AddTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
-    req.user_id = resolve_actor(request, req.user_id)
-    cur = conn.cursor()
-    require_playlist_owner(conn, playlist_id, req.user_id)
+    uid = resolve_actor(request, req.user_id)
+    actor = Actor(uid)
+    require_playlist_role(conn, playlist_id, actor, "editor")
 
     entries = extract_video_entries(req.urls_or_ids)
     if not entries:
@@ -1350,64 +1233,38 @@ async def add_tracks_to_playlist(
             detail="Could not find a valid YouTube link or 11-character video ID. Try pasting any youtube.com/watch?v=... or youtu.be/... link!",
         )
     ensure_entry_count(len(entries))
-    ensure_playlist_capacity(conn, playlist_id, len(entries))
+    ensure_room(conn, playlist_id, len(entries))
 
     explicit_start = parse_timestamp_seconds(req.start_time)
     explicit_end = parse_timestamp_seconds(req.end_time)
+    meta = await fetch_song_meta(conn, [e["video_id"] for e in entries])
+    failures = [m["error"] for m in meta.values() if m.get("error")]
+    if len(failures) == len(entries) and failures:
+        raise lookup_failure(VideoLookupUnavailable() if VideoLookupUnavailable.reason in failures else VideoLookupFailed())
 
-    # Verify provenance for every entry before writing anything.
-    sources = {
-        e["video_id"]: derive_grab_source(conn, req.source_playlist_id, req.source_user_id, e["video_id"])
-        for e in entries
-    }
-
-    results = []
-    skipped = []
+    items = []
     for entry in entries:
         vid = entry["video_id"]
-        start_sec = explicit_start if explicit_start is not None else entry["start_seconds"]
-        end_sec = explicit_end if explicit_end is not None else entry["end_seconds"]
-        src = sources[vid]
-        try:
-            res = await add_single_video_to_playlist(
-                conn=conn,
-                playlist_id=playlist_id,
-                user_id=req.user_id,
-                video_id=vid,
-                track_note=req.track_note or "",
-                custom_title=req.custom_title if len(entries) == 1 else None,
-                start_seconds=start_sec,
-                end_seconds=end_sec,
-                source_playlist_id=src[0] if src else None,
-                source_user_id=src[1] if src else None,
-            )
-        except VideoLookupFailed as exc:
-            skipped.append({"video_id": vid, "reason": exc.reason})
-            continue
-        results.append(res)
-
-    if not results:
-        if any(s["reason"] == VideoLookupUnavailable.reason for s in skipped):
-            raise lookup_failure(VideoLookupUnavailable())
-        raise lookup_failure(VideoLookupFailed())
-
-    # Evaluate badges for the user who added/grabbed the track
-    new_badges = evaluate_and_award_badges(conn, req.user_id)
-
-    # Also evaluate badges for the (verified) source curators and original song discoverers
-    others = {src[1] for src in sources.values() if src and src[1] != req.user_id}
-    for res in results:
-        cur.execute("SELECT first_added_by_user_id FROM songs WHERE video_id = ?", (res["video_id"],))
-        srow = cur.fetchone()
-        if srow and srow["first_added_by_user_id"] != req.user_id:
-            others.add(srow["first_added_by_user_id"])
-    for uid in others:
-        evaluate_and_award_badges(conn, uid)
-
+        item: Dict[str, Any] = {
+            "video_id": vid,
+            "start_seconds": explicit_start if explicit_start is not None else entry["start_seconds"],
+            "end_seconds": explicit_end if explicit_end is not None else entry["end_seconds"],
+            "note": req.track_note or "",
+            "display_title": req.custom_title if len(entries) == 1 else None,
+        }
+        ref = legacy_ref(conn, req.source_playlist_id, req.source_user_id, vid)
+        if ref:
+            item["ref"] = ref
+        items.append(item)
+    outcome = apply_ops(
+        conn, actor, parse_ops([{"kind": "insert", "playlist_id": playlist_id, "items": items}]),
+        batch_id=server_batch_id(), song_meta=meta, skip_unavailable=True,
+    )
     return {
-        "results": results,
-        "skipped": skipped,
-        "new_badges": new_badges,
+        "results": legacy_added(conn, outcome, playlist_id),
+        "skipped": legacy_skipped(outcome.skipped),
+        "new_badges": outcome.new_badges,
+        "version": playlist_version(conn, playlist_id),
     }
 
 
@@ -1419,33 +1276,21 @@ async def update_playlist_track(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    req.user_id = resolve_actor(request, req.user_id)
-    require_playlist_owner(conn, playlist_id, req.user_id)
-    if req.new_video_id and req.new_video_id.strip():
+    uid = resolve_actor(request, req.user_id)
+    reject_reserved_ids(req.group_id)
+    actor = Actor(uid)
+    pl = require_playlist_role(conn, playlist_id, actor, "editor")
+    swapping = bool(req.new_video_id and req.new_video_id.strip())
+    if swapping:
         enforce_rate_limit(request, "add")  # a swap can cost a YouTube lookup, like an add
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT pt.*, p.user_id AS owner_id, s.title AS current_song_title, s.channel_title AS current_channel_title
-        FROM playlist_tracks pt
-        JOIN playlists p ON p.id = pt.playlist_id
-        JOIN songs s ON s.video_id = pt.video_id
-        WHERE pt.id = ? AND pt.playlist_id = ?
-        """,
-        (track_id, playlist_id),
-    )
-    track = cur.fetchone()
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found in playlist")
+    order = [r["id"] for r in conn.execute(
+        "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC", (playlist_id,))]
+    if track_id not in order:
+        raise ApiError(404, "track_not_found", "Track not found in playlist")
 
-    migrated_video_id = track["video_id"]
-    current_row_title = track["display_title"] or track["current_song_title"]
-    migrated_title = current_row_title
-    migrated_channel = track["current_channel_title"]
-    orig_from_vid = track["migrated_from_video_id"]
-    orig_from_title = track["migrated_from_title"]
-
-    if req.new_video_id and req.new_video_id.strip():
+    new_set: Dict[str, Any] = {}
+    meta: Dict[str, Dict[str, Any]] = {}
+    if swapping:
         vids = extract_video_ids(req.new_video_id)
         if not vids:
             raise HTTPException(
@@ -1453,135 +1298,45 @@ async def update_playlist_track(
                 detail="Could not find a valid YouTube link or 11-character video ID for migration.",
             )
         new_vid = vids[0]
-        ts = now_str()
-
-        cur.execute("SELECT * FROM songs WHERE video_id = ?", (new_vid,))
-        srow = cur.fetchone()
-        if not srow:
-            try:
-                meta = await lookup_new_song_metadata(new_vid)
-            except VideoLookupFailed as exc:
-                raise lookup_failure(exc)
-            inserted, srow = insert_song_if_new(conn, new_vid, meta, req.user_id, playlist_id, ts)
-            migrated_title = srow["title"]
-            migrated_channel = srow["channel_title"]
-        else:
-            migrated_title = srow["title"]
-            migrated_channel = srow["channel_title"]
-            inserted = False
-        if inserted:
-            cur.execute(
-                """
-                INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-                VALUES (?, 'discovered_song', ?, 'song', ?, ?)
-                """,
-                (
-                    req.user_id,
-                    f"swapped a track to embeddable version '{migrated_title}'",
-                    new_vid,
-                    ts,
-                ),
-            )
-
-        # The custom title (if any) is this row's display title; it never renames the song.
-        new_display_title = clean_display_title(req.custom_title, migrated_title)
-        if new_display_title:
-            migrated_title = new_display_title
-
-        if new_vid != track["video_id"]:
-            if orig_from_vid and new_vid == orig_from_vid:
-                # Reverted back to the original un-migrated track
-                orig_from_vid = None
-                orig_from_title = None
-            elif not orig_from_vid:
-                orig_from_vid = track["video_id"]
-                orig_from_title = f"{current_row_title}" + (
-                    f" ({track['current_channel_title']})"
-                    if track["current_channel_title"] and track["current_channel_title"] not in ("YouTube", "YouTube Artist")
-                    else ""
-                )
-
-        # Grab credit ("from @someone") only survives a swap if the source playlist really
-        # has the new video; otherwise any song could be passed off as theirs.
-        source_pid, source_uid = track["source_playlist_id"], track["source_user_id"]
-        if new_vid != track["video_id"] and source_pid:
-            src = verified_source(conn, source_pid, new_vid)
-            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
-        elif new_vid != track["video_id"]:
-            source_pid, source_uid = None, None
-
-        cur.execute(
-            """
-            UPDATE playlist_tracks
-            SET video_id = ?, migrated_from_video_id = ?, migrated_from_title = ?, display_title = ?,
-                source_playlist_id = ?, source_user_id = ?
-            WHERE id = ? AND playlist_id = ?
-            """,
-            (new_vid, orig_from_vid, orig_from_title, new_display_title, source_pid, source_uid, track_id, playlist_id),
-        )
-        migrated_video_id = new_vid
+        meta = await fetch_song_meta(conn, [new_vid])
+        if meta.get(new_vid, {}).get("error"):
+            raise ops.lookup_error(meta[new_vid]["error"])
+        new_set["video_id"] = new_vid
+        # A swap gives the row the new song's title unless a custom title comes with it.
+        new_set["display_title"] = req.custom_title or ""
     elif req.custom_title is not None:
-        # Rename just this row (an empty string goes back to the song's real title).
-        new_display_title = clean_display_title(req.custom_title, track["current_song_title"])
-        cur.execute(
-            "UPDATE playlist_tracks SET display_title = ? WHERE id = ? AND playlist_id = ?",
-            (new_display_title, track_id, playlist_id),
-        )
-        migrated_title = new_display_title or track["current_song_title"]
-
+        new_set["display_title"] = req.custom_title
     if req.track_note is not None:
-        cur.execute(
-            "UPDATE playlist_tracks SET track_note = ? WHERE id = ?",
-            (req.track_note.strip(), track_id),
-        )
-
-    final_start = track["start_seconds"]
-    final_end = track["end_seconds"]
+        new_set["note"] = req.track_note
     if req.update_clip or req.start_time is not None or req.end_time is not None:
-        start_sec = parse_timestamp_seconds(req.start_time)
-        end_sec = parse_timestamp_seconds(req.end_time)
-        if start_sec is not None and end_sec is not None and end_sec <= start_sec:
-            raise HTTPException(
-                status_code=400,
-                detail="End time must be greater than start time.",
-            )
-        cur.execute(
-            "UPDATE playlist_tracks SET start_seconds = ?, end_seconds = ? WHERE id = ?",
-            (start_sec, end_sec, track_id),
-        )
-        final_start = start_sec
-        final_end = end_sec
+        new_set["start_seconds"] = parse_timestamp_seconds(req.start_time)
+        new_set["end_seconds"] = parse_timestamp_seconds(req.end_time)
 
+    raw_ops: List[Dict[str, Any]] = []
+    if new_set:
+        raw_ops.append({"kind": "update", "playlist_id": playlist_id, "track_id": track_id, "set": new_set})
     if req.direction in ("up", "down"):
-        cur.execute(
-            "SELECT id, position FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC",
-            (playlist_id,),
-        )
-        ordered = [dict(r) for r in cur.fetchall()]
-        idx = next((i for i, item in enumerate(ordered) if item["id"] == track_id), None)
-        if idx is not None:
-            swap_idx = idx - 1 if req.direction == "up" else idx + 1
-            if 0 <= swap_idx < len(ordered):
-                ordered[idx], ordered[swap_idx] = ordered[swap_idx], ordered[idx]
-                for pos, item in enumerate(ordered, start=1):
-                    cur.execute(
-                        "UPDATE playlist_tracks SET position = ? WHERE id = ?",
-                        (pos, item["id"]),
-                    )
-
-    cur.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (now_str(), playlist_id))
-    conn.commit()
-    new_badges = evaluate_and_award_badges(conn, req.user_id)
+        index = order.index(track_id) + 1
+        target = index - 1 if req.direction == "up" else index + 1
+        if 1 <= target <= len(order):
+            raw_ops.append({"kind": "move", "playlist_id": playlist_id, "track_ids": [track_id], "position": target})
+    new_badges: List[Dict[str, Any]] = []
+    if raw_ops:
+        outcome = apply_ops(conn, actor, parse_ops(raw_ops), batch_id=server_batch_id(), group_id=req.group_id,
+                            song_meta=meta)
+        new_badges = outcome.new_badges
+    row = ops.render_track_rows(conn, pl, uid, [track_id])[0]
     return {
         "ok": True,
-        "video_id": migrated_video_id,
-        "title": migrated_title,
-        "channel_title": migrated_channel,
-        "migrated_from_video_id": orig_from_vid,
-        "migrated_from_title": orig_from_title,
-        "start_seconds": final_start,
-        "end_seconds": final_end,
+        "video_id": row["video_id"],
+        "title": row["title"],
+        "channel_title": row["channel_title"],
+        "migrated_from_video_id": row["migrated_from_video_id"],
+        "migrated_from_title": row["migrated_from_title"],
+        "start_seconds": row["start_seconds"],
+        "end_seconds": row["end_seconds"],
         "new_badges": new_badges,
+        "version": playlist_version(conn, playlist_id),
     }
 
 
@@ -1608,78 +1363,64 @@ async def commit_playlist_import(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    req.user_id = resolve_actor(request, req.user_id)
+    uid = resolve_actor(request, req.user_id)
+    actor = Actor(uid)
+    target = None
     if req.target_playlist_id:
-        require_playlist_owner(conn, req.target_playlist_id, req.user_id)
+        target = require_playlist_role(conn, req.target_playlist_id, actor, "editor")  # may be the crate
     if not req.tracks:
         raise HTTPException(status_code=400, detail="Select at least one track to import.")
     ensure_entry_count(len(req.tracks))
-    if req.target_playlist_id:
-        ensure_playlist_capacity(conn, req.target_playlist_id, len(req.tracks))
+    if target is not None:
+        ensure_room(conn, target["id"], len(req.tracks))
 
-    cur = conn.cursor()
-    ts = now_str()
-
-    if req.target_playlist_id:
-        cur.execute("SELECT id, title FROM playlists WHERE id = ?", (req.target_playlist_id,))
-        pl_row = cur.fetchone()
-        if not pl_row:
-            raise HTTPException(status_code=404, detail="Target playlist not found")
-        playlist_id = pl_row["id"]
-        playlist_title = pl_row["title"]
-    else:
-        playlist_title = (req.title or "").strip() or "Imported YouTube Playlist"
-        cur.execute(
-            """
-            INSERT INTO playlists (user_id, title, description, plays, created_at, updated_at)
-            VALUES (?, ?, ?, 0, ?, ?)
-            """,
-            (req.user_id, playlist_title, (req.description or "").strip(), ts, ts),
-        )
-        playlist_id = cur.lastrowid
-        cur.execute(
-            """
-            INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-            VALUES (?, 'created_playlist', ?, 'playlist', ?, ?)
-            """,
-            (req.user_id, f"imported YouTube playlist '{playlist_title}'", str(playlist_id), ts),
-        )
-        conn.commit()
-
-    added_tracks = []
-    skipped = []
+    items: List[Dict[str, Any]] = []
+    migrated: List[Tuple[Optional[str], Optional[str]]] = []
     for item in req.tracks:
         vids = extract_video_ids(item.video_id)
         if not vids:
             continue
-        vid = vids[0]
-        start_sec = parse_timestamp_seconds(item.start_seconds)
-        end_sec = parse_timestamp_seconds(item.end_seconds)
-        try:
-            res = await add_single_video_to_playlist(
-                conn=conn,
-                playlist_id=playlist_id,
-                user_id=req.user_id,
-                video_id=vid,
-                track_note=item.track_note or "",
-                custom_title=item.custom_title,
-                start_seconds=start_sec,
-                end_seconds=end_sec,
-                migrated_from_video_id=item.migrated_from_video_id,
-                migrated_from_title=item.migrated_from_title,
-            )
-        except VideoLookupFailed as exc:
-            skipped.append({"video_id": vid, "reason": exc.reason})
-            continue
-        added_tracks.append(res)
+        items.append({
+            "video_id": vids[0],
+            "start_seconds": parse_timestamp_seconds(item.start_seconds),
+            "end_seconds": parse_timestamp_seconds(item.end_seconds),
+            "note": item.track_note or "",
+            "display_title": item.custom_title,
+        })
+        migrated.append((item.migrated_from_video_id, item.migrated_from_title))
+    meta = await fetch_song_meta(conn, [i["video_id"] for i in items])
 
-    new_badges = evaluate_and_award_badges(conn, req.user_id)
+    if target is not None:
+        playlist_id, playlist_title = int(target["id"]), target["title"]
+    else:
+        playlist_title = (req.title or "").strip() or "Imported YouTube Playlist"
+        playlist_id = ops.create_playlist(
+            conn, actor, playlist_title, (req.description or "").strip(), "public",
+            activity=f"imported YouTube playlist '{playlist_title}'",
+        )
+
+    added_tracks: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    new_badges: List[Dict[str, Any]] = []
+    if items:
+        parsed = parse_ops([{"kind": "insert", "playlist_id": playlist_id, "items": items}])
+        # migrated_from_* is accepted only on this internal path (never through /api/ops).
+        for it, (mv, mt) in zip(parsed[0].items, migrated):
+            it._migrated_from_video_id = mv
+            it._migrated_from_title = mt
+        outcome = apply_ops(conn, actor, parsed, batch_id=server_batch_id(), song_meta=meta, skip_unavailable=True)
+        added_tracks = legacy_added(conn, outcome, playlist_id)
+        skipped = legacy_skipped(outcome.skipped)
+        new_badges = outcome.new_badges
+    elif conn.in_transaction:
+        conn.commit()
     return {
         "playlist_id": playlist_id,
         "title": playlist_title,
         "added_tracks": added_tracks,
         "skipped": skipped,
         "new_badges": new_badges,
+        "version": playlist_version(conn, playlist_id),
     }
 
 
@@ -1697,14 +1438,17 @@ async def audit_playlist_embeds(
 
     cur.execute(
         """
-        SELECT pt.id AS track_id, pt.video_id, pt.position, pt.track_note,
-               pt.start_seconds, pt.end_seconds,
-               pt.migrated_from_video_id, pt.migrated_from_title,
-               COALESCE(pt.display_title, s.title) AS title, s.channel_title, s.thumbnail_url
-        FROM playlist_tracks pt
-        JOIN songs s ON s.video_id = pt.video_id
-        WHERE pt.playlist_id = ?
-        ORDER BY pt.position ASC, pt.id ASC
+        WITH ordered AS (
+            SELECT pt.*, ROW_NUMBER() OVER (ORDER BY pt.position ASC, pt.id ASC) AS ordinal
+            FROM playlist_tracks pt WHERE pt.playlist_id = ?
+        )
+        SELECT o.id AS track_id, o.video_id, o.ordinal AS position, o.track_note,
+               CAST(o.start_seconds AS INTEGER) AS start_seconds, CAST(o.end_seconds AS INTEGER) AS end_seconds,
+               o.migrated_from_video_id, o.migrated_from_title,
+               COALESCE(o.display_title, s.title) AS title, s.channel_title, s.thumbnail_url
+        FROM ordered o
+        JOIN songs s ON s.video_id = o.video_id
+        ORDER BY o.ordinal ASC
         """,
         (playlist_id,),
     )
@@ -1764,36 +1508,58 @@ def delete_playlist_track(
     user_id: Optional[int] = Query(None),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    require_playlist_owner(conn, playlist_id, resolve_actor(request, user_id))
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM playlist_tracks WHERE id = ? AND playlist_id = ?",
-        (track_id, playlist_id),
-    )
-    # Re-normalize positions
-    cur.execute(
-        "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC",
-        (playlist_id,),
-    )
-    for pos, row in enumerate(cur.fetchall(), start=1):
-        cur.execute("UPDATE playlist_tracks SET position = ? WHERE id = ?", (pos, row["id"]))
-    conn.commit()
-    return {"ok": True}
+    uid = resolve_actor(request, user_id)
+    apply_ops(conn, Actor(uid), parse_ops([{"kind": "delete", "playlist_id": playlist_id, "track_ids": [track_id]}]),
+              batch_id=server_batch_id())
+    return {"ok": True, "version": playlist_version(conn, playlist_id)}
 
 
-@app.put("/api/playlists/{playlist_id}/reorder")
+def reorder_moves(current: List[int], wanted: List[int]) -> List[Dict[str, Any]]:
+    """Minimal moves turning `current` into `wanted`: keep a longest increasing subsequence,
+    move every other track right after its new predecessor (left to right)."""
+    index = {t: i for i, t in enumerate(current)}
+    seq = [index[t] for t in wanted]
+    # Patience sorting with back-pointers: O(n log n) LIS.
+
+    tails: List[int] = []
+    tails_at: List[int] = []
+    prev = [-1] * len(seq)
+    for i, v in enumerate(seq):
+        j = bisect.bisect_left(tails, v)
+        if j == len(tails):
+            tails.append(v)
+            tails_at.append(i)
+        else:
+            tails[j] = v
+            tails_at[j] = i
+        prev[i] = tails_at[j - 1] if j > 0 else -1
+    keep = set()
+    k = tails_at[-1] if tails_at else -1
+    while k != -1:
+        keep.add(wanted[k])
+        k = prev[k]
+    moves = []
+    for j, t in enumerate(wanted):
+        if t in keep:
+            continue
+        move: Dict[str, Any] = {"kind": "move", "track_ids": [t]}
+        if j == 0:
+            move["position"] = 1
+        else:
+            move["after_track_id"] = wanted[j - 1]
+        moves.append(move)
+    return moves
+
+
+@app.put("/api/playlists/{playlist_id}/reorder", dependencies=[rate_limit("ops")])
 def reorder_playlist_tracks(
     playlist_id: int, req: ReorderTracksRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)
 ):
-    req.user_id = resolve_actor(request, req.user_id)
-    require_playlist_owner(conn, playlist_id, req.user_id)
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC",
-        (playlist_id,),
-    )
-    existing_ids = [r["id"] for r in cur.fetchall()]
+    uid = resolve_actor(request, req.user_id)
+    actor = Actor(uid)
+    require_playlist_role(conn, playlist_id, actor, "editor")
+    existing_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC", (playlist_id,))]
     existing_set = set(existing_ids)
 
     ordered_ids: List[int] = []
@@ -1806,149 +1572,139 @@ def reorder_playlist_tracks(
         if tid not in seen:
             ordered_ids.append(tid)
 
-    for pos, tid in enumerate(ordered_ids, start=1):
-        cur.execute(
-            "UPDATE playlist_tracks SET position = ? WHERE id = ? AND playlist_id = ?",
-            (pos, tid, playlist_id),
-        )
+    moves = reorder_moves(existing_ids, ordered_ids)
+    if len(moves) == 1:  # a single drag: one move op
+        moves[0]["playlist_id"] = playlist_id
+        apply_ops(conn, actor, parse_ops(moves), batch_id=server_batch_id())
+    elif moves:
+        # Anything bigger is ONE reorder effect (one op row, one O(n) pass), not one move per track.
+        reorder = ops.ReorderOp(playlist_id=playlist_id, track_ids=ordered_ids)
+        apply_ops(conn, actor, [reorder], batch_id=server_batch_id())
+    final = [r["id"] for r in conn.execute(
+        "SELECT id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC, id ASC", (playlist_id,))]
+    return {"ok": True, "ordered_track_ids": final, "version": playlist_version(conn, playlist_id)}
 
-    cur.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (now_str(), playlist_id))
+
+# PUT /api/playlists/{id}/snapshot was deleted in Phase 1a: undo is POST /api/ops/undo now.
+
+
+# --- Ops, undo/redo, crate, dock, paste, delete, fork (Phase 1a) -----------------------------
+
+def reject_reserved_ids(*ids: Optional[str]) -> None:
+    """srv-, fork- and promote- ids are minted by the server; a client may not borrow them."""
+    for value in ids:
+        if ops.is_reserved_id(value):
+            raise ApiError(400, "bad_op", "That op_id / group_id prefix is reserved.")
+
+
+@app.post("/api/ops", dependencies=[rate_limit("ops")])
+async def post_ops(req: OpsRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    reject_reserved_ids(req.op_id, req.group_id)
+    # Caps and roles first (read-only), so a batch that will be refused costs no YouTube lookups.
+    # The caps also bound the lookups: at most 50 items, so at most 50 unknown videos.
+    ops.check_batch_shape(req.ops)
+    ops.authorise_batch(conn, Actor(uid), req.ops)
+    video_ids = [it.video_id for op in req.ops if op.kind == "insert" for it in op.items]
+    video_ids += [op.set.video_id for op in req.ops if op.kind == "update" and op.set.video_id]
+    meta: Dict[str, Dict[str, Any]] = {}
+    unknown = ops.unknown_video_ids(conn, video_ids)
+    if unknown:
+        replay = conn.execute("SELECT 1 FROM playlist_ops WHERE batch_id = ? LIMIT 1", (req.op_id,)).fetchone()
+        if not replay:
+            enforce_rate_limit(request, "add")
+            meta = await fetch_song_meta(conn, unknown)
+    outcome = apply_ops(
+        conn, Actor(uid), req.ops, batch_id=req.op_id, group_id=req.group_id,
+        expected_versions=req.expected_versions, song_meta=meta,
+    )
+    return ops.outcome_json(conn, outcome, req.op_id, uid)
+
+
+@app.post("/api/ops/undo", dependencies=[rate_limit("ops")])
+def post_undo(req: UndoRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return ops.undo_group(conn, Actor(uid), expect_group_id=req.group_id, skip=req.skip)
+
+
+@app.post("/api/ops/redo", dependencies=[rate_limit("ops")])
+def post_redo(req: UndoRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return ops.redo_group(conn, Actor(uid), expect_group_id=req.group_id, skip=req.skip)
+
+
+@app.get("/api/me/undo")
+def get_my_undo(request: Request, user_id: Optional[int] = Query(None), conn: sqlite3.Connection = Depends(get_db)):
+    return undo_state(conn, resolve_actor(request, user_id))
+
+
+@app.get("/api/me/crate")
+def get_my_crate(request: Request, user_id: Optional[int] = Query(None), conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, user_id)
+    crate_id = ensure_crate(conn, uid)
     conn.commit()
-    return {"ok": True, "ordered_track_ids": ordered_ids}
+    pl = conn.execute("SELECT * FROM playlists WHERE id = ?", (crate_id,)).fetchone()
+    detail = build_playlist_detail(conn, pl, uid)
+    for t in detail["tracks"]:
+        t["also_in"] = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT DISTINCT p.id AS playlist_id, p.title FROM playlist_tracks pt JOIN playlists p ON p.id = pt.playlist_id
+                WHERE p.user_id = ? AND p.kind = 'playlist' AND pt.video_id = ?
+                  AND pt.start_seconds IS ? AND pt.end_seconds IS ?
+                ORDER BY p.id
+                """,
+                (uid, t["video_id"], t["start_seconds"], t["end_seconds"]),
+            )
+        ]
+    return detail
 
 
-@app.put("/api/playlists/{playlist_id}/snapshot")
-def restore_playlist_snapshot(
-    playlist_id: int,
-    req: RestorePlaylistSnapshotRequest,
-    request: Request,
-    conn: sqlite3.Connection = Depends(get_db),
-):
-    """Undo stopgap (replaced by the op log in Phase 1).
+@app.post("/api/me/crate/promote", status_code=201, dependencies=[rate_limit("ops")])
+def promote_my_crate(req: PromoteRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return ops.promote_crate(conn, Actor(uid), req.title, req.description or "", req.visibility, req.track_ids)
 
-    Only the owner's own content is taken from the client: order, notes, clips,
-    migration notes and display titles. Attribution (added_by_user_id, source_*,
-    created_at) is never trusted: a row whose id already belongs to this playlist
-    keeps the attribution it has on the server; any other row is attributed to the
-    actor, now, and only gets a source if that source playlist really contains it.
-    """
-    req.user_id = resolve_actor(request, req.user_id)
-    require_playlist_owner(conn, playlist_id, req.user_id)
-    cur = conn.cursor()
 
-    if len(req.tracks) > MAX_TRACKS_PER_PLAYLIST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Playlists can hold at most {MAX_TRACKS_PER_PLAYLIST} tracks.",
-        )
-    video_ids = {t.video_id for t in req.tracks}
-    bad = [v for v in video_ids if not VIDEO_ID_PATTERN.match(v)]
-    if bad:
-        raise HTTPException(status_code=400, detail="Snapshot contains an invalid video id.")
-    if video_ids:
-        placeholders = ",".join("?" * len(video_ids))
-        known = {
-            r["video_id"]
-            for r in cur.execute(
-                f"SELECT video_id FROM songs WHERE video_id IN ({placeholders})", tuple(video_ids)
-            ).fetchall()
-        }
-        if known != video_ids:
-            raise HTTPException(status_code=400, detail="Snapshot contains a track that isn't on Webjam.")
+@app.get("/api/me/dock")
+def get_my_dock(request: Request, user_id: Optional[int] = Query(None), conn: sqlite3.Connection = Depends(get_db)):
+    return ops.dock_view(conn, resolve_actor(request, user_id))
 
-    for t in req.tracks:
-        if t.start_seconds is not None and t.end_seconds is not None and t.end_seconds <= t.start_seconds:
-            raise HTTPException(status_code=400, detail="End time must be greater than start time.")
 
-    existing = {
-        r["id"]: r
-        for r in cur.execute("SELECT * FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)).fetchall()
-    }
-    # A client id is only reused for a row that once existed (undoing a delete), never
-    # above the highest id SQLite has handed out: an id near 2^63 would make every
-    # later AUTOINCREMENT insert fail with SQLITE_FULL for the whole site.
-    seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'playlist_tracks'").fetchone()
-    max_issued_id = int(seq_row["seq"]) if seq_row else 0
+@app.put("/api/me/dock")
+def put_my_dock(req: DockRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return ops.set_dock_pins(conn, uid, list(req.pinned))
 
-    ts = now_str()
-    cur.execute(
-        "UPDATE playlists SET title = ?, description = ?, updated_at = ? WHERE id = ?",
-        (req.title.strip() or "Untitled Playlist", (req.description or "").strip(), ts, playlist_id),
+
+@app.post("/api/resolve-paste")
+async def post_resolve_paste(req: ResolvePasteRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return await resolve_paste(
+        conn, req.text or "", req.html, uid,
+        fetch=lambda vid: fetch_youtube_metadata(vid),
+        charge=lambda: enforce_rate_limit(request, "add"),
+        base_url=get_config().base_url,
+        demo=not auth_enabled(),
     )
 
-    cur.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
-    used_ids = set()
-    for idx, t in enumerate(req.tracks, start=1):
-        orig = existing.get(t.id) if t.id is not None and t.id not in used_ids else None
-        row_id: Optional[int] = None
-        if orig is not None and orig["video_id"] == t.video_id:
-            row_id = orig["id"]
-            added_by = orig["added_by_user_id"]
-            source_pid, source_uid = orig["source_playlist_id"], orig["source_user_id"]
-            created_at = orig["created_at"]
-            fallback_display = orig["display_title"]
-        elif orig is not None:
-            # Same row, different song (e.g. undoing a swap): its grab credit only carries
-            # over if the source playlist really contains this song.
-            row_id = orig["id"]
-            added_by = orig["added_by_user_id"]
-            src = verified_source(conn, orig["source_playlist_id"] or t.source_playlist_id, t.video_id)
-            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
-            created_at = orig["created_at"]
-            fallback_display = None
-        else:
-            # Reuse a client id only if no row anywhere holds it (e.g. undoing a delete).
-            if t.id is not None and t.id <= max_issued_id and t.id not in used_ids:
-                if not cur.execute("SELECT 1 FROM playlist_tracks WHERE id = ?", (t.id,)).fetchone():
-                    row_id = t.id
-            added_by = req.user_id
-            src = verified_source(conn, t.source_playlist_id, t.video_id)
-            source_pid, source_uid = (src[0], src[1]) if src else (None, None)
-            created_at = ts
-            fallback_display = None
-        display_title = (
-            ((t.display_title or "").strip()[:MAX_TITLE] or None)
-            if "display_title" in t.model_fields_set
-            else fallback_display
-        )
-        migrated_vid = (
-            t.migrated_from_video_id
-            if t.migrated_from_video_id and VIDEO_ID_PATTERN.match(t.migrated_from_video_id)
-            else None
-        )
-        cur.execute(
-            """
-            INSERT INTO playlist_tracks (
-                id, playlist_id, video_id, position, track_note,
-                start_seconds, end_seconds,
-                migrated_from_video_id, migrated_from_title, display_title,
-                added_by_user_id, source_playlist_id, source_user_id, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row_id,
-                playlist_id,
-                t.video_id,
-                idx,
-                (t.track_note or "").strip(),
-                t.start_seconds,
-                t.end_seconds,
-                migrated_vid,
-                (t.migrated_from_title or "").strip() or None,
-                display_title,
-                added_by,
-                source_pid,
-                source_uid,
-                created_at,
-            ),
-        )
-        used_ids.add(cur.lastrowid)
 
-    conn.commit()
-    return {"ok": True}
+@app.delete("/api/playlists/{playlist_id}")
+def delete_playlist(
+    playlist_id: int, request: Request, user_id: Optional[int] = Query(None), conn: sqlite3.Connection = Depends(get_db)
+):
+    uid = resolve_actor(request, user_id)
+    return ops.delete_playlist(conn, Actor(uid), playlist_id)
 
 
+@app.post("/api/playlists/{playlist_id}/fork", status_code=201, dependencies=[rate_limit("ops")])
+def fork_playlist(playlist_id: int, req: ForkRequest, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = resolve_actor(request, req.user_id)
+    return ops.fork_playlist(conn, Actor(uid), playlist_id, req.title, req.visibility)
+
+
+# --- Likes, plays, songs, profiles, comments --------------------------------------------------
 
 @app.post("/api/playlists/{playlist_id}/like", dependencies=[rate_limit("like")])
 def toggle_playlist_like(
@@ -1956,10 +1712,10 @@ def toggle_playlist_like(
 ):
     req.user_id = resolve_actor(request, req.user_id)
     cur = conn.cursor()
-    cur.execute("SELECT id, user_id, title FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+    pl = require_visible_playlist(conn, playlist_id, req.user_id)
+    if pl["kind"] == "crate":
+        raise ApiError(400, "not_likeable", "Crates can't be liked.")
+    public = is_listed(pl)
 
     cur.execute(
         "SELECT count FROM playlist_likes WHERE playlist_id = ? AND user_id = ?",
@@ -1990,7 +1746,7 @@ def toggle_playlist_like(
                 (playlist_id, req.user_id, my_likes, ts),
             )
 
-        if prev_count == 0:
+        if public and prev_count == 0:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -1998,7 +1754,7 @@ def toggle_playlist_like(
                 """,
                 (req.user_id, f"co-signed playlist '{pl['title']}'", str(playlist_id), ts),
             )
-        elif prev_count < 10 <= my_likes:
+        elif public and prev_count < 10 <= my_likes:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -2056,8 +1812,9 @@ def toggle_song_like(
     cur = conn.cursor()
     cur.execute("SELECT video_id, title, first_added_by_user_id FROM songs WHERE video_id = ?", (video_id,))
     song = cur.fetchone()
-    if not song:
+    if not song or not song_visible(conn, video_id, req.user_id):
         raise HTTPException(status_code=404, detail="Song not found in Webjam")
+    public = song_visible(conn, video_id, 0)
 
     cur.execute(
         "SELECT count FROM song_likes WHERE video_id = ? AND user_id = ?",
@@ -2088,7 +1845,7 @@ def toggle_song_like(
                 (video_id, req.user_id, my_likes, ts),
             )
 
-        if prev_count == 0:
+        if public and prev_count == 0:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -2096,7 +1853,7 @@ def toggle_song_like(
                 """,
                 (req.user_id, f"loved track '{song['title']}'", video_id, ts),
             )
-        elif prev_count < 10 <= my_likes:
+        elif public and prev_count < 10 <= my_likes:
             cur.execute(
                 """
                 INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
@@ -2107,11 +1864,8 @@ def toggle_song_like(
 
     conn.commit()
     actor_badges = evaluate_and_award_badges(conn, req.user_id)
-    finder_badges = (
-        evaluate_and_award_badges(conn, song["first_added_by_user_id"])
-        if req.user_id != song["first_added_by_user_id"]
-        else []
-    )
+    finder = song["first_added_by_user_id"]
+    finder_badges = evaluate_and_award_badges(conn, finder) if finder and req.user_id != finder else []
     cur.execute(
         "SELECT COALESCE(SUM(count), 0) AS total_cnt, COUNT(*) AS lover_cnt FROM song_likes WHERE video_id = ?",
         (video_id,),
@@ -2167,12 +1921,11 @@ def record_playlist_play(
 
     The playlist's play count goes up at most once per listener (user, else IP) per
     playlist every 30 minutes, and never for the owner's own listening (it feeds
-    badges). A song's total_plays counts once per listener+track per 30 minutes."""
+    badges). A song's total_plays counts once per listener+track per 30 minutes.
+    Crates and private playlists never count toward either."""
     cur = conn.cursor()
-    cur.execute("SELECT id, user_id, plays FROM playlists WHERE id = ?", (playlist_id,))
-    pl = cur.fetchone()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+    pl = require_visible_playlist(conn, playlist_id, resolve_viewer(request, req.user_id))
+    countable = pl["kind"] == "playlist" and pl["visibility"] != "private"
 
     video_id = (req.video_id or "").strip()
     if video_id:
@@ -2197,13 +1950,13 @@ def record_playlist_play(
             "SELECT 1 FROM play_events WHERE viewer_key = ? AND playlist_id = ? AND video_id = ? AND at >= ?",
             (key, playlist_id, video_id, since),
         ).fetchone()
-        counted = playlist_recent is None and not is_owner
+        counted = playlist_recent is None and not is_owner and countable
         if not track_recent:
             cur.execute(
                 "INSERT INTO play_events (viewer_key, playlist_id, video_id, at) VALUES (?, ?, ?, ?)",
                 (key, playlist_id, video_id, now),
             )
-            if video_id:
+            if video_id and countable:
                 cur.execute("UPDATE songs SET total_plays = total_plays + 1 WHERE video_id = ?", (video_id,))
         if counted:
             cur.execute("UPDATE playlists SET plays = plays + 1 WHERE id = ?", (playlist_id,))
@@ -2230,16 +1983,19 @@ def get_song_page(
     video_id: str, request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
 ):
     user_id = resolve_viewer(request, user_id)
+    if not VIDEO_ID_PATTERN.match(video_id) or not song_visible(conn, video_id, user_id):
+        raise HTTPException(status_code=404, detail="Song not found in Webjam")
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT s.*,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', user_id)} THEN s.first_added_playlist_id END AS first_added_playlist_id,
                u.username AS finder_username, u.display_name AS finder_display_name, u.avatar_color AS finder_avatar_color,
-               p.title AS debut_playlist_title,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', user_id)} THEN p.title END AS debut_playlist_title,
                (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = s.video_id) AS like_count,
                (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = s.video_id AND sl.user_id = ?) AS my_likes
         FROM songs s
-        JOIN users u ON u.id = s.first_added_by_user_id
+        LEFT JOIN users u ON u.id = s.first_added_by_user_id
         LEFT JOIN playlists p ON p.id = s.first_added_playlist_id
         WHERE s.video_id = ?
         """,
@@ -2265,26 +2021,27 @@ def get_song_page(
     )
     song["liked_by_users"] = [dict(r) for r in cur.fetchall()]
 
-    # All playlist appearances ordered chronologically
+    # Playlist appearances the viewer may see, ordered chronologically
     cur.execute(
-        """
-        SELECT pt.id AS track_entry_id, pt.playlist_id, pt.position, pt.track_note,
-               pt.start_seconds, pt.end_seconds,
-               pt.source_playlist_id, pt.source_user_id, pt.created_at,
-               p.title AS playlist_title, p.plays AS playlist_plays,
+        f"""
+        SELECT pt.id AS track_entry_id, pt.playlist_id, {ordinal_sql('pt')} AS position, pt.track_note,
+               CAST(pt.start_seconds AS INTEGER) AS start_seconds, CAST(pt.end_seconds AS INTEGER) AS end_seconds,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', user_id)} THEN sp.id END AS source_playlist_id,
+               pt.source_user_id, pt.created_at,
+               p.title AS playlist_title, p.plays AS playlist_plays, p.visibility AS playlist_visibility,
                u.id AS user_id, u.username, u.display_name, u.avatar_color,
                su.username AS source_username, su.display_name AS source_display_name,
-               sp.title AS source_playlist_title,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', user_id)} THEN sp.title END AS source_playlist_title,
                (SELECT COALESCE(SUM(pl.count), 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id) AS playlist_likes
         FROM playlist_tracks pt
         JOIN playlists p ON p.id = pt.playlist_id
         JOIN users u ON u.id = p.user_id
         LEFT JOIN users su ON su.id = pt.source_user_id
         LEFT JOIN playlists sp ON sp.id = pt.source_playlist_id
-        WHERE pt.video_id = ?
+        WHERE pt.video_id = ? AND ({listed('p')} OR (p.user_id = ? AND p.kind = 'playlist'))
         ORDER BY pt.created_at ASC, pt.id ASC
         """,
-        (video_id,),
+        (video_id, user_id),
     )
     song["appearances"] = [dict(r) for r in cur.fetchall()]
     song["comments"], song["comments_has_more"] = fetch_comments_page(conn, "song", video_id)
@@ -2296,6 +2053,7 @@ def get_user_profile(
     profile_user_id: int, request: Request, viewer_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
 ):
     viewer_id = resolve_viewer(request, viewer_id)
+    is_self = bool(viewer_id) and viewer_id == profile_user_id
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id = ?", (profile_user_id,))
     urow = cur.fetchone()
@@ -2308,16 +2066,18 @@ def get_user_profile(
 
     badge_data = get_user_badge_progress(conn, profile_user_id)
 
-    # User's playlists
+    # User's playlists: all of them (not the crate) for the owner, public ones for everyone else.
+    playlist_filter = "p.kind = 'playlist'" if is_self else listed("p")
     cur.execute(
-        """
+        f"""
         SELECT p.*,
                (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count,
                (SELECT COALESCE(SUM(pl.count), 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id) AS like_count,
                (SELECT COALESCE(pl.count, 0) FROM playlist_likes pl WHERE pl.playlist_id = p.id AND pl.user_id = ?) AS my_likes,
-               (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id) AS times_grabbed_from
+               (SELECT COUNT(*) FROM playlist_tracks pt JOIN playlists tp ON tp.id = pt.playlist_id
+                 WHERE pt.source_playlist_id = p.id AND pt.added_by_user_id != p.user_id AND {listed('tp')}) AS times_grabbed_from
         FROM playlists p
-        WHERE p.user_id = ?
+        WHERE p.user_id = ? AND {playlist_filter}
         ORDER BY p.updated_at DESC, p.id DESC
         """,
         (viewer_id, profile_user_id),
@@ -2325,22 +2085,30 @@ def get_user_profile(
     playlists = []
     for prow in cur.fetchall():
         pl = dict(prow)
+        if pl.get("forked_from_playlist_id"):
+            src = conn.execute("SELECT * FROM playlists WHERE id = ?", (pl["forked_from_playlist_id"],)).fetchone()
+            if not is_linkable(src, viewer_id):  # same rule as the detail endpoint's forked_from
+                pl["forked_from_playlist_id"] = None
         pl["my_likes"] = int(pl.get("my_likes") or 0)
         pl["liked_by_me"] = bool(pl["my_likes"] > 0)
         cur.execute(
             """
-            SELECT pt.id, pt.video_id, pt.position, pt.track_note, pt.start_seconds, pt.end_seconds,
-                   COALESCE(pt.display_title, s.title) AS title, s.title AS song_title, s.channel_title,
+            WITH ordered AS (
+                SELECT pt.*, ROW_NUMBER() OVER (ORDER BY pt.position ASC, pt.id ASC) AS ordinal
+                FROM playlist_tracks pt WHERE pt.playlist_id = ?
+            )
+            SELECT o.id, o.video_id, o.ordinal AS position, o.track_note,
+                   CAST(o.start_seconds AS INTEGER) AS start_seconds, CAST(o.end_seconds AS INTEGER) AS end_seconds,
+                   COALESCE(o.display_title, s.title) AS title, s.title AS song_title, s.channel_title,
                    su.username AS source_username,
-                   (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = pt.video_id) AS song_like_count,
-                   (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = pt.video_id AND sl.user_id = ?) AS song_my_likes
-            FROM playlist_tracks pt
-            JOIN songs s ON s.video_id = pt.video_id
-            LEFT JOIN users su ON su.id = pt.source_user_id
-            WHERE pt.playlist_id = ?
-            ORDER BY pt.position ASC
+                   (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = o.video_id) AS song_like_count,
+                   (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = o.video_id AND sl.user_id = ?) AS song_my_likes
+            FROM ordered o
+            JOIN songs s ON s.video_id = o.video_id
+            LEFT JOIN users su ON su.id = o.source_user_id
+            ORDER BY o.ordinal ASC
             """,
-            (viewer_id, pl["id"]),
+            (pl["id"], viewer_id),
         )
         tracks = []
         for t in cur.fetchall():
@@ -2351,16 +2119,19 @@ def get_user_profile(
         pl["tracks"] = tracks
         playlists.append(pl)
 
-    # Songs first discovered on Webjam by this user
+    # Songs first discovered on Webjam by this user (claims only come from public placements)
     cur.execute(
-        """
-        SELECT s.*, p.title AS debut_playlist_title,
-               (SELECT COUNT(DISTINCT pt.playlist_id) FROM playlist_tracks pt WHERE pt.video_id = s.video_id) AS playlist_count,
+        f"""
+        SELECT s.*,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', viewer_id)} THEN s.first_added_playlist_id END AS first_added_playlist_id,
+               CASE WHEN p.id IS NOT NULL AND {linkable('p', viewer_id)} THEN p.title END AS debut_playlist_title,
+               (SELECT COUNT(DISTINCT pt.playlist_id) FROM playlist_tracks pt JOIN playlists p2 ON p2.id = pt.playlist_id
+                 WHERE pt.video_id = s.video_id AND {listed('p2')}) AS playlist_count,
                (SELECT COALESCE(SUM(sl.count), 0) FROM song_likes sl WHERE sl.video_id = s.video_id) AS like_count,
                (SELECT COALESCE(sl.count, 0) FROM song_likes sl WHERE sl.video_id = s.video_id AND sl.user_id = ?) AS my_likes
         FROM songs s
         LEFT JOIN playlists p ON p.id = s.first_added_playlist_id
-        WHERE s.first_added_by_user_id = ?
+        WHERE s.first_added_by_user_id = ? AND {_song_visible_sql('s.video_id', viewer_id)}
         ORDER BY s.first_added_at DESC
         """,
         (viewer_id, profile_user_id),
@@ -2375,17 +2146,21 @@ def get_user_profile(
         sd["song_liked_by_me"] = sd["liked_by_me"]
         discovered_songs.append(sd)
 
-    # Songs liked by this user
+    # Songs liked by this user (others only see songs they could open)
+    liked_filter = "" if is_self else (
+        f"AND EXISTS (SELECT 1 FROM playlist_tracks xpt JOIN playlists xp ON xp.id = xpt.playlist_id "
+        f"WHERE xpt.video_id = s.video_id AND ({listed('xp')} OR xp.user_id = {int(viewer_id or 0)}))"
+    )
     cur.execute(
-        """
+        f"""
         SELECT s.*, sl.created_at AS liked_at, sl.count AS profile_user_likes,
                fu.username AS finder_username,
                (SELECT COALESCE(SUM(sl2.count), 0) FROM song_likes sl2 WHERE sl2.video_id = s.video_id) AS like_count,
                (SELECT COALESCE(sl3.count, 0) FROM song_likes sl3 WHERE sl3.video_id = s.video_id AND sl3.user_id = ?) AS my_likes
         FROM song_likes sl
         JOIN songs s ON s.video_id = sl.video_id
-        JOIN users fu ON fu.id = s.first_added_by_user_id
-        WHERE sl.user_id = ?
+        LEFT JOIN users fu ON fu.id = s.first_added_by_user_id
+        WHERE sl.user_id = ? {liked_filter}
         ORDER BY sl.count DESC, sl.created_at DESC
         """,
         (viewer_id, profile_user_id),
@@ -2401,9 +2176,10 @@ def get_user_profile(
         liked_songs.append(sd)
 
     # Playlists liked by this user
+    liked_pl_filter = visible("p", viewer_id) if is_self else listed("p")
     cur.execute(
-        """
-        SELECT p.id, p.user_id, p.title, p.description, p.plays, pl.created_at AS liked_at, pl.count AS profile_user_likes,
+        f"""
+        SELECT p.id, p.user_id, p.title, p.description, p.plays, p.visibility, pl.created_at AS liked_at, pl.count AS profile_user_likes,
                u.username, u.display_name, u.avatar_color,
                (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count,
                (SELECT COALESCE(SUM(pl2.count), 0) FROM playlist_likes pl2 WHERE pl2.playlist_id = p.id) AS like_count,
@@ -2411,7 +2187,7 @@ def get_user_profile(
         FROM playlist_likes pl
         JOIN playlists p ON p.id = pl.playlist_id
         JOIN users u ON u.id = p.user_id
-        WHERE pl.user_id = ?
+        WHERE pl.user_id = ? AND {liked_pl_filter}
         ORDER BY pl.count DESC, pl.created_at DESC
         """,
         (viewer_id, profile_user_id),
@@ -2423,19 +2199,20 @@ def get_user_profile(
         pd["liked_by_me"] = bool(pd["my_likes"] > 0)
         liked_playlists.append(pd)
 
-    # Lineage: tracks others grabbed from this user
+    # Lineage: tracks others grabbed from this user (only grabs that live in public playlists)
     cur.execute(
-        """
+        f"""
         SELECT pt.created_at, pt.video_id, s.title AS song_title,
                u.id AS taker_user_id, u.username AS taker_username, u.display_name AS taker_display_name,
                tp.id AS target_playlist_id, tp.title AS target_playlist_title, tp.plays AS target_playlist_plays,
-               sp.id AS source_playlist_id, sp.title AS source_playlist_title
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', viewer_id)} THEN sp.id END AS source_playlist_id,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', viewer_id)} THEN sp.title END AS source_playlist_title
         FROM playlist_tracks pt
         JOIN songs s ON s.video_id = pt.video_id
         JOIN users u ON u.id = pt.added_by_user_id
         JOIN playlists tp ON tp.id = pt.playlist_id
         LEFT JOIN playlists sp ON sp.id = pt.source_playlist_id
-        WHERE pt.source_user_id = ? AND pt.added_by_user_id != ?
+        WHERE pt.source_user_id = ? AND pt.added_by_user_id != ? AND {listed('tp')}
         ORDER BY pt.created_at DESC
         """,
         (profile_user_id, profile_user_id),
@@ -2443,18 +2220,20 @@ def get_user_profile(
     grabs_from_user = [dict(r) for r in cur.fetchall()]
 
     # Lineage: tracks this user grabbed from others
+    target_filter = "tp.kind = 'playlist'" if is_self else listed("tp")
     cur.execute(
-        """
+        f"""
         SELECT pt.created_at, pt.video_id, s.title AS song_title,
                su.id AS source_user_id, su.username AS source_username, su.display_name AS source_display_name,
-               sp.id AS source_playlist_id, sp.title AS source_playlist_title,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', viewer_id)} THEN sp.id END AS source_playlist_id,
+               CASE WHEN sp.id IS NOT NULL AND {linkable('sp', viewer_id)} THEN sp.title END AS source_playlist_title,
                tp.id AS target_playlist_id, tp.title AS target_playlist_title, tp.plays AS target_playlist_plays
         FROM playlist_tracks pt
         JOIN songs s ON s.video_id = pt.video_id
         JOIN users su ON su.id = pt.source_user_id
         JOIN playlists tp ON tp.id = pt.playlist_id
         LEFT JOIN playlists sp ON sp.id = pt.source_playlist_id
-        WHERE pt.added_by_user_id = ? AND pt.source_user_id IS NOT NULL AND pt.source_user_id != ?
+        WHERE pt.added_by_user_id = ? AND pt.source_user_id IS NOT NULL AND pt.source_user_id != ? AND {target_filter}
         ORDER BY pt.created_at DESC
         """,
         (profile_user_id, profile_user_id),
@@ -2478,8 +2257,10 @@ def get_user_profile(
     }
 
 
-def resolve_comment_target(conn: sqlite3.Connection, target_type: str, target_id: str) -> Tuple[str, str]:
-    """Validate a comment target. Returns (canonical target_id, activity label); 400/404 otherwise."""
+def resolve_comment_target(
+    conn: sqlite3.Connection, target_type: str, target_id: str, viewer: int
+) -> Tuple[str, str, bool]:
+    """Validate a comment target the viewer can see. Returns (canonical id, activity label, public)."""
     cur = conn.cursor()
     raw = (target_id or "").strip()
     if target_type in ("playlist", "profile"):
@@ -2487,33 +2268,35 @@ def resolve_comment_target(conn: sqlite3.Connection, target_type: str, target_id
             raise HTTPException(status_code=400, detail=f"Invalid {target_type} id")
         num = int(raw)
         if target_type == "playlist":
-            r = cur.execute("SELECT title FROM playlists WHERE id = ?", (num,)).fetchone()
-            if not r:
-                raise HTTPException(status_code=404, detail="Playlist not found")
-            return str(num), f"playlist '{r['title']}'"
+            pl = require_visible_playlist(conn, num, viewer)
+            if pl["kind"] == "crate":
+                raise ApiError(400, "not_commentable", "Crates don't have comments.")
+            return str(num), f"playlist '{pl['title']}'", is_listed(pl)
         r = cur.execute("SELECT username FROM users WHERE id = ?", (num,)).fetchone()
         if not r:
             raise HTTPException(status_code=404, detail="User not found")
-        return str(num), f"@{r['username']}'s profile"
+        return str(num), f"@{r['username']}'s profile", True
     if target_type == "song":
         if not VIDEO_ID_PATTERN.match(raw):
             raise HTTPException(status_code=400, detail="Invalid song id")
         r = cur.execute("SELECT title FROM songs WHERE video_id = ?", (raw,)).fetchone()
-        if not r:
+        if not r or not song_visible(conn, raw, viewer):
             raise HTTPException(status_code=404, detail="Song not found in Webjam")
-        return raw, f"song '{r['title']}'"
+        return raw, f"song '{r['title']}'", song_visible(conn, raw, 0)
     raise HTTPException(status_code=400, detail="Invalid comment target_type")
 
 
 @app.get("/api/comments")
 def list_comments(
+    request: Request,
     target_type: str = Query(..., max_length=16),
     target_id: str = Query(..., max_length=64),
     before_id: Optional[int] = Query(None),
+    user_id: int = Query(1),
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """Older pages of a comment thread: the 50 comments before `before_id`, oldest first."""
-    canonical, _ = resolve_comment_target(conn, target_type, target_id)
+    canonical, _, _ = resolve_comment_target(conn, target_type, target_id, resolve_viewer(request, user_id))
     comments, has_more = fetch_comments_page(conn, target_type, canonical, before_id=before_id)
     return {"comments": comments, "has_more": has_more}
 
@@ -2526,7 +2309,7 @@ def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Co
     body = req.body.strip()
     if not body:
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
-    target_id, label = resolve_comment_target(conn, req.target_type, req.target_id)
+    target_id, label, public = resolve_comment_target(conn, req.target_type, req.target_id, req.author_user_id)
 
     ts = now_str()
     cur = conn.cursor()
@@ -2537,13 +2320,14 @@ def create_comment(req: CreateCommentRequest, request: Request, conn: sqlite3.Co
         """,
         (req.author_user_id, req.target_type, target_id, body, ts),
     )
-    cur.execute(
-        """
-        INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
-        VALUES (?, 'commented', ?, ?, ?, ?)
-        """,
-        (req.author_user_id, f"commented on {label}", req.target_type, target_id, ts),
-    )
+    if public:
+        cur.execute(
+            """
+            INSERT INTO activity_log (actor_user_id, action_type, summary, link_type, link_id, created_at)
+            VALUES (?, 'commented', ?, ?, ?, ?)
+            """,
+            (req.author_user_id, f"commented on {label}", req.target_type, target_id, ts),
+        )
     conn.commit()
 
     new_badges = evaluate_and_award_badges(conn, req.author_user_id)
@@ -2589,3 +2373,20 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 def serve_index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
+
+# Page routes for the plain-text clipboard links (§5.2): the SPA maps the path onto its hash routes.
+_P_ROUTE = re.compile(r"^\d{1,18}(?:-[A-Za-z0-9_-]{0,200})?$")
+
+
+@app.get("/p/{ref}")
+def serve_playlist_page(ref: str):
+    if not _P_ROUTE.match(ref):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/t/{video_id}")
+def serve_track_page(video_id: str):
+    if not VIDEO_ID_PATTERN.match(video_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(STATIC_DIR / "index.html"))

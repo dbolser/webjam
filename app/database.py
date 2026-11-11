@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Generator
 
 from app.badges import evaluate_and_award_badges
+from app.ops import ensure_crate
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -121,38 +122,87 @@ CREATE TABLE IF NOT EXISTS songs (
     title TEXT NOT NULL,
     channel_title TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
-    first_added_by_user_id INTEGER NOT NULL REFERENCES users(id),
-    first_added_playlist_id INTEGER,
-    first_added_at TEXT NOT NULL,
-    total_plays INTEGER DEFAULT 0
+    -- "First found by": NULL until the song's first placement in a public (LISTED) playlist.
+    first_added_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    first_added_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
+    first_added_at TEXT,
+    total_plays INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL  -- when Webjam cached the metadata
 );
 
 CREATE TABLE IF NOT EXISTS playlists (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'playlist' CHECK (kind IN ('playlist', 'crate')),
+    visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'unlisted', 'private')),
+    version INTEGER NOT NULL DEFAULT 0,
     title TEXT NOT NULL,
     description TEXT DEFAULT '',
     plays INTEGER DEFAULT 0,
+    forked_from_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CHECK (kind = 'playlist' OR visibility = 'private')  -- a crate is always private
 );
+CREATE UNIQUE INDEX IF NOT EXISTS one_crate_per_user ON playlists(user_id) WHERE kind = 'crate';
+CREATE INDEX IF NOT EXISTS idx_playlists_listed ON playlists(kind, visibility, updated_at);
+CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists(user_id, updated_at);
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
     video_id TEXT NOT NULL REFERENCES songs(video_id),
-    position INTEGER NOT NULL,
+    position REAL NOT NULL,  -- fractional sort key, NOT the 1-based index (the API exposes the ordinal)
     added_by_user_id INTEGER NOT NULL REFERENCES users(id),
     track_note TEXT DEFAULT '',
-    start_seconds INTEGER DEFAULT NULL,
-    end_seconds INTEGER DEFAULT NULL,
+    start_seconds REAL DEFAULT NULL,  -- REAL now; the API keeps whole seconds until Phase 2
+    end_seconds REAL DEFAULT NULL,
     migrated_from_video_id TEXT DEFAULT NULL,
     migrated_from_title TEXT DEFAULT NULL,
     display_title TEXT DEFAULT NULL,  -- per-row title override; songs.title stays YouTube's
     source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
     source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    -- No FK on purpose: an FK would SET NULL other users' links whenever a row is deleted or moved,
+    -- and undo could never put them back. Readers treat a dangling id as no link.
+    source_track_id INTEGER,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_pt_order ON playlist_tracks(playlist_id, position, id);
+CREATE INDEX IF NOT EXISTS idx_pt_video ON playlist_tracks(video_id);
+CREATE INDEX IF NOT EXISTS idx_pt_source_user ON playlist_tracks(source_user_id);
+CREATE INDEX IF NOT EXISTS idx_pt_source_playlist ON playlist_tracks(source_playlist_id);
+CREATE INDEX IF NOT EXISTS idx_pt_source_track ON playlist_tracks(source_track_id);
+
+-- The op log: one row per per-playlist effect of an op batch. The undo stack is per user.
+CREATE TABLE IF NOT EXISTS playlist_ops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id TEXT NOT NULL UNIQUE,      -- "<client op_id>#<n>"
+    batch_id TEXT NOT NULL,          -- the client's op_id (idempotency key)
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    group_id TEXT NOT NULL,          -- undo unit; defaults to batch_id
+    kind TEXT NOT NULL CHECK (kind IN ('insert', 'delete', 'move', 'update', 'set_meta', 'reorder')),
+    forward_json TEXT NOT NULL,
+    inverse_json TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    undone_at TEXT,
+    discarded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ops_user ON playlist_ops(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_ops_group ON playlist_ops(user_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_ops_batch ON playlist_ops(user_id, batch_id);
+CREATE INDEX IF NOT EXISTS idx_ops_playlist ON playlist_ops(playlist_id, id);
+
+CREATE TABLE IF NOT EXISTS user_dock (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    sort REAL,
+    last_used_at TEXT,
+    PRIMARY KEY (user_id, playlist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dock_recent ON user_dock(user_id, last_used_at);
 
 CREATE TABLE IF NOT EXISTS play_events (
     viewer_key TEXT NOT NULL,
@@ -194,6 +244,7 @@ CREATE TABLE IF NOT EXISTS user_badges (
     badge_key TEXT NOT NULL,
     context_note TEXT DEFAULT '',
     awarded_at TEXT NOT NULL,
+    op_group_key TEXT NULL,  -- "<actor id>:<group id>" when an undoable op group earned it (undo revokes it)
     UNIQUE(user_id, badge_key)
 );
 
@@ -204,159 +255,17 @@ CREATE TABLE IF NOT EXISTS activity_log (
     summary TEXT NOT NULL,
     link_type TEXT DEFAULT '',
     link_id TEXT DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    op_group_id TEXT NULL  -- set by apply_ops so that undo can remove the lines
 );
+CREATE INDEX IF NOT EXISTS idx_activity_group ON activity_log(actor_user_id, op_group_id);
 """
 
-
-LEGACY_VIDEO_ID_MAP = {
-    "q4xKvHANqjk": (
-        "0PsOJ_fRckg",
-        "Khruangbin - Full Performance (Live on KEXP)",
-        "KEXP",
-    ),
-    "U4U19zwFENs": (
-        "TNsSBhl_2LI",
-        "Men I Trust - Lauren",
-        "Men I Trust",
-    ),
-    "Z5NoQg8LdDk": (
-        "c_56qQqxvm4",
-        "Tycho - Full Performance (Live on KEXP)",
-        "KEXP",
-    ),
-    "c3yEjD_oijw": (
-        "4fHw4GeW3EU",
-        "Kiasmos - Full Performance (Live on KEXP)",
-        "KEXP",
-    ),
-    "N7FZ2cUX1rM": (
-        "w2oGFEsaG5c",
-        "Bicep - Glue & Apricots (Glastonbury 2022)",
-        "BBC Music",
-    ),
-    "2fX6qg03L38": (
-        "-y9rkNXBuhg",
-        "Parcels - Overnight (Live from Hansa Studios, Berlin)",
-        "Parcels",
-    ),
-    "L9rQ6LA63Y0": (
-        "6647smeduGI",
-        "Alvvays - Full Performance (Live on KEXP)",
-        "KEXP",
-    ),
-    "T3T9pG9s-h0": (
-        "BI2Et19vDCM",
-        "CARIBOU - Can't Do Without You",
-        "Caribou",
-    ),
-    "p6vH6ntI1vY": (
-        "S8fFo4REHOE",
-        "Floating Points - LesAlpx (Official Audio)",
-        "Floating Points",
-    ),
-}
-
-
-def ensure_playlist_track_clip_columns(conn: sqlite3.Connection) -> None:
-    """Ensure start_seconds/end_seconds on playlist_tracks, drop legacy UNIQUE(playlist_id, video_id), and ensure count on likes."""
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(playlist_tracks)")
-    cols = {row["name"] for row in cur.fetchall()}
-    changed = False
-    if "start_seconds" not in cols:
-        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN start_seconds INTEGER DEFAULT NULL")
-        changed = True
-    if "end_seconds" not in cols:
-        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN end_seconds INTEGER DEFAULT NULL")
-        changed = True
-    if "migrated_from_video_id" not in cols:
-        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN migrated_from_video_id TEXT DEFAULT NULL")
-        changed = True
-    if "migrated_from_title" not in cols:
-        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN migrated_from_title TEXT DEFAULT NULL")
-        changed = True
-
-    # If playlist_tracks still has the legacy UNIQUE(playlist_id, video_id) constraint, rebuild without it
-    cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='playlist_tracks'")
-    table_sql_row = cur.fetchone()
-    if table_sql_row and "UNIQUE" in (table_sql_row["sql"] or "").upper():
-        conn.execute("PRAGMA foreign_keys = OFF;")
-        try:
-            cur.execute(
-                """
-                CREATE TABLE playlist_tracks_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-                    video_id TEXT NOT NULL REFERENCES songs(video_id),
-                    position INTEGER NOT NULL,
-                    added_by_user_id INTEGER NOT NULL REFERENCES users(id),
-                    track_note TEXT DEFAULT '',
-                    start_seconds INTEGER DEFAULT NULL,
-                    end_seconds INTEGER DEFAULT NULL,
-                    migrated_from_video_id TEXT DEFAULT NULL,
-                    migrated_from_title TEXT DEFAULT NULL,
-                    source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
-                    source_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO playlist_tracks_new
-                (id, playlist_id, video_id, position, added_by_user_id, track_note, start_seconds, end_seconds, migrated_from_video_id, migrated_from_title, source_playlist_id, source_user_id, created_at)
-                SELECT id, playlist_id, video_id, position, added_by_user_id, track_note, start_seconds, end_seconds, migrated_from_video_id, migrated_from_title, source_playlist_id, source_user_id, created_at
-                FROM playlist_tracks
-                """
-            )
-            cur.execute("DROP TABLE playlist_tracks")
-            cur.execute("ALTER TABLE playlist_tracks_new RENAME TO playlist_tracks")
-            changed = True
-        finally:
-            conn.execute("PRAGMA foreign_keys = ON;")
-
-    # Backfill migrated_from_video_id for any track imported earlier with the migration note pattern
-    cur.execute(
-        """
-        SELECT id, track_note FROM playlist_tracks
-        WHERE migrated_from_video_id IS NULL
-          AND track_note LIKE 'Migrated to embeddable version from %'
-        """
-    )
-    for row in cur.fetchall():
-        orig_vid = row["track_note"].replace("Migrated to embeddable version from ", "").strip()[:11]
-        if orig_vid:
-            cur.execute(
-                "UPDATE playlist_tracks SET migrated_from_video_id = ? WHERE id = ?",
-                (orig_vid, row["id"]),
-            )
-            changed = True
-
-    # Columns added in Phase 0 (fresh DBs get them from SCHEMA_SQL; this keeps old dev DBs opening)
-    cur.execute("PRAGMA table_info(playlist_tracks)")
-    if "display_title" not in {row["name"] for row in cur.fetchall()}:
-        cur.execute("ALTER TABLE playlist_tracks ADD COLUMN display_title TEXT DEFAULT NULL")
-        changed = True
-    cur.execute("PRAGMA table_info(users)")
-    if "session_epoch" not in {row["name"] for row in cur.fetchall()}:
-        cur.execute("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
-        changed = True
-
-    cur.execute("PRAGMA table_info(playlist_likes)")
-    pl_like_cols = {row["name"] for row in cur.fetchall()}
-    if "count" not in pl_like_cols:
-        cur.execute("ALTER TABLE playlist_likes ADD COLUMN count INTEGER NOT NULL DEFAULT 1")
-        changed = True
-
-    cur.execute("PRAGMA table_info(song_likes)")
-    song_like_cols = {row["name"] for row in cur.fetchall()}
-    if "count" not in song_like_cols:
-        cur.execute("ALTER TABLE song_likes ADD COLUMN count INTEGER NOT NULL DEFAULT 1")
-        changed = True
-
-    if changed:
-        conn.commit()
+SCHEMA_VERSION = 3
+SCHEMA_CHANGED_MESSAGE = (
+    "Webjam Phase 1 changed the schema. Delete the database file (WEBJAM_DB_PATH) and restart; "
+    "it will be reseeded."
+)
 
 
 def ensure_initial_song_likes(conn: sqlite3.Connection) -> None:
@@ -396,71 +305,44 @@ def ensure_initial_song_likes(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def migrate_legacy_seed_videos(conn: sqlite3.Connection) -> None:
-    """Replace any legacy placeholder/restricted seed video IDs in an existing DB."""
-    cur = conn.cursor()
-    conn.execute("PRAGMA foreign_keys = OFF;")
+def _check_schema_version(conn: sqlite3.Connection) -> None:
+    """Refuse to open a pre-Phase 1 database: there is no migration, wipe and reseed instead."""
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "users" not in tables:
+        return
+    if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+        return
+    version = None
+    if "meta" in tables:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        version = row["value"] if row else None
     try:
-        changed = False
-        for old_vid, (new_vid, new_title, new_channel) in LEGACY_VIDEO_ID_MAP.items():
-            cur.execute("SELECT 1 FROM songs WHERE video_id = ?", (old_vid,))
-            if not cur.fetchone():
-                continue
-            changed = True
-            new_thumb = f"https://i.ytimg.com/vi/{new_vid}/hqdefault.jpg"
-            cur.execute("SELECT 1 FROM songs WHERE video_id = ?", (new_vid,))
-            if cur.fetchone():
-                cur.execute("DELETE FROM songs WHERE video_id = ?", (old_vid,))
-            else:
-                cur.execute(
-                    """
-                    UPDATE songs
-                    SET video_id = ?, title = ?, channel_title = ?, thumbnail_url = ?
-                    WHERE video_id = ?
-                    """,
-                    (new_vid, new_title, new_channel, new_thumb, old_vid),
-                )
-            cur.execute(
-                "UPDATE playlist_tracks SET video_id = ? WHERE video_id = ?",
-                (new_vid, old_vid),
-            )
-            cur.execute(
-                "UPDATE OR IGNORE song_likes SET video_id = ? WHERE video_id = ?",
-                (new_vid, old_vid),
-            )
-            cur.execute(
-                "UPDATE comments SET target_id = ? WHERE target_type = 'song' AND target_id = ?",
-                (new_vid, old_vid),
-            )
-            cur.execute(
-                "UPDATE activity_log SET link_id = ? WHERE link_type = 'song' AND link_id = ?",
-                (new_vid, old_vid),
-            )
-        if changed:
-            conn.commit()
-    finally:
-        conn.execute("PRAGMA foreign_keys = ON;")
+        ok = version is not None and int(version) >= SCHEMA_VERSION
+    except ValueError:
+        ok = False
+    if not ok:
+        raise RuntimeError(SCHEMA_CHANGED_MESSAGE)
 
 
 def init_db() -> None:
     conn = get_connection()
     try:
+        _check_schema_version(conn)
         conn.execute("PRAGMA journal_mode = WAL;")  # persistent; concurrent readers + one writer
         conn.executescript(SCHEMA_SQL)
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+        )
         # A random id per database: sessions carry it, so a wiped DB rejects old cookies.
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('install_id', ?)", (secrets.token_urlsafe(16),)
         )
         conn.commit()
         tighten_db_permissions(DB_PATH)
-        ensure_playlist_track_clip_columns(conn)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS cnt FROM users")
         if cur.fetchone()["cnt"] == 0:
             seed_initial_data(conn)
-        else:
-            migrate_legacy_seed_videos(conn)
-            ensure_initial_song_likes(conn)
     finally:
         conn.close()
 
@@ -557,8 +439,8 @@ def seed_initial_data(conn: sqlite3.Connection) -> None:
     ]
     cur.executemany(
         """
-        INSERT INTO playlists (id, user_id, title, description, plays, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO playlists (id, user_id, kind, visibility, version, title, description, plays, created_at, updated_at)
+        VALUES (?, ?, 'playlist', 'public', 0, ?, ?, ?, ?, ?)
         """,
         playlists,
     )
@@ -651,8 +533,8 @@ def seed_initial_data(conn: sqlite3.Connection) -> None:
     for vid, title, ch, uid, pid, ts, plays in songs:
         cur.execute(
             """
-            INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO songs (video_id, title, channel_title, thumbnail_url, first_added_by_user_id, first_added_playlist_id, first_added_at, total_plays, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 vid,
@@ -663,6 +545,7 @@ def seed_initial_data(conn: sqlite3.Connection) -> None:
                 pid,
                 ts,
                 plays,
+                ts,
             ),
         )
 
@@ -830,8 +713,34 @@ def seed_initial_data(conn: sqlite3.Connection) -> None:
         (playlist_id, video_id, position, added_by_user_id, track_note, source_playlist_id, source_user_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        tracks,
+        [(pid, vid, float(pos), *rest) for pid, vid, pos, *rest in tracks],
     )
+
+    # Every seeded user gets a crate (ids 5-8, after playlists 1-4).
+    crates = {uid: ensure_crate(conn, uid) for uid in (1, 2, 3, 4)}
+    # Dan's crate holds two rows copied from Maya's and Julian's playlists. They are the
+    # privacy canary: they must never show up in any count, feed or badge.
+    for pos, (vid, src_pid, ts) in enumerate(
+        (("c_56qQqxvm4", 2, "2026-11-01 19:00:00"), ("6647smeduGI", 3, "2026-11-01 19:05:00")), start=1
+    ):
+        src = cur.execute(
+            """
+            SELECT pt.id, p.user_id FROM playlist_tracks pt JOIN playlists p ON p.id = pt.playlist_id
+            WHERE pt.playlist_id = ? AND pt.video_id = ? ORDER BY pt.position, pt.id LIMIT 1
+            """,
+            (src_pid, vid),
+        ).fetchone()
+        cur.execute(
+            """
+            INSERT INTO playlist_tracks
+            (playlist_id, video_id, position, added_by_user_id, track_note, source_playlist_id, source_user_id,
+             source_track_id, created_at)
+            VALUES (?, ?, ?, 1, '', ?, ?, ?, ?)
+            """,
+            (crates[1], vid, float(pos), src_pid, src["user_id"], src["id"], ts),
+        )
+    # Dan pins his playlist to the dock.
+    cur.execute("INSERT INTO user_dock (user_id, playlist_id, pinned, sort, last_used_at) VALUES (1, 4, 1, 1.0, NULL)")
 
     # Likes
     likes = [

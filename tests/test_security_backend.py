@@ -531,44 +531,35 @@ def test_first_finder_credit_is_verified(demo):
     assert (row["source_playlist_id"], row["source_user_id"]) == (1, 2)
 
 
-# --- #4 snapshot stopgap ------------------------------------------------------
+# --- #4 the snapshot stopgap is gone: /api/ops never accepts client provenance --------
 
-def _snapshot(client, pid, tracks, user_id):
-    return client.put(
-        f"/api/playlists/{pid}/snapshot",
-        json={"user_id": user_id, "title": "T", "description": "", "tracks": tracks},
-    )
+def _ops(client, user_id, op_id, ops):
+    return client.post("/api/ops", json={"user_id": user_id, "op_id": op_id, "ops": ops})
 
 
-def test_snapshot_ignores_client_attribution(demo):
-    before = _track_rows(4)  # dan's playlist; rows 3-4 were grabbed from lucas/maya
-    forged = [
-        {**{k: r[k] for k in ("id", "video_id", "track_note", "start_seconds", "end_seconds")},
-         "added_by_user_id": 3, "source_user_id": 3, "source_playlist_id": 2, "created_at": "1999-01-01 00:00:00"}
-        for r in before
-    ]
-    forged.append({"video_id": "TNsSBhl_2LI", "added_by_user_id": 3, "source_user_id": 3,
-                   "source_playlist_id": 3, "created_at": "1999-01-01 00:00:00"})
-    forged.append({"id": 999999, "video_id": "6647smeduGI", "added_by_user_id": 2, "source_playlist_id": 1})
-    assert _snapshot(demo, 4, forged, user_id=1).status_code == 200
-
-    after = _track_rows(4)
-    for b, a in zip(before, after):
-        assert (a["id"], a["added_by_user_id"], a["source_user_id"], a["source_playlist_id"], a["created_at"]) == (
-            b["id"], b["added_by_user_id"], b["source_user_id"], b["source_playlist_id"], b["created_at"])
-    new_verified, new_unverified = after[-2], after[-1]
-    # Playlist 3 (julian, 4) really contains TNsSBhl_2LI, so that source is kept, owner derived.
-    assert (new_verified["added_by_user_id"], new_verified["source_user_id"]) == (1, 4)
-    assert new_verified["created_at"] != "1999-01-01 00:00:00"
-    # Playlist 1 doesn't contain 6647smeduGI: no source, attributed to the actor.
-    assert (new_unverified["added_by_user_id"], new_unverified["source_user_id"]) == (1, None)
+def test_ops_reject_client_attribution(demo):
+    for i, forged in enumerate(({"added_by_user_id": 3}, {"source_user_id": 3}, {"source_playlist_id": 2},
+                                {"source_track_id": 4}, {"created_at": "1999-01-01 00:00:00"},
+                                {"migrated_from_video_id": "Z5NoQg8LdDk"})):
+        res = _ops(demo, 1, f"forge-{i}", [{"kind": "insert", "playlist_id": 4,
+                                            "items": [{"video_id": "TNsSBhl_2LI", **forged}]}])
+        assert res.status_code == 422, forged
+    assert demo.put("/api/playlists/4/snapshot", json={"user_id": 1, "title": "T", "tracks": []}).status_code in (404, 405)
+    # The legal way to credit someone is a ref; the server derives the owner.
+    res = _ops(demo, 1, "credit-ok", [{"kind": "insert", "playlist_id": 4,
+                                       "items": [{"video_id": "TNsSBhl_2LI", "ref": {"playlist_id": 3, "user_id": 2}}]}])
+    assert res.status_code == 200
+    row = _track_rows(4)[-1]
+    assert (row["added_by_user_id"], row["source_user_id"], row["source_playlist_id"]) == (1, 4, 3)
+    assert row["created_at"] != "1999-01-01 00:00:00"
 
 
-def test_snapshot_validates_rows(demo):
-    assert _snapshot(demo, 4, [{"video_id": "bad id"}], 1).status_code == 400
-    assert _snapshot(demo, 4, [{"video_id": "AAAAAAAAAAA"}], 1).status_code == 400  # not a Webjam song
-    too_many = [{"video_id": "0PsOJ_fRckg"}] * 1001
-    assert _snapshot(demo, 4, too_many, 1).status_code == 400
+def test_ops_validate_rows(demo):
+    assert _ops(demo, 1, "v1", [{"kind": "insert", "playlist_id": 4, "items": [{"video_id": "bad id"}]}]).status_code == 422
+    missing = _ops(demo, 1, "v2", [{"kind": "insert", "playlist_id": 4, "items": [{"video_id": "zzzzzzzzzzz"}]}])
+    assert missing.status_code == 400 and missing.json()["code"] == "video_not_found"
+    too_many = _ops(demo, 1, "v3", [{"kind": "insert", "playlist_id": 4, "items": [{"video_id": "0PsOJ_fRckg"}] * 51}])
+    assert too_many.status_code == 400 and too_many.json()["code"] == "batch_too_large"
     assert len(_track_rows(4)) == 4  # nothing changed
 
 

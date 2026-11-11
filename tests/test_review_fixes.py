@@ -1,4 +1,4 @@
-"""Regressions for the Phase 0 review findings (snapshot ids, provenance, invites,
+"""Regressions for the Phase 0 review findings (undo ids, provenance, invites,
 sessions, demo-mode exposure, plays, handles, search quota, input bounds, races)."""
 
 import asyncio
@@ -55,33 +55,30 @@ def track_row(track_id):
         conn.close()
 
 
-# --- snapshot restore can't poison AUTOINCREMENT ----------------------------------
+# --- undo (replaces the snapshot stopgap): ids are never client-chosen ---------------
 
-def test_snapshot_cannot_push_track_ids_past_sqlite_sequence(demo):
+def test_undo_restores_deleted_rows_under_their_old_ids(demo):
     pid = demo.post("/api/playlists", json={"user_id": 1, "title": "mine", "initial_urls": "0PsOJ_fRckg"}).json()["playlist_id"]
-    huge = demo.put(f"/api/playlists/{pid}/snapshot",
-                    json={"user_id": 1, "title": "mine", "tracks": [{"id": 2**63 - 1, "video_id": "0PsOJ_fRckg"}]})
-    assert huge.status_code == 422
-    big = demo.put(f"/api/playlists/{pid}/snapshot",
-                   json={"user_id": 1, "title": "mine", "tracks": [{"id": 2**53, "video_id": "0PsOJ_fRckg"}]})
-    assert big.status_code == 200
+    # A client can't choose a row id at all: unknown fields are rejected.
+    forged = demo.post("/api/ops", json={"user_id": 1, "op_id": "forge-id", "ops": [
+        {"kind": "insert", "playlist_id": pid, "items": [{"id": 2**63 - 1, "video_id": "0PsOJ_fRckg"}]}]})
+    assert forged.status_code == 422
     conn = db()
     assert conn.execute("SELECT MAX(id) FROM playlist_tracks").fetchone()[0] < 10_000
     conn.close()
     assert demo.post(f"/api/playlists/{pid}/tracks", json={"user_id": 1, "urls_or_ids": "TNsSBhl_2LI"}).status_code == 200
 
     # Undoing a delete still brings the row back under its old id.
-    pl = demo.get(f"/api/playlists/{pid}").json()
+    pl = demo.get(f"/api/playlists/{pid}?user_id=1").json()
     tid = pl["tracks"][-1]["id"]
-    demo.delete(f"/api/playlists/{pid}/tracks/{tid}?user_id=1")
-    tracks = [{"id": t["id"], "video_id": t["video_id"]} for t in pl["tracks"]]
-    assert demo.put(f"/api/playlists/{pid}/snapshot", json={"user_id": 1, "title": "mine", "tracks": tracks}).status_code == 200
-    assert [t["id"] for t in demo.get(f"/api/playlists/{pid}").json()["tracks"]] == [t["id"] for t in pl["tracks"]]
+    assert demo.delete(f"/api/playlists/{pid}/tracks/{tid}?user_id=1").status_code == 200
+    assert demo.post("/api/ops/undo", json={"user_id": 1}).status_code == 200
+    assert [t["id"] for t in demo.get(f"/api/playlists/{pid}?user_id=1").json()["tracks"]] == [t["id"] for t in pl["tracks"]]
 
 
 # --- grab credit can't be moved onto another song ---------------------------------
 
-def test_snapshot_and_swap_drop_forged_grab_credit(demo):
+def test_swap_drops_forged_grab_credit_and_undo_restores_it(demo):
     # Seed playlist 1 (owner 2) contains 0PsOJ_fRckg and TNsSBhl_2LI but not S8fFo4REHOE.
     pid = demo.post("/api/playlists", json={"user_id": 3, "title": "grabs"}).json()["playlist_id"]
 
@@ -93,15 +90,15 @@ def test_snapshot_and_swap_drop_forged_grab_credit(demo):
         return tid
 
     tid = grab()
-    r = demo.put(f"/api/playlists/{pid}/snapshot",
-                 json={"user_id": 3, "title": "grabs", "tracks": [{"id": tid, "video_id": "S8fFo4REHOE"}]})
+    r = demo.post("/api/ops", json={"user_id": 3, "op_id": "swap-1", "ops": [
+        {"kind": "update", "playlist_id": pid, "track_id": tid, "set": {"video_id": "S8fFo4REHOE"}}]})
     assert r.status_code == 200
     row = track_row(tid)
     assert row["video_id"] == "S8fFo4REHOE" and row["source_user_id"] is None and row["source_playlist_id"] is None
-    # Undoing that (back to the grabbed song, with its source) restores the credit.
-    demo.put(f"/api/playlists/{pid}/snapshot", json={"user_id": 3, "title": "grabs", "tracks": [
-        {"id": tid, "video_id": "0PsOJ_fRckg", "source_playlist_id": 1}]})
-    assert track_row(tid)["source_user_id"] == 2
+    # Undoing that (back to the grabbed song) restores the credit.
+    assert demo.post("/api/ops/undo", json={"user_id": 3}).status_code == 200
+    row = track_row(tid)
+    assert row["video_id"] == "0PsOJ_fRckg" and row["source_user_id"] == 2
 
     tid2 = grab()
     r = demo.put(f"/api/playlists/{pid}/tracks/{tid2}",
@@ -374,13 +371,17 @@ def test_out_of_range_numbers_are_400_not_500(demo):
     assert r.status_code == 200 and r.json()["start_seconds"] is None
 
 
-def test_snapshot_rejects_bad_clip_windows(demo):
-    def put(start, end):
-        return demo.put("/api/playlists/1/snapshot", json={"user_id": 2, "title": "p", "tracks": [
-            {"video_id": "0PsOJ_fRckg", "start_seconds": start, "end_seconds": end}]})
+def test_ops_reject_bad_clip_windows(demo):
+    n = [0]
 
-    assert put(500, -5).status_code == 422
-    assert put(10**30, None).status_code == 422
+    def put(start, end):
+        n[0] += 1
+        return demo.post("/api/ops", json={"user_id": 2, "op_id": f"clip-{n[0]}", "ops": [
+            {"kind": "insert", "playlist_id": 1, "items": [
+                {"video_id": "0PsOJ_fRckg", "start_seconds": start, "end_seconds": end}]}]})
+
+    assert put(500, -5).json()["code"] == "bad_clip"
+    assert put(10**30, None).status_code == 400
     assert put(500, 100).status_code == 400
     assert put(10, 100).status_code == 200
 
@@ -503,7 +504,9 @@ def _fn(name):
 
 
 def test_frontend_follows_the_backend_changes():
-    assert "display_title" in _fn("capturePlaylistSnapshot")
+    # Phase 1a: undo goes through the server-side op log; the snapshot endpoint is gone.
+    assert "/api/ops/undo" in _fn("runUndo") and "runUndo(" in _fn("undoLastPlaylistChange")
+    assert "/snapshot" not in APP_JS and "capturePlaylistSnapshot" not in APP_JS
     assert "Array.isArray(data.detail)" in _fn("api")
     assert "res.counted" in _fn("incrementPlaylistSpin") and "res.counted" in _fn("simulateExtraSpin")
     assert "youtube_connected" in _fn("loadMyYouTubePlaylists")
