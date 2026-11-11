@@ -10,7 +10,8 @@
 // source: { playlistId, title, kind } attached to the player queue (play counting, "from" link).
 // Rows are TrackMini or GET-playlist rows: { id, playlist_id?, video_id, title, channel_title,
 // thumbnail_url, start_seconds, end_seconds, track_note?, source_username?, source_playlist_id?,
-// source_playlist_title?, playlist_count? }. Temp rows (negative ids) render as pending.
+// source_playlist_title?, playlist_count?, found_by? (a handle: "found by @x" hop),
+// together_count? ("together in N", on the track page's "often alongside") }. Temp rows (negative ids) render as pending.
 
 import { html, nothing, repeat, classMap } from '../lit.js';
 import { state } from '../store.js';
@@ -54,9 +55,11 @@ function metaLine(row, context) {
       parts.push(html`<a class="hop" href=${userUrl(row.source_username)}>via @${row.source_username}</a>`);
     }
   }
+  if (row.found_by) parts.push(html`<a class="hop" href=${userUrl(row.found_by)}>found by @${row.found_by}</a>`);
   const min = context === 'playlist' ? 2 : 1;
   const n = Number(row.playlist_count) || 0;
   if (n >= min) parts.push(html`<a class="hop" href=${trackUrl(row.video_id)}>in ${plural(n, 'playlist')}</a>`);
+  if (Number(row.together_count) > 0) parts.push(html`<span class="sep">together in ${row.together_count}</span>`);
   if (state.dead.has(row.video_id)) parts.push(html`<span class="sep dead-label">unavailable</span>`);
   const len = displayLength(row);
   if (len) parts.push(html`<span class="sep dur-inline mono">${mmss(len)}</span>`);
