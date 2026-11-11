@@ -61,6 +61,14 @@ export function userUrl(handle) {
 }
 
 /** A same-origin path (starts with one "/", no scheme, no "//"); anything else becomes "/". */
+/** /auth/google/login, with ?next=<current path> for an action-triggered sign-in (§3.9). The top-bar
+ *  "Sign in" link stays bare so a deliberate sign-in lands on my page. */
+export function signInUrl(next) {
+  const n = next == null ? '' : localUrl(next);
+  if (!n || n === '/' || /^\/(auth|api)\//.test(n) || n.length > 512) return '/auth/google/login';
+  return `/auth/google/login?next=${encodeURIComponent(n)}`;
+}
+
 export function localUrl(path) {
   const p = String(path || '');
   if (!p.startsWith('/') || p.startsWith('//') || p.startsWith('/\\')) return '/';

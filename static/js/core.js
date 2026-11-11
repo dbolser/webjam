@@ -14,7 +14,7 @@ import { itemsFromRows, itemFromRow } from './player/queue.js';
 import * as player from './player/player.js';
 import { reloadDock } from './session.js';
 import { openSlot } from './panels/dock.js';
-import { playlistUrl, trackUrl, absoluteUrl } from './format.js';
+import { playlistUrl, trackUrl, absoluteUrl, signInUrl } from './format.js';
 import { cycleTheme } from './theme.js';
 
 // --- helpers ------------------------------------------------------------------------------------
@@ -77,7 +77,7 @@ function requireSignIn(intent) {
   const handled = slots.call('auth.required', intent);
   if (handled === undefined) {
     toast.show(state.auth.mode === 'demo' ? 'Pick a persona to do that.' : 'Sign in to collect tracks.',
-      state.auth.mode === 'demo' ? {} : { action: { label: 'Sign in', href: '/auth/google/login' } });
+      state.auth.mode === 'demo' ? {} : { action: { label: 'Sign in', href: signInUrl(location.pathname + location.search) } });
   }
 }
 

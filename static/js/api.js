@@ -4,6 +4,7 @@
 import { state, reconcile, rollback, settle, refreshPlaylists } from './store.js';
 import * as slots from './slots.js';
 import { toast } from './ui/toast.js';
+import { signInUrl } from './format.js';
 
 const DEMO_KEY = 'webjam_user_id';
 
@@ -104,7 +105,7 @@ function handleSignedOut(err, intent) {
   err.code = err.code || 'signed_out';
   const handled = slots.call('auth.required', { ...intent, error: err });
   if (handled === undefined) {
-    toast.show('Sign in to do that.', { action: { label: 'Sign in', href: '/auth/google/login' } });
+    toast.show('Sign in to do that.', { action: { label: 'Sign in', href: signInUrl(location.pathname + location.search) } });
   }
   err.handled = true;
 }

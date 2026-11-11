@@ -1,12 +1,12 @@
 // Discover (F's minimal version; Lane B replaces this file with the tabbed view).
 // Anonymous "/" lands here: listed playlist cards with three preview tracks, paged by 20.
-// Uses /api/discover and falls back to /api/feed until the backend lane lands it.
+// Uses GET /api/discover?tab=playlists&sort=fresh (next_offset paging).
 
 import { html, nothing, repeat } from '../lit.js';
 import { state, update } from '../store.js';
 import * as api from '../api.js';
 import { registerActions } from '../actions.js';
-import { playlistCard, feedCard } from '../components/playlist-card.js';
+import { playlistCard } from '../components/playlist-card.js';
 import { empty } from '../components/empty.js';
 
 let cards = [];
@@ -15,16 +15,8 @@ let loadingMore = false;
 let rerender = () => {};
 
 async function page(offset) {
-  try {
-    const d = await api.get('/api/discover', { tab: 'playlists', sort: 'fresh', offset, limit: 20 });
-    return { playlists: d.playlists || [], next: d.next_offset ?? null };
-  } catch (err) {
-    if (!(err instanceof api.ApiError) || err.status !== 404) throw err;
-    const feed = await api.get('/api/feed');
-    const all = (feed.playlists || []).filter((p) => (p.track_count ?? (p.tracks || []).length) > 0).map(feedCard);
-    const slice = all.slice(offset, offset + 20);
-    return { playlists: slice, next: offset + 20 < all.length ? offset + 20 : null };
-  }
+  const d = await api.get('/api/discover', { tab: 'playlists', sort: 'fresh', offset, limit: 20 });
+  return { playlists: d.playlists || [], next: d.next_offset ?? null };
 }
 
 export async function load(ctx) {

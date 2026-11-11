@@ -1,12 +1,12 @@
 // My page (signed in, "/"): my playlists first, then the crate, then the discovery sections
-// (docs/phase1b-shell.md §2.4). One call: GET /api/me/home. Until the backend lane lands that
-// endpoint, a 404 falls back to /api/bootstrap data + /api/me/dock + /api/feed.
+// (docs/phase1b-shell.md §2.4). One call: GET /api/me/home (plus /api/discover for "Start here"
+// when I have no playlists yet).
 
 import { html, nothing, repeat } from '../lit.js';
-import { state, update, rowsOf, loadPlaylist } from '../store.js';
+import { state, update } from '../store.js';
 import * as api from '../api.js';
 import * as slots from '../slots.js';
-import { playlistCard, feedCard } from '../components/playlist-card.js';
+import { playlistCard } from '../components/playlist-card.js';
 import { trackList, compactList } from '../components/track-row.js';
 import { avatar } from '../components/avatar.js';
 import { empty } from '../components/empty.js';
@@ -15,53 +15,12 @@ import { playlistUrl, trackUrl, userUrl, relTime, isoTs } from '../format.js';
 
 let startHere = null; // discover cards for a new user with no playlists
 
-function userMini(u) {
-  return u ? { id: u.id, username: u.username, display_name: u.display_name, avatar_color: u.avatar_color } : null;
-}
-
-async function fallbackHome() {
-  const me = state.auth.user;
-  const feed = await api.get('/api/feed').catch(() => null);
-  const feedById = new Map(((feed && feed.playlists) || []).map((p) => [p.id, p]));
-  const playlists = (me.playlists || [])
-    .filter((p) => p.kind === 'playlist')
-    .map((p) => feedCard({ ...p, ...(feedById.get(p.id) || {}), user_id: me.id, username: me.username,
-      display_name: me.display_name, avatar_color: me.avatar_color, visibility: p.visibility }));
-  const crateId = state.auth.crateId;
-  let recent = [];
-  if (crateId) {
-    await loadPlaylist(crateId, { force: true }).catch(() => null);
-    recent = rowsOf(crateId).slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 5);
-  }
-  return {
-    user: { ...userMini(me), bio: me.bio, needs_handle: !!me.needs_handle },
-    playlists,
-    crate: { id: crateId, version: null, track_count: crateId ? rowsOf(crateId).length : 0, recent },
-    neighbours: [],
-    fresh: [],
-    about_you: [],
-    activity: ((feed && feed.activity) || []).filter((a) => a.action_type !== 'earned_badge').slice(0, 20),
-    fallback: true,
-  };
-}
-
 export async function load() {
-  let home;
-  try {
-    home = await api.get('/api/me/home');
-  } catch (err) {
-    if (err instanceof api.ApiError && (err.status === 404 || err.status === 405)) home = await fallbackHome();
-    else throw err;
-  }
+  const home = await api.get('/api/me/home');
   startHere = null;
   if (!home.playlists || !home.playlists.length) {
-    try {
-      const d = await api.get('/api/discover', { tab: 'playlists', limit: 6 });
-      startHere = d.playlists || [];
-    } catch {
-      const feed = await api.get('/api/feed').catch(() => null);
-      startHere = ((feed && feed.playlists) || []).slice(0, 6).map(feedCard);
-    }
+    const d = await api.get('/api/discover', { tab: 'playlists', sort: 'popular', limit: 6 }, { quiet: true }).catch(() => null);
+    startHere = (d && d.playlists) || [];
   }
   update((s) => {
     s.home = home;

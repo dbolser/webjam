@@ -40,22 +40,3 @@ export function playlistCard(card, { showCurator = true, showVisibility = false 
       : nothing}
   </article>`;
 }
-
-/** Map the old /api/feed playlist shape to a PlaylistCard. */
-export function feedCard(p) {
-  return {
-    id: p.id,
-    kind: p.kind || 'playlist',
-    visibility: p.visibility || 'public',
-    version: p.version,
-    title: p.title,
-    description: p.description,
-    track_count: p.track_count ?? (p.tracks ? p.tracks.length : 0),
-    like_count: p.like_count,
-    plays: p.plays,
-    related_count: p.related_count,
-    updated_at: p.updated_at,
-    user: { id: p.user_id, username: p.username, display_name: p.display_name, avatar_color: p.avatar_color },
-    preview: (p.preview || p.tracks || []).slice(0, 3),
-  };
-}
