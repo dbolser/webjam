@@ -657,3 +657,24 @@ body.video-small .video-tile {
 @media (max-width: 759px) {
   body.video-small .video-tile { width: 200px; left: auto; }
 }
+
+/* Resume where you left off (§12.3): one quiet line, never autoplays. */
+.pbar.pbar-offer { grid-template-columns: auto minmax(0, 1fr) auto; }
+.pbar-resume {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 0;
+  font-size: var(--fs-sm);
+  color: var(--ink-2);
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.pbar-resume:hover .pbar-resume-label, .pbar-resume:focus-visible .pbar-resume-label { color: var(--ink); }
+.pbar-resume .t { color: var(--ink); font-weight: 500; }
+.pbar-now .pbar-resume .pbar-time { color: var(--ink-2); }

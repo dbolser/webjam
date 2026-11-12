@@ -7,13 +7,22 @@
 //   renderBar()                           draws the player bar (main.js calls it on store changes)
 //   toggleRepeat()  toggleSmallVideo()    ported from the classic UI at cutover: repeat one track,
 //                                         and a small, low-data video tile (remembered per browser)
+//   play()  pause()                       idempotent, for lock-screen and headphone buttons
+//   toggleKeepAwake()  keepAwake()        screen wake lock while playing (§12.1, wake-lock.js)
+//   resumeSaved()  dismissResume()        "Resume <title> at 2:31" (§12.3, resume.js)
 
 import { html, render, nothing, ref } from '../lit.js';
-import { state, update } from '../store.js';
+import { state, update, loadPlaylist, rowsOf } from '../store.js';
 import * as api from '../api.js';
 import * as slots from '../slots.js';
 import { toast } from '../ui/toast.js';
 import { trackUrl, playlistUrl, mmss, iconHref } from '../format.js';
+import { itemsFromRows } from './queue.js';
+import { createWakeLock } from './wake-lock.js';
+import * as ms from './media-session.js';
+import {
+  snapshot, readResume, writeResume, clearResume, resumeAt, resumeKey, findInQueue, itemFromRecord,
+} from './resume.js';
 import { loadYouTube } from './youtube.js';
 import { getDuration, setDuration } from './durations.js';
 import { SEAM_LEAD, tailStart, seamProgress } from './seam.js';
@@ -34,6 +43,24 @@ let lastTick = 0;
 const counted = new Set();
 let repeatOne = false;
 let smallVideo = readPref('webjam.smallVideo');
+
+const nav = typeof navigator !== 'undefined' ? navigator : null;
+const RESUME_EVERY_MS = 5000;
+let lastSaved = 0;
+let offer = null; // { key, record }: the saved spot offered on load, until played or dismissed
+let offerBar = false; // the bar is showing only because of the offer
+let awayAt = null; // seconds: the OS paused us while the tab was hidden; offer one tap back
+let playingOnHide = false;
+
+const wake = createWakeLock({ nav, doc: typeof document !== 'undefined' ? document : null, storage: safeStorage(), touch: isTouch() });
+
+function safeStorage() {
+  try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch { return null; }
+}
+
+function isTouch() {
+  try { return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches; } catch { return false; }
+}
 
 function readPref(key) {
   try { return localStorage.getItem(key) === '1'; } catch { return false; }
@@ -134,6 +161,11 @@ function tick() {
   lastTick = now;
   state.player.time = t;
   if (playedMs >= 30000) countPlay(item);
+  if (state.player.status === 'playing' && now - lastSaved >= RESUME_EVERY_MS) {
+    state.player.time = t;
+    saveResume();
+    mediaPosition();
+  }
   const seam = state.player.seam;
   if (seam && seam.phase === 'b' && t - (seam.bFrom || 0) >= SEAM_LEAD) {
     update((s) => { s.player.seam = null; }, 'player');
@@ -144,6 +176,128 @@ function tick() {
     return;
   }
   update(null, 'tick');
+}
+
+// --- resume where you left off (§12.3) -----------------------------------------------------------
+
+function userId() {
+  return state.auth && state.auth.user ? state.auth.user.id : null;
+}
+
+function saveResume() {
+  const p = state.player;
+  const item = current();
+  const store = safeStorage();
+  if (!item || !store || p.seam || (p.status !== 'playing' && p.status !== 'paused')) return;
+  let t = p.time;
+  try { if (yt) t = yt.getCurrentTime() || t; } catch { /* keep */ }
+  const rec = snapshot({ item, index: p.index, source: p.source, time: t, duration: p.duration, userId: userId() });
+  lastSaved = performance.now();
+  if (rec) writeResume(store, userId(), rec);
+}
+
+function forgetResume() {
+  const store = safeStorage();
+  if (store) clearResume(store, userId());
+}
+
+/** The saved spot for whoever is here now (re-read when the person changes). */
+function currentOffer() {
+  if (!state.auth || !state.auth.mode) return null; // bootstrap not back yet
+  const key = resumeKey(userId());
+  if (!offer || offer.key !== key) {
+    const store = safeStorage();
+    offer = { key, record: store ? readResume(store, userId()) : null };
+  }
+  return offer.record;
+}
+
+/** Tap "Resume …": rebuild the queue (the playlist when it still loads), then play from the spot. */
+export async function resumeSaved() {
+  if (current() && awayAt != null) {
+    const at = awayAt;
+    awayAt = null;
+    if (!yt || state.player.status === 'idle' || state.player.status === 'ended') return loadCurrent({ startAt: at });
+    try {
+      if (Math.abs((yt.getCurrentTime() || 0) - at) > 2) yt.seekTo(at, true);
+      yt.playVideo();
+    } catch { /* ignore */ }
+    update(null, 'player');
+    return undefined;
+  }
+  const r = currentOffer();
+  if (!r) return undefined;
+  offer = { key: offer.key, record: null };
+  let items = null;
+  let index = 0;
+  let source = null;
+  const src = r.src;
+  if (src && (src.kind !== 'crate' || Number(state.auth.crateId) === src.playlistId)) {
+    try {
+      await loadPlaylist(src.playlistId);
+      const pl = state.playlists.get(src.playlistId);
+      source = { playlistId: src.playlistId, title: pl.kind === 'crate' ? 'Crate' : pl.meta.title, kind: pl.kind };
+      const list = itemsFromRows(rowsOf(src.playlistId), source);
+      const i = findInQueue(r, list);
+      if (i >= 0) { items = list; index = i; }
+    } catch { /* gone or private now: play just the track */ }
+  }
+  if (!items) {
+    items = [itemFromRecord(r)];
+    index = 0;
+    source = null;
+  }
+  return playQueue(items, index, { source, startAt: resumeAt(r) });
+}
+
+export function dismissResume() {
+  awayAt = null;
+  if (!current()) {
+    forgetResume();
+    if (offer) offer = { key: offer.key, record: null };
+  }
+  update(null, 'player');
+}
+
+function onVisibility() {
+  wake.visibility();
+  if (document.visibilityState === 'hidden') {
+    playingOnHide = state.player.status === 'playing';
+    saveResume();
+    return;
+  }
+  if (!playingOnHide) return;
+  playingOnHide = false;
+  // Give YouTube a moment to report the pause the OS made while we were away.
+  setTimeout(() => {
+    if (document.visibilityState === 'hidden' || !current()) return;
+    if (state.player.status === 'paused') {
+      awayAt = state.player.time;
+      update(null, 'player');
+    }
+  }, 800);
+}
+
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', onVisibility);
+}
+if (typeof addEventListener === 'function') addEventListener('pagehide', () => saveResume());
+
+// --- keep the screen awake (§12.1) --------------------------------------------------------------
+
+export function keepAwakeSupported() {
+  return wake.supported;
+}
+
+export function keepAwake() {
+  return wake.supported && wake.enabled();
+}
+
+export function toggleKeepAwake() {
+  if (!wake.supported) return;
+  wake.setEnabled(!wake.enabled());
+  update(null, 'player');
+  toast.show(wake.enabled() ? 'Screen stays awake while playing' : 'Screen can sleep');
 }
 
 function startMonitor() {
@@ -175,13 +329,20 @@ function onState(code) {
     }, 'player');
     setBody('player-paused', false);
     setBody('video-collapsed', false);
+    awayAt = null;
+    lastSaved = performance.now();
     startMonitor();
-    mediaState('playing');
+    wake.setPlaying(true);
+    ms.setPlaybackState(nav, 'playing');
+    mediaPosition();
   } else if (code === YT_PAUSED) {
     stopMonitor();
     update((s) => { s.player.status = 'paused'; }, 'player');
     setBody('player-paused', true);
-    mediaState('paused');
+    wake.setPlaying(false);
+    ms.setPlaybackState(nav, 'paused');
+    mediaPosition();
+    saveResume();
   } else if (code === YT_ENDED) {
     stopMonitor();
     if (endedToken !== loadToken) {
@@ -197,6 +358,7 @@ function onError(code) {
   if (DEAD_CODES.has(Number(code))) {
     const token = loadToken;
     update((s) => { s.dead.add(item.video_id); s.player.status = 'paused'; }, 'player');
+    wake.setPlaying(false);
     toast.show('Unavailable on YouTube; skipped');
     setTimeout(() => {
       if (token === loadToken) next({ auto: true });
@@ -222,6 +384,9 @@ function handleEnd() {
     stopMonitor();
     update((s) => { s.player.status = 'ended'; s.player.seam = null; }, 'player');
     setBody('player-paused', true);
+    wake.setPlaying(false);
+    ms.setPlaybackState(nav, 'paused');
+    forgetResume(); // finished the list: nothing to come back to
     try { yt && yt.pauseVideo(); } catch { /* ignore */ }
   }
 }
@@ -236,16 +401,22 @@ function countPlay(item) {
   api.post(`/api/playlists/${Number(item.playlistId)}/play`, { video_id: item.video_id }, { quiet: true }).catch(() => {});
 }
 
-async function loadCurrent({ tail = null } = {}) {
+async function loadCurrent({ tail = null, startAt = null } = {}) {
   const item = current();
   if (!item) return;
   const token = ++loadToken;
   playedMs = 0;
   pendingTail = tail;
+  awayAt = null;
   const known = getDuration(item.video_id);
+  let from = item.start || 0;
+  if (startAt != null && Number.isFinite(Number(startAt))) {
+    from = Math.max(from, Number(startAt));
+    if (item.end != null) from = Math.min(from, Math.max(item.start || 0, item.end - 1));
+  }
   update((s) => {
     s.player.status = 'loading';
-    s.player.time = item.start || 0;
+    s.player.time = from;
     s.player.duration = known || 0;
   }, 'player');
   showBar();
@@ -258,7 +429,7 @@ async function loadCurrent({ tail = null } = {}) {
     return;
   }
   if (token !== loadToken) return;
-  let startSeconds = item.start || 0;
+  let startSeconds = from;
   if (tail != null) {
     const at = tailStart(item, known, tail);
     if (at != null) {
@@ -281,7 +452,7 @@ function showBar() {
 
 // --- public API ---------------------------------------------------------------------------------
 
-export function playQueue(items, index = 0, { source = null } = {}) {
+export function playQueue(items, index = 0, { source = null, startAt = null } = {}) {
   const list = (items || []).filter((it) => it && it.video_id);
   if (!list.length) return Promise.resolve();
   const i = Math.max(0, Math.min(list.length - 1, index));
@@ -291,7 +462,7 @@ export function playQueue(items, index = 0, { source = null } = {}) {
     s.player.source = source;
     s.player.seam = null;
   }, 'player');
-  return loadCurrent();
+  return loadCurrent({ startAt });
 }
 
 export function toggle() {
@@ -300,6 +471,18 @@ export function toggle() {
   if (!yt || p.status === 'idle' || p.status === 'ended') return loadCurrent();
   if (p.status === 'playing') yt.pauseVideo();
   else yt.playVideo();
+}
+
+/** Idempotent play / pause, for the lock screen and headphones (toggle() would flip twice). */
+export function play() {
+  const s = state.player.status;
+  if (s !== 'playing' && s !== 'loading') toggle();
+}
+
+export function pause() {
+  if (yt && state.player.status === 'playing') {
+    try { yt.pauseVideo(); } catch { /* ignore */ }
+  }
 }
 
 export function next({ auto = false } = {}) {
@@ -341,6 +524,7 @@ export function seek(seconds) {
   yt.seekTo(t, true);
   state.player.time = t;
   endedToken = -1;
+  mediaPosition();
   update(null, 'tick');
 }
 
@@ -379,40 +563,35 @@ export function previewSeam(bIndex, { items = null, source = null } = {}) {
   loadCurrent({ tail: SEAM_LEAD });
 }
 
-// --- Media Session ----------------------------------------------------------------------------
+// --- Media Session (§12.2, media-session.js) ----------------------------------------------------
 
 function mediaMeta(item) {
-  if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
-  try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: item.title || '',
-      artist: item.channel || '',
-      album: (state.player.source && state.player.source.title) || 'webjam',
-      artwork: item.thumb ? [{ src: item.thumb, sizes: '480x360', type: 'image/jpeg' }] : [],
-    });
-  } catch {
-    /* ignore */
-  }
+  const src = state.player.source;
+  const pl = src && src.playlistId ? state.playlists.get(Number(src.playlistId)) : null;
+  const curator = pl && pl.meta && src.kind !== 'crate' ? pl.meta.username || '' : '';
+  ms.setMetadata(nav, typeof MediaMetadata === 'function' ? MediaMetadata : null, ms.metadataFor(item, src, curator));
+  ms.setPosition(nav, null);
 }
 
-function mediaState(s) {
-  if ('mediaSession' in navigator) {
-    try { navigator.mediaSession.playbackState = s; } catch { /* ignore */ }
-  }
+function mediaPosition() {
+  ms.setPosition(nav, ms.positionFor(current(), state.player.time, state.player.duration));
 }
 
 let mediaWired = false;
 function wireMediaSession() {
-  if (mediaWired || !('mediaSession' in navigator)) return;
+  if (mediaWired) return;
   mediaWired = true;
-  const set = (name, fn) => {
-    try { navigator.mediaSession.setActionHandler(name, fn); } catch { /* unsupported action */ }
-  };
-  set('play', () => toggle());
-  set('pause', () => toggle());
-  set('previoustrack', () => prev());
-  set('nexttrack', () => next());
-  set('seekto', (d) => d && d.seekTime != null && seek(d.seekTime));
+  ms.wireActions(nav, {
+    play: () => play(),
+    pause: () => pause(),
+    prev: () => prev(),
+    next: () => next(),
+    seekTo: (clipSeconds) => {
+      const item = current();
+      if (item) seek((item.start || 0) + clipSeconds);
+    },
+    seekBy: (delta) => seek(state.player.time + delta),
+  });
 }
 
 // --- the bar ------------------------------------------------------------------------------------
@@ -445,9 +624,10 @@ export function renderBar() {
   wireMediaSession();
   const item = current();
   if (!item) {
-    render(nothing, bar);
+    renderOffer(bar);
     return;
   }
+  offerBar = false;
   const p = state.player;
   const src = p.source;
   const playing = p.status === 'playing' || p.status === 'loading';
@@ -466,9 +646,12 @@ export function renderBar() {
     </div>
     <div class="pbar-now">
       <a class="t" href=${trackUrl(item.video_id, item.start, item.end)}>${item.title}</a>
-      <div class="s">${item.channel}${src && src.playlistId && src.kind !== 'crate' && src.title
+      ${awayAt != null
+        ? html`<button type="button" class="pbar-resume" data-action="player-resume">Resume at
+            <span class="pbar-time">${mmss(awayAt - start)}</span></button>`
+        : html`<div class="s">${item.channel}${src && src.playlistId && src.kind !== 'crate' && src.title
         ? html`<a class="hop" href=${playlistUrl(src.playlistId, src.title)}>from ‘${src.title}’</a>`
-        : src && src.kind === 'crate' ? html`<a class="hop" href="/crate">from your crate</a>` : nothing}</div>
+        : src && src.kind === 'crate' ? html`<a class="hop" href="/crate">from your crate</a>` : nothing}</div>`}
     </div>
     <div class="pbar-progress">
       <span class="pbar-time">${mmss(elapsed)}</span>
@@ -489,6 +672,11 @@ export function renderBar() {
       <button type="button" class="icon-btn ${smallVideo ? 'is-on' : ''}" data-action="player-small-video"
         aria-pressed=${smallVideo ? 'true' : 'false'} aria-label="Small video, low data" title="Small video, low data">
         <svg class="i"><use href="#i-small-video"></use></svg></button>
+      ${wake.supported && isTouch()
+        ? html`<button type="button" class="icon-btn ${keepAwake() ? 'is-on' : ''}" data-action="player-keep-awake"
+            aria-pressed=${keepAwake() ? 'true' : 'false'} aria-label="Keep the screen awake while playing"
+            title="Keep the screen awake while playing"><svg class="i"><use href="#i-awake"></use></svg></button>`
+        : nothing}
       <button type="button" class="icon-btn" data-action="player-seam" aria-label="Preview the seam into the next track"
         title="Preview the seam (N)" ?disabled=${p.index >= p.queue.length - 1}>
         <svg class="i"><use href="#i-seam"></use></svg></button>
@@ -501,6 +689,34 @@ export function renderBar() {
     </div>
     <button type="button" class="icon-btn pbar-more" data-action="player-more" aria-label="More player controls"
       aria-haspopup="menu" aria-expanded="false"><svg class="i"><use href="#i-more"></use></svg></button>
+  </div>`, bar);
+}
+
+/** Nothing playing: a quiet "Resume <title> at 2:31" if there's a saved spot (never autoplays). */
+function renderOffer(bar) {
+  const r = currentOffer();
+  if (!r) {
+    render(nothing, bar);
+    if (offerBar) {
+      offerBar = false;
+      bar.hidden = true;
+      setBody('has-player', false);
+    }
+    return;
+  }
+  if (bar.hidden) {
+    offerBar = true;
+    showBar();
+  }
+  const at = mmss(resumeAt(r) - (r.start || 0));
+  render(html`<div class="pbar pbar-offer">
+    <button type="button" class="icon-btn play" data-action="player-resume" aria-label=${`Resume ${r.title} at ${at}`}>
+      <svg class="i"><use href="#i-play"></use></svg></button>
+    <button type="button" class="pbar-resume" data-action="player-resume">
+      <span class="pbar-resume-label">Resume</span> <span class="t">${r.title}</span>
+      <span class="pbar-resume-label">at</span> <span class="pbar-time">${at}</span></button>
+    <button type="button" class="icon-btn" data-action="player-resume-dismiss" aria-label="Not now" title="Not now">
+      <svg class="i"><use href="#i-close"></use></svg></button>
   </div>`, bar);
 }
 
