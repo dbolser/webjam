@@ -58,3 +58,31 @@ def test_resume_key_is_per_user_and_storage_is_guarded():
 def test_csp_allows_youtube_artwork():
     main = _read(ROOT / "app" / "main.py")
     assert re.search(r"img-src[^\"]*https://i\.ytimg\.com", main)
+
+
+def _fn(src: str, name: str) -> str:
+    return src.split(f"function {name}(")[1].split("\nfunction ")[0].split("\nexport ")[0]
+
+
+def test_player_review_fixes_are_wired():
+    player = _read(JS / "player" / "player.js")
+    # Resume saves only for whoever started the queue, never for a dead video, and move on in the tail.
+    save = _fn(player, "saveResume")
+    assert "queueOwner" in save and "state.dead.has(" in save and "planSave(" in save
+    assert "clearResume(" in save
+    assert "claimQueue()" in _fn(player, "playQueue") and "claimQueue()" in _fn(player, "previewSeam")
+    # The 5 s cadence holds during a seam preview (saveResume returns early there).
+    tick = _fn(player, "tick")
+    assert "lastSaved = now" in tick.split("saveResume()")[0]
+    # Lock-screen play/pause work while a track is still loading.
+    assert "yt.playVideo()" in _fn(player, "play")
+    assert "'loading'" in _fn(player, "pause")
+    # A dead video leaves the lock screen paused.
+    assert "setPlaybackState(nav, 'paused')" in _fn(player, "onError")
+    # Fresh time before the lock-screen position and the "Resume at" offer.
+    assert "ytTime()" in _fn(player, "onState") and "awayAt = ytTime()" in _fn(player, "onVisibility")
+    # A slow playlist load never overwrites a queue the person started meanwhile.
+    assert "token !== loadToken" in _fn(player, "resumeSaved")
+    # One Resume button for keyboards and screen readers; the icon is decorative.
+    offer = _fn(player, "renderOffer")
+    assert offer.count('tabindex="-1" aria-hidden="true"') == 1

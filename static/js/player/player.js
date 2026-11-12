@@ -21,7 +21,7 @@ import { itemsFromRows } from './queue.js';
 import { createWakeLock } from './wake-lock.js';
 import * as ms from './media-session.js';
 import {
-  snapshot, readResume, writeResume, clearResume, resumeAt, resumeKey, findInQueue, itemFromRecord,
+  planSave, readResume, writeResume, clearResume, resumeAt, resumeKey, findInQueue, itemFromRecord,
 } from './resume.js';
 import { loadYouTube } from './youtube.js';
 import { getDuration, setDuration } from './durations.js';
@@ -51,6 +51,8 @@ let offer = null; // { key, record }: the saved spot offered on load, until play
 let offerBar = false; // the bar is showing only because of the offer
 let awayAt = null; // seconds: the OS paused us while the tab was hidden; offer one tap back
 let playingOnHide = false;
+let queueOwner; // user id (null: signed out) of whoever started the queue; resume saves only for them
+let holdToken = -1; // loadToken of a load paused from the lock screen before it started playing
 
 const wake = createWakeLock({ nav, doc: typeof document !== 'undefined' ? document : null, storage: safeStorage(), touch: isTouch() });
 
@@ -162,7 +164,7 @@ function tick() {
   state.player.time = t;
   if (playedMs >= 30000) countPlay(item);
   if (state.player.status === 'playing' && now - lastSaved >= RESUME_EVERY_MS) {
-    state.player.time = t;
+    lastSaved = now; // here, not in saveResume: it returns early during a seam preview
     saveResume();
     mediaPosition();
   }
@@ -180,6 +182,14 @@ function tick() {
 
 // --- resume where you left off (§12.3) -----------------------------------------------------------
 
+/** YouTube's current time (also stored in state.player.time); state.player.time if it can't say. */
+function ytTime() {
+  let t = state.player.time;
+  try { if (yt) t = yt.getCurrentTime() || t; } catch { /* keep */ }
+  state.player.time = t;
+  return t;
+}
+
 function userId() {
   return state.auth && state.auth.user ? state.auth.user.id : null;
 }
@@ -189,11 +199,27 @@ function saveResume() {
   const item = current();
   const store = safeStorage();
   if (!item || !store || p.seam || (p.status !== 'playing' && p.status !== 'paused')) return;
+  if (state.dead.has(item.video_id)) return; // YouTube won't play it: nothing to come back to
+  if (!state.auth || !state.auth.mode) return; // bootstrap not back yet: we don't know who this is
+  const me = userId();
+  if (queueOwner === undefined) queueOwner = me; // started before bootstrap came back
+  // Mid persona switch (user briefly null) or after one: this queue belongs to someone else.
+  if (me !== queueOwner) return;
   let t = p.time;
   try { if (yt) t = yt.getCurrentTime() || t; } catch { /* keep */ }
-  const rec = snapshot({ item, index: p.index, source: p.source, time: t, duration: p.duration, userId: userId() });
   lastSaved = performance.now();
-  if (rec) writeResume(store, userId(), rec);
+  const plan = planSave({
+    queue: p.queue, index: p.index, source: p.source, time: t, duration: p.duration,
+    durationOf: getDuration, repeat: repeatOne, userId: me, ownerId: queueOwner,
+    crateId: state.auth ? state.auth.crateId : undefined,
+  });
+  if (plan && plan.write) writeResume(store, me, plan.write);
+  else if (plan && plan.clear) clearResume(store, me);
+}
+
+/** Whoever is here now starts owning the queue (playQueue, previewSeam with new items). */
+function claimQueue() {
+  queueOwner = state.auth && state.auth.mode ? userId() : undefined;
 }
 
 function forgetResume() {
@@ -213,13 +239,37 @@ function currentOffer() {
 }
 
 /** Tap "Resume …": rebuild the queue (the playlist when it still loads), then play from the spot. */
+/** Call before the bar re-renders: returns refocus(selector), which moves focus there afterwards if
+ *  it was in the bar (the button pressed is gone) and hasn't gone anywhere else meanwhile. */
+function keepFocus() {
+  const bar = document.getElementById('player-bar');
+  const active = document.activeElement;
+  const had = !!(bar && active && bar.contains(active));
+  return (selector) => {
+    if (!had) return;
+    // The store flushes in a microtask; the bar is redrawn by then.
+    setTimeout(() => {
+      const el = document.querySelector(selector);
+      const now = document.activeElement;
+      if (el && (!now || now === document.body || !now.isConnected || bar.contains(now))) {
+        try { el.focus({ preventScroll: true }); } catch { /* ignore */ }
+      }
+    }, 0);
+  };
+}
+
+const PLAY_BUTTON = '#player-bar .pbar-controls .play';
+
 export async function resumeSaved() {
+  const refocus = keepFocus();
   if (current() && awayAt != null) {
     const at = awayAt;
     awayAt = null;
+    refocus(PLAY_BUTTON);
     if (!yt || state.player.status === 'idle' || state.player.status === 'ended') return loadCurrent({ startAt: at });
     try {
-      if (Math.abs((yt.getCurrentTime() || 0) - at) > 2) yt.seekTo(at, true);
+      // Only ever forward to the saved spot: never jump back over what already played.
+      if ((yt.getCurrentTime() || 0) < at - 2) yt.seekTo(at, true);
       yt.playVideo();
     } catch { /* ignore */ }
     update(null, 'player');
@@ -232,26 +282,35 @@ export async function resumeSaved() {
   let index = 0;
   let source = null;
   const src = r.src;
+  const token = loadToken;
+  const queue = state.player.queue;
+  const who = userId();
   if (src && (src.kind !== 'crate' || Number(state.auth.crateId) === src.playlistId)) {
     try {
       await loadPlaylist(src.playlistId);
+      // Something else started (or someone else is here) while the list loaded: leave it be.
+      if (token !== loadToken || queue !== state.player.queue || who !== userId()) return undefined;
       const pl = state.playlists.get(src.playlistId);
       source = { playlistId: src.playlistId, title: pl.kind === 'crate' ? 'Crate' : pl.meta.title, kind: pl.kind };
       const list = itemsFromRows(rowsOf(src.playlistId), source);
       const i = findInQueue(r, list);
       if (i >= 0) { items = list; index = i; }
     } catch { /* gone or private now: play just the track */ }
+    if (token !== loadToken || queue !== state.player.queue || who !== userId()) return undefined;
   }
   if (!items) {
     items = [itemFromRecord(r)];
     index = 0;
     source = null;
   }
-  return playQueue(items, index, { source, startAt: resumeAt(r) });
+  const started = playQueue(items, index, { source, startAt: resumeAt(r) });
+  refocus(PLAY_BUTTON);
+  return started;
 }
 
 export function dismissResume() {
   awayAt = null;
+  keepFocus()(current() ? PLAY_BUTTON : '#view');
   if (!current()) {
     forgetResume();
     if (offer) offer = { key: offer.key, record: null };
@@ -272,7 +331,7 @@ function onVisibility() {
   setTimeout(() => {
     if (document.visibilityState === 'hidden' || !current()) return;
     if (state.player.status === 'paused') {
-      awayAt = state.player.time;
+      awayAt = ytTime();
       update(null, 'player');
     }
   }, 800);
@@ -331,16 +390,24 @@ function onState(code) {
     setBody('video-collapsed', false);
     awayAt = null;
     lastSaved = performance.now();
+    if (holdToken === loadToken) {
+      // Paused from the lock screen while the track was still loading.
+      holdToken = -1;
+      try { yt.pauseVideo(); } catch { /* ignore */ }
+    }
     startMonitor();
     wake.setPlaying(true);
     ms.setPlaybackState(nav, 'playing');
+    ytTime(); // after a repeat, a seam tail or a resume seek, the old time is stale
     mediaPosition();
   } else if (code === YT_PAUSED) {
+    holdToken = -1;
     stopMonitor();
     update((s) => { s.player.status = 'paused'; }, 'player');
     setBody('player-paused', true);
     wake.setPlaying(false);
     ms.setPlaybackState(nav, 'paused');
+    ytTime(); // the tick may have been throttled in a background tab
     mediaPosition();
     saveResume();
   } else if (code === YT_ENDED) {
@@ -359,6 +426,7 @@ function onError(code) {
     const token = loadToken;
     update((s) => { s.dead.add(item.video_id); s.player.status = 'paused'; }, 'player');
     wake.setPlaying(false);
+    ms.setPlaybackState(nav, 'paused');
     toast.show('Unavailable on YouTube; skipped');
     setTimeout(() => {
       if (token === loadToken) next({ auto: true });
@@ -375,6 +443,8 @@ function handleEnd() {
       yt.seekTo(item.start || 0, true);
       yt.playVideo();
     } catch { /* ignore */ }
+    state.player.time = item.start || 0;
+    mediaPosition();
     return;
   }
   const p = state.player;
@@ -456,6 +526,7 @@ export function playQueue(items, index = 0, { source = null, startAt = null } = 
   const list = (items || []).filter((it) => it && it.video_id);
   if (!list.length) return Promise.resolve();
   const i = Math.max(0, Math.min(list.length - 1, index));
+  claimQueue();
   update((s) => {
     s.player.queue = list;
     s.player.index = i;
@@ -468,6 +539,7 @@ export function playQueue(items, index = 0, { source = null, startAt = null } = 
 export function toggle() {
   const p = state.player;
   if (!current()) return;
+  holdToken = -1;
   if (!yt || p.status === 'idle' || p.status === 'ended') return loadCurrent();
   if (p.status === 'playing') yt.pauseVideo();
   else yt.playVideo();
@@ -476,11 +548,22 @@ export function toggle() {
 /** Idempotent play / pause, for the lock screen and headphones (toggle() would flip twice). */
 export function play() {
   const s = state.player.status;
-  if (s !== 'playing' && s !== 'loading') toggle();
+  holdToken = -1;
+  if (s === 'playing') return;
+  if (s === 'loading') {
+    // Still starting, or the browser refused to start it (iOS after an await): nudge it.
+    if (yt) {
+      try { yt.playVideo(); } catch { /* ignore */ }
+    }
+    return;
+  }
+  toggle();
 }
 
 export function pause() {
-  if (yt && state.player.status === 'playing') {
+  const s = state.player.status;
+  if (s === 'loading') holdToken = loadToken; // the load may not have reached YouTube yet
+  if (yt && (s === 'playing' || s === 'loading')) {
     try { yt.pauseVideo(); } catch { /* ignore */ }
   }
 }
@@ -552,6 +635,7 @@ export function previewSeam(bIndex, { items = null, source = null } = {}) {
     toast.show(b >= 1 ? 'Nothing after this track.' : 'Nothing before this track.');
     return;
   }
+  if (items) claimQueue();
   update((s) => {
     if (items) {
       s.player.queue = queue;
@@ -710,7 +794,7 @@ function renderOffer(bar) {
   }
   const at = mmss(resumeAt(r) - (r.start || 0));
   render(html`<div class="pbar pbar-offer">
-    <button type="button" class="icon-btn play" data-action="player-resume" aria-label=${`Resume ${r.title} at ${at}`}>
+    <button type="button" class="icon-btn play" data-action="player-resume" tabindex="-1" aria-hidden="true">
       <svg class="i"><use href="#i-play"></use></svg></button>
     <button type="button" class="pbar-resume" data-action="player-resume">
       <span class="pbar-resume-label">Resume</span> <span class="t">${r.title}</span>
