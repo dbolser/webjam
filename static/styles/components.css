@@ -462,6 +462,9 @@
   color: var(--ink-3);
 }
 .pbar-extra { display: flex; align-items: center; gap: 2px; }
+/* The video toggle matters only where the video floats over the page (<1100px); the ⋯ only on phones. */
+.pbar-video, .pbar-more { display: none; }
+@media (max-width: 1099px) { .pbar-video { display: inline-flex; } }
 
 .range {
   --p: 0;
@@ -604,7 +607,7 @@
 }
 .toast-text { flex: 1 1 auto; min-width: 0; }
 .toast .btn { height: 26px; }
-.toast .glyph { margin-right: 2px; }
+.toast .glyph { margin-right: 2px; color: var(--ink-2); font-variant-emoji: text; }
 
 /* --- misc ---------------------------------------------------------------- */
 .loading { padding: var(--sp-7) 0; color: var(--ink-3); font-size: var(--fs-sm); }
@@ -616,7 +619,7 @@
   .trow-pos, .trow-dur { display: none; }
   .trow-meta .dur-inline { display: inline; }
   .pbar {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     grid-template-rows: auto;
     gap: var(--sp-3);
     padding: 0 var(--sp-3) 0 var(--sp-4);
@@ -626,8 +629,10 @@
   .pbar-controls { order: 2; }
   .pbar-now { order: 1; }
   .pbar-extra { display: none; }
+  .pbar-more { display: inline-flex; order: 3; }
   .omnibox kbd { display: none; }
-  .topbar-nav [data-action="theme-cycle"], .account .me-name { display: none; }
+  /* Signed in, the account menu carries the theme; signed out there is no menu, so the icon stays. */
+  .topbar-nav [data-action="theme-cycle"]:not(.theme-anon), .account .me-name { display: none; }
   .dock-label, .dock-sep { display: none; }
   .dock-list { flex-direction: row; align-items: center; height: 100%; gap: var(--sp-1); }
   .chip { width: auto; max-width: 160px; flex: none; }

@@ -246,15 +246,59 @@ export function rollback(token) {
   if (!snap) return;
   tokens.delete(token);
   update(() => {
-    for (const [p, order] of snap.orders) p.order = order;
+    if (snap.temps.length && !snap.rows.size) {
+      // An insert: take out only its own temp rows, so earlier edits reconciled since stay put.
+      const drop = new Set(snap.temps);
+      for (const [p] of snap.orders) p.order = p.order.filter((id) => !drop.has(id));
+    } else {
+      for (const [p, order] of snap.orders) p.order = order;
+    }
     for (const id of snap.temps) state.tracks.delete(id);
     for (const [id, row] of snap.rows) state.tracks.set(id, row);
   }, 'rollback');
 }
 
-/** Forget a token without restoring (the server response replaced the preview). */
-export function settle(token) {
+// temp id -> real id for the insert that just came back; read by the reconcile() that follows, so
+// rows still queued behind it (V, V, V faster than the round trip) can keep their place.
+let justResolved = new Map();
+
+/** Forget a token without restoring (the server response replaced the preview). With the response,
+ *  remember which real ids replaced the token's temp rows for the reconcile that follows. */
+export function settle(token, res) {
+  const snap = tokens.get(token);
   tokens.delete(token);
+  if (!snap || !res || !snap.temps.length) return;
+  const r0 = (res.results || [])[0];
+  if (r0 && Array.isArray(r0.track_ids)) {
+    snap.temps.forEach((t, i) => { if (r0.track_ids[i] != null) justResolved.set(t, Number(r0.track_ids[i])); });
+  }
+}
+
+/** Temp ids of edits that are still queued or in flight (their previews must survive a reconcile). */
+function pendingTemps() {
+  const out = new Set();
+  for (const snap of tokens.values()) for (const id of snap.temps) out.add(id);
+  return out;
+}
+
+/** Put still-pending temp rows back into a server order, each after the row it followed. */
+export function keepPending(oldOrder, serverOrder, pending, resolved = new Map()) {
+  const out = serverOrder.slice();
+  for (let i = 0; i < oldOrder.length; i++) {
+    const id = oldOrder[i];
+    if (!(id < 0) || !pending.has(id)) continue;
+    let at = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = resolved.has(oldOrder[j]) ? resolved.get(oldOrder[j]) : oldOrder[j];
+      const k = out.indexOf(prev);
+      if (k >= 0) {
+        at = k + 1;
+        break;
+      }
+    }
+    out.splice(at, 0, id);
+  }
+  return out;
 }
 
 // --- reconcile --------------------------------------------------------------------------------
@@ -290,7 +334,8 @@ export function reconcile(res) {
       const ids = (order || []).map(Number);
       if (p) {
         const before = new Set(p.order.filter((id) => id > 0));
-        for (const id of p.order) if (id < 0) state.tracks.delete(id);
+        const pending = pendingTemps();
+        for (const id of p.order) if (id < 0 && !pending.has(id)) state.tracks.delete(id);
         const keep = new Set(ids);
         for (const id of before) {
           if (!keep.has(id)) {
@@ -299,7 +344,7 @@ export function reconcile(res) {
           }
         }
         if (before.size || p.order.length) for (const id of ids) if (!before.has(id)) landed.add(id);
-        p.order = ids;
+        p.order = keepPending(p.order, ids, pending, justResolved);
         if (versions[pidStr] != null) p.version = versions[pidStr];
         if (p.meta) p.meta.version = p.version;
       }
@@ -315,6 +360,7 @@ export function reconcile(res) {
     if (res.undo) state.undo = res.undo;
     markLanded(landed);
   }, 'reconcile');
+  justResolved = new Map();
 }
 
 function touchCounts(pid, ids, version, rows) {
@@ -360,4 +406,52 @@ export async function refreshPlaylists(ids) {
     [...new Set(ids.map(Number))].filter((id) => state.playlists.has(id)).map((id) =>
       loadPlaylist(id, { force: true }).catch(() => forgetPlaylist(id))),
   );
+}
+
+/** A 409 carried the server's current versions ({ "17": 2 }): adopt them for the playlists we
+ *  only know through the dock or home (no loaded copy to refetch), so the next send can succeed. */
+export function adoptVersions(versions) {
+  if (!versions || typeof versions !== 'object') return;
+  const entries = Object.entries(versions)
+    .map(([k, v]) => [Number(k), Number(v)])
+    .filter(([k, v]) => k > 0 && Number.isFinite(v));
+  if (!entries.length) return;
+  update(() => {
+    for (const [pid, v] of entries) {
+      if (state.playlists.has(pid)) continue; // refreshPlaylists refetches these
+      const dock = state.dock;
+      if (dock) {
+        for (const chip of [dock.crate, ...(dock.pinned || []), ...(dock.recent || [])]) {
+          if (chip && Number(chip.playlist_id) === pid) chip.version = v;
+        }
+        state.dock = { ...dock };
+      }
+      const home = state.home;
+      if (home) {
+        for (const card of home.playlists || []) if (Number(card.id) === pid) card.version = v;
+        if (home.crate && Number(home.crate.id) === pid) home.crate = { ...home.crate, version: v };
+        state.home = { ...home };
+      }
+    }
+  }, 'versions');
+}
+
+/** expected_versions for `pids` from what this tab knows (a loaded playlist, else its dock chip).
+ *  Pass `() => expectedFor([...])` to api.ops.send so it is read at send time, not when queued. */
+export function expectedFor(pids) {
+  const out = {};
+  for (const raw of pids || []) {
+    const id = Number(raw);
+    if (!(id > 0)) continue;
+    const p = state.playlists.get(id);
+    let v = p && p.version != null ? p.version : null;
+    const d = state.dock;
+    if (v == null && d) {
+      for (const c of [d.crate, ...(d.pinned || []), ...(d.recent || [])]) {
+        if (c && Number(c.playlist_id) === id && c.version != null) v = c.version;
+      }
+    }
+    if (v != null) out[String(id)] = v;
+  }
+  return out;
 }

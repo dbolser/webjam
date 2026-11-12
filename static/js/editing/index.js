@@ -21,6 +21,7 @@ import { doUndo, doRedo } from './undo.js';
 import { openMetaEditor, deletePlaylist, removeRows, openClipEditor, openSwap } from './inline-edit.js';
 import { sendToSlot, sendToChip } from './send.js';
 import { openCheatsheet } from './cheatsheet.js';
+import { rowKey } from './ops.js';
 
 startSelection();
 startClipboard();
@@ -40,7 +41,7 @@ function rowsFor(ctx) {
   const key = ctx.list && ctx.list.dataset.listKey;
   if (key && state.selection.listKey === key && selectionCount()) return selectedRows();
   if (ctx.row) {
-    const id = Number(ctx.row.dataset.trackId);
+    const id = rowKey(ctx.row.dataset.trackId);
     const r = rowsOfList(key).find((x) => x.id === id);
     if (r) return [r];
   }
@@ -57,7 +58,7 @@ function cursorRowEl(list) {
   const a = document.activeElement;
   if (a && list.contains(a) && a.matches('[data-track-id]')) return a;
   const id = state.selection.cursorId;
-  return id != null ? list.querySelector(`[data-track-id="${id}"]`) : null;
+  return id != null ? list.querySelector(`[data-track-id="${CSS.escape(String(id))}"]`) : null;
 }
 
 // --- keys -----------------------------------------------------------------------------------------------
@@ -92,7 +93,7 @@ function comboAlt() {
 
 registerKeys([
   { combo: '?', when: 'always', label: 'Keyboard shortcuts', group: 'General', run: () => openCheatsheet() },
-  { combo: 'escape', when: 'always', label: 'Cancel drag, cut or selection', group: 'General', run: () => {
+  { combo: 'escape', when: 'always', label: 'Close or cancel', group: 'General', run: () => {
     if (cancelDrag()) return true;
     if (cancelCut()) return true;
     if (selectionCount()) return clearSelection();
@@ -207,7 +208,7 @@ function rowMenuItems(m, { crate = false } = {}) {
   }
   if (list && rowEl) {
     items.push(
-      { label: 'Note and clip…', icon: 'seam', kbd: 'T', run: () => openClipEditor(list, rowEl) },
+      { label: 'Note and clip…', icon: 'note', kbd: 'T', run: () => openClipEditor(list, rowEl) },
       { label: 'Move to position…', kbd: 'G', run: () => openMoveTo(list, rowEl) },
     );
     if (!crate) {
@@ -215,7 +216,7 @@ function rowMenuItems(m, { crate = false } = {}) {
         { label: 'Swap video…', icon: 'link', run: () => openSwap(list, rowEl) },
         'sep',
         { label: 'Remove', icon: 'close', kbd: 'Del', danger: true, run: () => {
-          const r = rowsOfList(list.dataset.listKey).find((x) => x.id === Number(rowEl.dataset.trackId));
+          const r = rowsOfList(list.dataset.listKey).find((x) => x.id === rowKey(rowEl.dataset.trackId));
           if (r) removeRows(list, [r]);
         } },
       );

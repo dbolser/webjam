@@ -14,7 +14,7 @@
 //       crate in batches of 50 sharing one undo group, optimistic where the crate is loaded.
 
 import { html, nothing } from '../lit.js';
-import { state, update, optimistic, ingestPlaylist } from '../store.js';
+import { state, update, optimistic, ingestPlaylist, expectedFor } from '../store.js';
 import * as api from '../api.js';
 import * as slots from '../slots.js';
 import { registerActions } from '../actions.js';
@@ -126,7 +126,7 @@ async function unloadTo(pid, ids, { keep = false } = {}) {
       token = optimistic(op);
     }
     try {
-      await api.ops.send([op], { token, groupId: gid });
+      await api.ops.send([op], { token, groupId: gid, expectedVersions: () => expectedFor([cid, pid]) });
       n += part.length;
     } catch {
       break;
@@ -283,7 +283,7 @@ async function clearUnloaded() {
     const op = { kind: 'delete', playlist_id: Number(detail.id), track_ids: part };
     const token = optimistic(op);
     try {
-      await api.ops.send([op], { token, groupId: gid });
+      await api.ops.send([op], { token, groupId: gid, expectedVersions: () => expectedFor([detail.id]) });
       n += part.length;
     } catch {
       break;

@@ -1,7 +1,7 @@
 // The only module that calls fetch. Adds X-Webjam: 1 to every write (CSRF), user_id in demo mode
 // only, turns error bodies into ApiError, and runs the serial ops queue (docs/phase1-ops-api.md §3.1).
 
-import { state, reconcile, rollback, settle, refreshPlaylists } from './store.js';
+import { state, reconcile, rollback, settle, refreshPlaylists, adoptVersions } from './store.js';
 import * as slots from './slots.js';
 import { toast } from './ui/toast.js';
 import { signInUrl } from './format.js';
@@ -175,6 +175,7 @@ function touchedIds(list, err) {
 
 /**
  * ops.send(list, { groupId, expectedVersions, label, token, quiet })
+ * expectedVersions may be an object or a function returning one (evaluated at send time).
  * One request in flight per tab. Each call gets a fresh op_id (group_id defaults to it); network
  * failures retry with the SAME op_id. Resolves to the server response after reconcile().
  * `token` is an optimistic token from store.optimistic(); it is rolled back on failure.
@@ -184,16 +185,24 @@ export const ops = {
   send(list, { groupId, expectedVersions, token, quiet = false } = {}) {
     const opId = newId();
     const body = { op_id: opId, group_id: groupId || opId, ops: list };
-    if (expectedVersions) body.expected_versions = expectedVersions;
     return enqueue(async () => {
+      // A function is read now, at send time, so earlier queued edits' version bumps are seen.
+      const ev = typeof expectedVersions === 'function' ? expectedVersions() : expectedVersions;
+      if (ev && Object.keys(ev).length) body.expected_versions = ev;
       try {
         const res = await postWithRetry('/api/ops', body);
-        if (token != null) settle(token);
+        if (token != null) settle(token, res);
         afterSuccess(res);
         return res;
       } catch (err) {
         if (token != null) rollback(token);
-        if (err instanceof ApiError && (err.code === 'stale_version' || err.code === 'anchor_missing')) {
+        if (err instanceof ApiError && err.code === 'track_not_found') {
+          // The row was already gone (another tab or device): show the truth instead of a ghost.
+          await refreshPlaylists(touchedIds(list, err));
+          if (!quiet) toast.show('That track was already gone; refreshed.');
+          err.handled = true;
+        } else if (err instanceof ApiError && (err.code === 'stale_version' || err.code === 'anchor_missing')) {
+          adoptVersions(err.data && err.data.versions);
           await refreshPlaylists(touchedIds(list, err));
           if (!quiet) toast.show('That playlist changed elsewhere; refreshed.');
           err.handled = true;

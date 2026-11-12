@@ -64,6 +64,22 @@ export function toggleRepeat() {
   toast.show(repeatOne ? 'Repeating this track' : 'Repeat off');
 }
 
+/** Below 1100px the video floats over the page. YouTube needs a visible player while playing, so
+ *  hiding the video pauses, and playing again brings it back (docs/phase1b-shell.md §1.3). */
+export function isVideoCollapsed() {
+  return document.body.classList.contains('video-collapsed');
+}
+
+export function toggleVideo() {
+  if (isVideoCollapsed()) {
+    setBody('video-collapsed', false);
+  } else {
+    try { yt && yt.pauseVideo(); } catch { /* ignore */ }
+    setBody('video-collapsed', true);
+  }
+  update(null, 'player');
+}
+
 export function toggleSmallVideo() {
   smallVideo = !smallVideo;
   writePref('webjam.smallVideo', smallVideo);
@@ -84,6 +100,7 @@ function ensurePlayer() {
   if (ready) return ready;
   const tile = document.getElementById('video-tile');
   if (tile) tile.hidden = false;
+  setBody('has-video', true);
   ready = loadYouTube().then((YT) => new Promise((resolve) => {
     yt = new YT.Player('yt-player', {
       width: '100%',
@@ -157,6 +174,7 @@ function onState(code) {
       s.player.duration = d || s.player.duration;
     }, 'player');
     setBody('player-paused', false);
+    setBody('video-collapsed', false);
     startMonitor();
     mediaState('playing');
   } else if (code === YT_PAUSED) {
@@ -474,8 +492,15 @@ export function renderBar() {
       <button type="button" class="icon-btn" data-action="player-seam" aria-label="Preview the seam into the next track"
         title="Preview the seam (N)" ?disabled=${p.index >= p.queue.length - 1}>
         <svg class="i"><use href="#i-seam"></use></svg></button>
+      <button type="button" class="icon-btn pbar-video ${isVideoCollapsed() ? 'is-on' : ''}" data-action="player-video"
+        aria-pressed=${isVideoCollapsed() ? 'true' : 'false'}
+        aria-label=${isVideoCollapsed() ? 'Show the video' : 'Hide the video (pauses)'}
+        title=${isVideoCollapsed() ? 'Show the video' : 'Hide the video (pauses)'}>
+        <svg class="i"><use href="#i-video-off"></use></svg></button>
       ${slots.render('player.like', { item })}
     </div>
+    <button type="button" class="icon-btn pbar-more" data-action="player-more" aria-label="More player controls"
+      aria-haspopup="menu" aria-expanded="false"><svg class="i"><use href="#i-more"></use></svg></button>
   </div>`, bar);
 }
 

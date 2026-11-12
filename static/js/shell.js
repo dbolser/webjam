@@ -40,7 +40,8 @@ function renderTopbar() {
     </form>
     <nav class="topbar-nav" aria-label="Site">
       <a class="discover-link" href="/discover" aria-current=${r.name === 'discover' ? 'page' : nothing}>Discover</a>
-      <button type="button" class="icon-btn" data-action="theme-cycle" aria-label=${themeLabel()} title=${themeLabel()}>
+      <button type="button" class="icon-btn ${state.auth.signedIn ? '' : 'theme-anon'}" data-action="theme-cycle"
+        aria-label=${themeLabel()} title=${themeLabel()}>
         <svg class="i"><use href=${iconHref(icon)}></use></svg>
       </button>
       <div class="account">${account.length ? account : accountFallback()}</div>

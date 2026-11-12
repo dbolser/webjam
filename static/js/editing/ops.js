@@ -21,8 +21,19 @@ export function setUndoHook(fn) {
   undoHook = fn;
 }
 
-/** Follow temp -> real (and moved-from -> moved-to) mappings. */
+/** A row id as rendered in data-track-id: numeric ids (playlist rows, temp rows) become numbers;
+ *  synthetic ids of rows outside any playlist (search `s:VID`, discover `d:VID`, profile, the track
+ *  page's `a:VID`) stay strings, so they still match the row objects they came from. */
+export function rowKey(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v;
+  const s = String(v);
+  return /^-?\d+$/.test(s) ? Number(s) : s;
+}
+
+/** Follow temp -> real (and moved-from -> moved-to) mappings. Synthetic string ids pass through. */
 export function real(id) {
+  if (typeof id === 'string' && !/^-?\d+$/.test(id)) return id;
   let v = Number(id);
   for (let i = 0; i < 8 && realOf.has(v); i++) v = realOf.get(v);
   return v;

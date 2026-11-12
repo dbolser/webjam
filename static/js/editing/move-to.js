@@ -6,7 +6,7 @@ import { html } from '../lit.js';
 import { state, isMine } from '../store.js';
 import { registerActions } from '../actions.js';
 import { openPopover, closePopover } from '../ui/popover.js';
-import { submit } from './ops.js';
+import { submit, rowKey } from './ops.js';
 import { selectedRows, rowsOfList, isEditableList, listEl, focusRow } from './selection.js';
 import { plural } from '../format.js';
 
@@ -20,7 +20,7 @@ function blockOf(list) {
   if (!picked.length) {
     const a = document.activeElement;
     const rowEl = a && a.closest ? a.closest('[data-track-id]') : null;
-    const r = rowEl && rows.find((x) => x.id === Number(rowEl.dataset.trackId));
+    const r = rowEl && rows.find((x) => x.id === rowKey(rowEl.dataset.trackId));
     if (r) picked = [r];
   }
   if (!picked.length) return null;

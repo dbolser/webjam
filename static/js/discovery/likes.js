@@ -129,6 +129,21 @@ slots.register('player.like', ({ item } = {}) => {
   return likeButton('song', item.video_id, { ...fb, label: item.title });
 });
 
+// The phone player's ⋯ menu (the ♡ in .pbar-extra is hidden there).
+slots.register('player.more', ({ item } = {}) => {
+  if (!item || !isVideoId(item.video_id)) return null;
+  const fb = songFallback(item);
+  const liked = likeState('song', item.video_id, fb).mine > 0;
+  return {
+    label: liked ? 'Liked' : 'Like this track',
+    icon: liked ? 'heart-fill' : 'heart',
+    kbd: 'L',
+    run: () => toggleLike('song', item.video_id, { fallback: fb }).then((res) => {
+      if (res) toast.show(res.my_likes > 0 ? 'Liked' : 'Like removed');
+    }),
+  };
+});
+
 registerKeys([
   { combo: 'l', when: ['list', 'player'], label: 'Like the focused or playing track', group: 'Player', run: (e, ctx) => {
     let vid = ctx && ctx.row ? ctx.row.dataset.videoId : null;

@@ -2,7 +2,7 @@
 //
 // Names defined by F: topbar.account, home.top, playlist.actions, playlist.menu, playlist.related,
 // playlist.footer, row.menu, crate.actions, crate.row.menu, auth.required, share.open, import.open,
-// player.like, rail.context.
+// player.like, player.more (phone player ⋯ menu items), rail.context.
 //
 //   register(name, fn, { order })  fn(ctx) returns a TemplateResult (render slots), or menu items
 //                                   (playlist.menu, row.menu, crate.row.menu), or a value (call slots)

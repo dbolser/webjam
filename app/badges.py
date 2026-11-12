@@ -47,7 +47,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "spark_1",
         "name": "The Spark",
-        "icon": "⚡",
+        "icon": "ϟ",
         "category": "Tastemaker",
         "description": "Have another user grab a track from one of your playlists into theirs.",
         "threshold": 1,
@@ -56,7 +56,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "trendsetter_5",
         "name": "Trendsetter",
-        "icon": "📡",
+        "icon": "⇗",
         "category": "Tastemaker",
         "description": "Have tracks grabbed from your playlists 5 or more times across the community.",
         "threshold": 5,
@@ -65,7 +65,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "source_material",
         "name": "Source Material",
-        "icon": "⛲",
+        "icon": "◎",
         "category": "Tastemaker",
         "description": "Inspire 3+ distinct users to take tracks from your playlists.",
         "threshold": 3,
@@ -85,7 +85,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "cross_pollinator_3",
         "name": "Cross-Pollinator",
-        "icon": "🐝",
+        "icon": "⁂",
         "category": "Curation & Lineage",
         "description": "Grab 3+ tracks from other curators' playlists into your mixes.",
         "threshold": 3,
@@ -94,7 +94,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "alchemist_remix",
         "name": "Crate Alchemist",
-        "icon": "⚗",
+        "icon": "☿",
         "category": "Curation & Lineage",
         "description": "Take tracks from another user's playlist and get 5+ plays on your resulting playlist.",
         "threshold": 1,
@@ -103,7 +103,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "block_rockin_remix",
         "name": "Selector's Gold",
-        "icon": "🏆",
+        "icon": "✪",
         "category": "Curation & Lineage",
         "description": "Take tracks from at least 2 different curators into one playlist and reach 10+ plays.",
         "threshold": 1,
@@ -114,7 +114,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "liked_1",
         "name": "Co-Signed",
-        "icon": "♥",
+        "icon": "♡",
         "category": "Reception & Community",
         "description": "Receive your first like on a playlist.",
         "threshold": 1,
@@ -132,7 +132,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "heavy_rotation",
         "name": "Heavy Rotation",
-        "icon": "▶",
+        "icon": "▸",
         "category": "Reception & Community",
         "description": "Reach 10+ plays on any single playlist you curated.",
         "threshold": 10,
@@ -150,7 +150,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "record_shop_regular",
         "name": "Record Shop Regular",
-        "icon": "💬",
+        "icon": "❝",
         "category": "Reception & Community",
         "description": "Leave 3+ comments across playlists, songs, or user profiles.",
         "threshold": 3,
@@ -159,7 +159,7 @@ BADGE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "superlover",
         "name": "Superlover",
-        "icon": "💖",
+        "icon": "❦",
         "category": "Reception & Community",
         "description": "Smack the ♥ love button 10+ times on a single track or mixtape to bestow Superlove.",
         "threshold": 10,

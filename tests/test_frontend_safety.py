@@ -262,9 +262,13 @@ def test_index_html_is_static():
     assert not re.search(r"\sstyle\s*=", html, re.I), "style attribute in index.html"
     assert not re.search(r"<style\b", html, re.I), "inline <style> in index.html"
     scripts = re.findall(r"<script\b([^>]*)>(.*?)</script>", html, re.I | re.S)
-    assert len(scripts) == 1, f"exactly one script tag expected, got {len(scripts)}"
-    attrs, body = scripts[0]
-    assert body.strip() == "", "inline script in index.html"
+    # theme-boot.js (classic, sets data-theme before first paint) and the main.js module graph.
+    assert len(scripts) == 2, f"exactly two script tags expected, got {len(scripts)}"
+    for attrs, body in scripts:
+        assert body.strip() == "", "inline script in index.html"
+    (boot_attrs, _), (attrs, _) = scripts
+    assert re.search(r'src="/static/js/theme-boot\.js"', boot_attrs), boot_attrs
+    assert "module" not in boot_attrs and "defer" not in boot_attrs and "async" not in boot_attrs, boot_attrs
     assert re.search(r'type="module"', attrs)
     src = re.search(r'src="([^"]+)"', attrs).group(1)
     assert src.split("?")[0] == "/static/js/main.js", src

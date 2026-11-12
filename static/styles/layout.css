@@ -169,6 +169,10 @@ body:not(.has-player) .toasts { bottom: var(--sp-5); }
     box-shadow: var(--shadow-pop);
   }
   body.video-collapsed .video-tile { display: none; }
+  /* Reserve the floating tile's height so the last rows (and their ⋯) scroll clear of it. */
+  body.has-player.has-video:not(.video-collapsed) {
+    padding-bottom: calc(var(--player-h) + var(--sp-3) + 200px + var(--sp-3));
+  }
   .toasts { left: var(--sp-4); }
 }
 
@@ -218,6 +222,13 @@ body:not(.has-player) .toasts { bottom: var(--sp-5); }
     box-shadow: none;
   }
   body.player-paused .video-tile { display: none; }
+  /* While the tile shows (playing), the page reserves its height too: dock + player + video. */
+  body.has-player.has-video:not(.player-paused):not(.video-collapsed) {
+    padding-bottom: calc(var(--player-h) + 200px);
+  }
+  body.has-dock.has-player.has-video:not(.player-paused):not(.video-collapsed) {
+    padding-bottom: calc(48px + var(--player-h) + 200px);
+  }
 
   .crate-panel {
     top: auto;

@@ -14,7 +14,7 @@ import { state, onChange, loadPlaylist, rowsOf, isMine } from '../store.js';
 import { runAction } from '../actions.js';
 import { openPopover, closePopover, rerenderPopover } from '../ui/popover.js';
 import { thumbSrc, plural } from '../format.js';
-import { real } from './ops.js';
+import { real, rowKey } from './ops.js';
 import {
   clickSelect, selectedRows, selectionCount, rowsOfList, isEditableList, drawInsertLine,
   hideAllInsertLines, setDragging, clearSelection, focusRow,
@@ -89,7 +89,7 @@ function endPress() {
 
 function rowsForDrag(p) {
   const key = p.list && p.list.dataset.listKey;
-  const id = Number(p.rowEl.dataset.trackId);
+  const id = rowKey(p.rowEl.dataset.trackId);
   const sel = state.selection;
   if (sel.listKey === key && sel.ids && sel.ids.has(id)) return selectedRows();
   clickSelect(p.rowEl);
@@ -175,7 +175,7 @@ function gapIn(list, y) {
   for (const el of rows) {
     const r = el.getBoundingClientRect();
     if (y < r.top + r.height / 2) return after;
-    after = Number(el.dataset.trackId);
+    after = rowKey(el.dataset.trackId);
   }
   return after;
 }

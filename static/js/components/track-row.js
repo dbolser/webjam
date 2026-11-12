@@ -42,9 +42,23 @@ function selectedIn(row, playlistId) {
   return !!(sel && sel.ids && sel.ids.has(row.id) && (sel.playlistId == null || sel.playlistId === playlistId));
 }
 
+/** Does the "in N playlists" count include the row's own playlist? Only a public one is counted
+ *  (playlist_count is LISTED playlists), so a private or unlisted draft shows the hop from N = 1. */
+function countsItself(row, context) {
+  if (context !== 'playlist') return false;
+  const p = row.playlist_id != null ? state.playlists.get(Number(row.playlist_id)) : null;
+  if (!p) return true;
+  const vis = p.meta && p.meta.visibility;
+  return p.kind !== 'crate' && (vis == null || vis === 'public');
+}
+
 function metaLine(row, context) {
   const parts = [];
   if (row.channel_title) parts.push(html`<span>${row.channel_title}</span>`);
+  // The track -> playlists hop comes right after the channel, so a narrow (ellipsised) line keeps it.
+  const min = countsItself(row, context) ? 2 : 1;
+  const n = Number(row.playlist_count) || 0;
+  if (n >= min) parts.push(html`<a class="hop" href=${trackUrl(row.video_id)}>in ${plural(n, 'playlist')}</a>`);
   if (row.source_username && context !== 'crate') {
     parts.push(html`<a class="hop" href=${userUrl(row.source_username)}>via @${row.source_username}</a>`);
   }
@@ -56,9 +70,6 @@ function metaLine(row, context) {
     }
   }
   if (row.found_by) parts.push(html`<a class="hop" href=${userUrl(row.found_by)}>found by @${row.found_by}</a>`);
-  const min = context === 'playlist' ? 2 : 1;
-  const n = Number(row.playlist_count) || 0;
-  if (n >= min) parts.push(html`<a class="hop" href=${trackUrl(row.video_id)}>in ${plural(n, 'playlist')}</a>`);
   if (Number(row.together_count) > 0) parts.push(html`<span class="sep">together in ${row.together_count}</span>`);
   if (state.dead.has(row.video_id)) parts.push(html`<span class="sep dead-label">unavailable</span>`);
   const len = displayLength(row);

@@ -186,13 +186,25 @@ export async function deletePlaylist(pid) {
 
 // --- removing rows ---------------------------------------------------------------------------------------
 
+/** The selection when it belongs to this list; else the focused row in it (never another list's rows). */
+function rowsHere(list) {
+  const key = list.dataset.listKey;
+  if (state.selection.listKey === key) return selectedRows();
+  const a = document.activeElement;
+  const rowEl = a && a.closest ? a.closest('[data-track-id]') : null;
+  if (!rowEl || !list.contains(rowEl)) return [];
+  const id = Number(rowEl.dataset.trackId);
+  const r = rowsOfList(key).find((x) => x.id === id);
+  return r ? [r] : [];
+}
+
 /** Remove the selection (or the given rows) from an editable list. */
 export function removeRows(list, rows = null) {
   if (!list || !isEditableList(list)) return false;
   const pid = Number(list.dataset.playlistId);
   if (!pid || !isMine(pid)) return false;
   const key = list.dataset.listKey;
-  const picked = rows || selectedRows();
+  const picked = rows || rowsHere(list);
   const ids = picked.map((r) => r.id).filter((id) => id > 0);
   if (!ids.length) return false;
   // The cursor moves to the row after the block (or before it at the end).

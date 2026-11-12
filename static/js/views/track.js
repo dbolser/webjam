@@ -151,7 +151,7 @@ export function render(ctx) {
     ${lovers(song)}
 
     <section class="section" aria-labelledby="dc-h-in">
-      <h2 class="label" id="dc-h-in">In ${plural(count || playlists.length, 'playlist')}</h2>
+      <h2 class="label" id="dc-h-in">In ${plural(playlists.length || count, 'playlist')}</h2>
       ${playlists.length
         ? html`<ul class="dc-in-list">${repeat(playlists, (e) => e.playlist.id, (e) => inPlaylistTpl(song, e, firsts))}</ul>`
         : empty('Not in any public playlist yet.')}

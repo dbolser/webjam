@@ -13,7 +13,7 @@ import * as slots from '../slots.js';
 import { register as registerPaste } from '../paste-router.js';
 import { toast } from '../ui/toast.js';
 import { trackUrl, playlistUrl, absoluteUrl, clipLabel, isVideoId, plural } from '../format.js';
-import { submit, real } from './ops.js';
+import { submit, real, rowKey } from './ops.js';
 import { selectedRows, insertAfterId, rowsOfList, isEditableList, focusRow } from './selection.js';
 
 const MAX_ITEMS = 1000;
@@ -98,7 +98,7 @@ function focusedRowObj(list) {
   const a = document.activeElement;
   const rowEl = a && a.closest ? a.closest('[data-track-id]') : null;
   if (!list || !rowEl) return null;
-  const id = Number(rowEl.dataset.trackId);
+  const id = rowKey(rowEl.dataset.trackId);
   return rowsOfList(list.dataset.listKey).find((r) => r.id === id) || null;
 }
 
@@ -203,10 +203,11 @@ function anchorIn(list) {
   if (state.selection.listKey === key) return insertAfterId(key);
   const a = document.activeElement;
   const rowEl = a && a.closest ? a.closest('[data-track-id]') : null;
-  return rowEl && list.contains(rowEl) ? Number(rowEl.dataset.trackId) : null;
+  return rowEl && list.contains(rowEl) ? rowKey(rowEl.dataset.trackId) : null;
 }
 
 function placement(after) {
+  if (after === undefined) return {}; // the anchor is gone (a reconcile raced the key): append
   return after != null ? { after_track_id: after } : { position: 1 };
 }
 

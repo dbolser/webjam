@@ -213,7 +213,7 @@ export function render(ctx) {
 
     ${commentsSection({ type: 'profile', id: u.id, comments: d.comments, hasMore: d.comments_has_more, heading: 'Guestbook', emptyText: 'Nobody has signed yet.' })}
 
-    ${badgesSection(d)}
+    ${badgesSection(d, { owner: isOwner(u) })}
   </div>`;
 }
 

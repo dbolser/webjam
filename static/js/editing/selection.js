@@ -7,7 +7,7 @@
 
 import { state, update, onChange } from '../store.js';
 import { listRows } from '../components/track-row.js';
-import { real } from './ops.js';
+import { real, rowKey } from './ops.js';
 
 const EMPTY = () => ({ listKey: null, playlistId: null, ids: new Set(), anchorId: null, cursorId: null, insertAfterId: undefined });
 
@@ -54,6 +54,15 @@ export function insertAfterId(key) {
     const ids = sel.ids || new Set();
     for (let i = rows.length - 1; i >= 0; i--) if (ids.has(rows[i].id)) return rows[i].id;
     if (sel.cursorId != null && rows.some((r) => r.id === sel.cursorId)) return sel.cursorId;
+    // A paste that just landed: the selection may still name its temp id for a moment.
+    const realIds = new Set([...ids].map(real));
+    for (let i = rows.length - 1; i >= 0; i--) if (realIds.has(rows[i].id)) return rows[i].id;
+    if (sel.cursorId != null) {
+      const c = real(sel.cursorId);
+      if (rows.some((r) => r.id === c)) return c;
+    }
+    // The selection belongs here but is gone from the list: append rather than jump to the top.
+    if (ids.size || sel.cursorId != null) return undefined;
   }
   return null;
 }
@@ -79,7 +88,7 @@ export function clickSelect(rowEl, { shift = false, toggle = false } = {}) {
   const list = rowEl.closest('[data-list-key]');
   if (!list) return;
   const key = list.dataset.listKey;
-  const id = Number(rowEl.dataset.trackId);
+  const id = rowKey(rowEl.dataset.trackId);
   const rows = rowsOfList(key);
   const sel = state.selection;
   const same = sel.listKey === key;
@@ -114,7 +123,7 @@ export function moveCursor(list, delta, { extend = false } = {}) {
   let at = same ? rows.findIndex((r) => r.id === sel.cursorId) : -1;
   if (at < 0) {
     const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-track-id]');
-    at = focused ? rows.findIndex((r) => r.id === Number(focused.dataset.trackId)) : -1;
+    at = focused ? rows.findIndex((r) => r.id === rowKey(focused.dataset.trackId)) : -1;
   }
   const next = at < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, at + delta));
   const id = rows[next].id;
@@ -144,7 +153,7 @@ export function selectAll(list) {
 export function focusRow(key, id, { scroll = false } = {}) {
   requestAnimationFrame(() => {
     const list = listEl(key);
-    const el = list && list.querySelector(`[data-track-id="${real(id)}"]`);
+    const el = list && list.querySelector(`[data-track-id="${CSS.escape(String(real(id)))}"]`);
     if (!el) return;
     el.focus({ preventScroll: true });
     if (scroll) el.scrollIntoView({ block: 'nearest', behavior: 'auto' });
@@ -164,7 +173,7 @@ export function drawInsertLine(list, afterId, { hint = false } = {}) {
   }
   let y = 0;
   if (afterId != null) {
-    const row = list.querySelector(`:scope > [data-track-id="${afterId}"]`);
+    const row = list.querySelector(`:scope > [data-track-id="${CSS.escape(String(afterId))}"]`);
     if (!row) {
       line.hidden = true;
       return;
@@ -209,7 +218,7 @@ function afterRender() {
   const sel = state.selection;
   if ((!active || active === document.body) && lastFocusedKey && sel.cursorId != null && sel.listKey === lastFocusedKey) {
     const list = listEl(sel.listKey);
-    const el = list && list.querySelector(`[data-track-id="${real(sel.cursorId)}"]`);
+    const el = list && list.querySelector(`[data-track-id="${CSS.escape(String(real(sel.cursorId)))}"]`);
     if (el) el.focus({ preventScroll: true });
   }
   refreshHint();

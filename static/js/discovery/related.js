@@ -7,7 +7,7 @@
 // playlists too, because I can already see the source.
 
 import { html, nothing, repeat } from '../lit.js';
-import { state } from '../store.js';
+import { state, onChange, rowsOf } from '../store.js';
 import * as api from '../api.js';
 import * as slots from '../slots.js';
 import { registerActions } from '../actions.js';
@@ -21,7 +21,7 @@ const panels = new Map(); // playlistId -> { open, items, total, next, loading, 
 function panel(id) {
   let p = panels.get(id);
   if (!p) {
-    p = { open: false, items: null, total: 0, next: null, loading: false, more: false, error: '', expanded: new Set() };
+    p = { open: false, items: null, total: 0, next: null, loading: false, more: false, error: '', expanded: new Set(), sig: null };
     panels.set(id, p);
   }
   return p;
@@ -41,6 +41,7 @@ export async function openRelated(id) {
   p.loading = true;
   p.error = '';
   redraw('dc-related');
+  p.sig = trackSig(id);
   try {
     const res = await fetchPage(id, 0);
     p.items = res.related || [];
@@ -183,3 +184,25 @@ registerActions({
 export function resetRelated(id) {
   panels.delete(Number(id));
 }
+
+/** The playlist's set of videos as this tab knows it (temp rows excluded); null when not loaded. */
+function trackSig(id) {
+  const pid = Number(id);
+  if (!state.playlists.has(pid)) return null;
+  const vids = new Set(rowsOf(pid).filter((t) => t.id > 0).map((t) => t.video_id));
+  return [...vids].sort().join(',');
+}
+
+// After an edit is reconciled (or a playlist reloaded), a panel computed from the old track set is
+// stale: drop it, and refetch at once if it is open, so overlap and shared counts stay true.
+onChange((reasons) => {
+  if (!(reasons.has('reconcile') || reasons.has('load-playlist'))) return;
+  for (const [id, p] of [...panels]) {
+    if (p.loading || p.sig == null) continue;
+    const now = trackSig(id);
+    if (now == null || now === p.sig) continue;
+    const wasOpen = p.open;
+    resetRelated(id);
+    if (wasOpen) openRelated(id);
+  }
+});

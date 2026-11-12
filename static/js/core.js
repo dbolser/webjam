@@ -1,7 +1,7 @@
 // F's core actions and keys. Imported by main.js BEFORE the lane entry modules, so lanes can extend
 // a key (later registrations run first) and add actions with their own prefixes.
 
-import { state, update, rowsOf, loadPlaylist, optimistic } from './store.js';
+import { state, update, rowsOf, loadPlaylist, optimistic, expectedFor } from './store.js';
 import * as api from './api.js';
 import * as slots from './slots.js';
 import { registerActions } from './actions.js';
@@ -118,7 +118,7 @@ export async function removeFromCrate(trackId) {
   const op = { kind: 'delete', playlist_id: cid, track_ids: [trackId] };
   const token = optimistic(op);
   try {
-    await api.ops.send([op], { token });
+    await api.ops.send([op], { token, expectedVersions: () => expectedFor([cid]) });
     toast.show('Removed from your crate', state.undo && state.undo.can_undo
       ? { action: { label: 'Undo', run: () => api.undo().catch((err) => toast.show(err.detail)) } } : {});
   } catch {
@@ -143,6 +143,23 @@ async function copyText(text, done = 'Link copied') {
   } catch {
     toast.show('Copy failed; your browser blocked the clipboard.');
   }
+}
+
+/** Add the playing track to my crate (the player bar's crate button and the phone ⋯ menu). */
+function playingToCrate() {
+  const it = player.current();
+  if (!it) return null;
+  const fromCrate = state.player.source && state.player.source.kind === 'crate';
+  return addToCrate([{
+    id: fromCrate ? null : it.trackId,
+    playlist_id: fromCrate ? null : it.playlistId,
+    video_id: it.video_id,
+    start_seconds: it.start ?? null,
+    end_seconds: it.end ?? null,
+    title: it.title,
+    channel_title: it.channel,
+    thumbnail_url: it.thumb,
+  }]);
 }
 
 // --- actions ------------------------------------------------------------------------------------
@@ -218,20 +235,25 @@ registerActions({
   'player-seam': () => player.previewSeam(state.player.index + 1),
   'player-repeat': () => player.toggleRepeat(),
   'player-small-video': () => player.toggleSmallVideo(),
-  'player-crate': () => {
-    const it = player.current();
-    if (!it) return;
-    const fromCrate = state.player.source && state.player.source.kind === 'crate';
-    addToCrate([{
-      id: fromCrate ? null : it.trackId,
-      playlist_id: fromCrate ? null : it.playlistId,
-      video_id: it.video_id,
-      start_seconds: it.start ?? null,
-      end_seconds: it.end ?? null,
-      title: it.title,
-      channel_title: it.channel,
-      thumbnail_url: it.thumb,
-    }]);
+  'player-video': () => player.toggleVideo(),
+  'player-crate': () => playingToCrate(),
+  // Phones: the extra controls (like, crate, seam, repeat, video) live behind one quiet ⋯.
+  'player-more': (el) => {
+    const p = state.player;
+    const item = player.current();
+    if (!item) return;
+    const items = [
+      ...slots.render('player.more', { item }),
+      { label: 'Add to crate', icon: 'crate', run: () => playingToCrate() },
+      p.index < p.queue.length - 1
+        ? { label: 'Preview the seam into the next track', icon: 'seam', kbd: 'N', run: () => player.previewSeam(p.index + 1) }
+        : null,
+      'sep',
+      { label: player.isRepeating() ? 'Repeat this track: on' : 'Repeat this track', icon: 'repeat', run: () => player.toggleRepeat() },
+      { label: player.isSmallVideo() ? 'Small video: on' : 'Small video, low data', icon: 'small-video', run: () => player.toggleSmallVideo() },
+      { label: player.isVideoCollapsed() ? 'Show the video' : 'Hide the video (pauses)', icon: 'video-off', run: () => player.toggleVideo() },
+    ];
+    openMenu(el, items, { label: 'Player' });
   },
   'player-seek': (el, e) => {
     if (e.type === 'change' || e.type === 'input') player.seekFraction(Number(el.value) / 1000);
@@ -243,8 +265,12 @@ registerActions({
       const row = rowFor(ctx);
       if (!row) return;
       const mctx = { ...ctx, row, rowEl: ctx.row, crate: kind === 'crate-row' };
+      const at = focusedIndexIn(ctx);
+      const count = listRows(ctx.list && ctx.list.dataset.listKey).rows.length;
       const items = [
         { label: 'Play', icon: 'play', run: () => playRow(ctx) },
+        at >= 1 ? { label: 'Preview the seam into this', icon: 'seam', kbd: 'B', run: () => seamAt(ctx, 'into') } : null,
+        at >= 0 && at < count - 1 ? { label: 'Preview the seam out of this', icon: 'seam', kbd: 'N', run: () => seamAt(ctx, 'out') } : null,
         kind === 'crate-row'
           ? { label: 'Remove from crate', icon: 'close', run: () => removeFromCrate(Number(row.id)) }
           : { label: 'Add to crate', icon: 'plus', kbd: 'C', run: () => addToCrate([row]) },
@@ -283,6 +309,26 @@ async function listQueue(ctx) {
   return { items: itemsFromRows(rows, source), source, rows };
 }
 
+/** Preview the seam into ('into': the row before -> this row) or out of ('out': this row -> the next)
+ *  the row in ctx: the B / N keys and the row menu share this. */
+async function seamAt(ctx, dir) {
+  const q = await listQueue(ctx);
+  const i = focusedIndexIn(ctx);
+  if (dir === 'into') {
+    if (i < 1) {
+      toast.show('Nothing before this track.');
+      return;
+    }
+    player.previewSeam(i, { items: q.items, source: q.source });
+    return;
+  }
+  if (i < 0 || i >= q.items.length - 1) {
+    toast.show('Nothing after this track.');
+    return;
+  }
+  player.previewSeam(i + 1, { items: q.items, source: q.source });
+}
+
 function isCurrentRow(ctx) {
   const cur = player.current();
   return !!(cur && ctx.trackId && cur.trackId === ctx.trackId);
@@ -296,7 +342,7 @@ registerKeys([
     box.select();
     return true;
   } },
-  { combo: 'escape', when: 'always', label: 'Close', group: 'General', run: () => {
+  { combo: 'escape', when: 'always', label: 'Close or cancel', group: 'General', run: () => {
     if (state.ui.cratePanel) {
       update((s) => { s.ui.cratePanel = false; }, 'crate-panel');
       return true;
@@ -332,25 +378,13 @@ registerKeys([
     }
     player.jumpToEnd(10);
   } },
-  { combo: 'b', when: 'list', label: 'Preview the seam before this track', group: 'Player', run: async (e, ctx) => {
+  { combo: 'b', when: 'list', label: 'Preview the seam before this track', group: 'Player', run: (e, ctx) => {
     if (!ctx.row) return false;
-    const q = await listQueue(ctx);
-    const i = focusedIndexIn(ctx);
-    if (i < 1) {
-      toast.show('Nothing before this track.');
-      return;
-    }
-    player.previewSeam(i, { items: q.items, source: q.source });
+    return seamAt(ctx, 'into');
   } },
-  { combo: 'n', when: 'list', label: 'Preview the seam after this track', group: 'Player', run: async (e, ctx) => {
+  { combo: 'n', when: 'list', label: 'Preview the seam after this track', group: 'Player', run: (e, ctx) => {
     if (!ctx.row) return false;
-    const q = await listQueue(ctx);
-    const i = focusedIndexIn(ctx);
-    if (i < 0 || i >= q.items.length - 1) {
-      toast.show('Nothing after this track.');
-      return;
-    }
-    player.previewSeam(i + 1, { items: q.items, source: q.source });
+    return seamAt(ctx, 'out');
   } },
   { combo: 'c', when: 'list', label: 'Add to crate', group: 'Edit', run: (e, ctx) => {
     const rows = selectedRows(ctx);
