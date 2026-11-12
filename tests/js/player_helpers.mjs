@@ -5,8 +5,11 @@
 //   media-session.js  metadata, position state and handler wiring against a fake mediaSession
 //   node tests/js/player_helpers.mjs <path to static/js>
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-const base = new URL(`file://${process.argv[2].replace(/\/$/, '')}/`);
+// Relative paths work too (resolved against the current directory).
+const base = pathToFileURL(`${path.resolve(process.argv[2] || 'static/js')}/`);
 const mod = (p) => import(new URL(p, base).href);
 
 const R = await mod('player/resume.js');
@@ -104,6 +107,52 @@ assert.equal(R.snapshot({ item: { ...item, title: 'x'.repeat(5000) }, time: 50, 
   assert.equal(one.video_id, 'abcdefghijk');
   assert.equal(one.start, 30);
   assert.equal(one.end, 200);
+}
+
+// The fallback item for a list that no longer loads carries no playlist or track id.
+{
+  const rec = R.snapshot({ item, index: 1, source: src, time: 50, userId: 5, now: NOW });
+  const one = R.itemFromRecord(rec);
+  assert.equal(one.playlistId, null);
+  assert.equal(one.trackId, null);
+}
+
+// Whoever started the queue owns it: a persona switch mid-play saves nothing for the new person.
+{
+  const crate = { playlistId: 9, title: 'Crate', kind: 'crate' };
+  assert.ok(R.snapshot({ item, source: src, time: 60, userId: 5, ownerId: 5, now: NOW }));
+  assert.equal(R.snapshot({ item, source: src, time: 60, userId: null, ownerId: 5, now: NOW }), null, 'mid switch');
+  assert.equal(R.snapshot({ item, source: crate, time: 60, userId: 6, ownerId: 5, now: NOW }), null, 'after switch');
+  assert.equal(R.snapshot({ item, source: src, time: 60, userId: 6, ownerId: null, now: NOW }), null, 'signed in later');
+  assert.ok(R.snapshot({ item, source: src, time: 60, userId: null, ownerId: null, now: NOW }), 'anonymous, same person');
+  // A crate that isn't the current user's crate is never saved, whoever's key it would go under.
+  assert.equal(R.snapshot({ item, source: crate, time: 60, userId: 6, crateId: 12, now: NOW }), null);
+  assert.equal(R.snapshot({ item, source: crate, time: 60, userId: 6, crateId: 9, now: NOW }).src.kind, 'crate');
+  assert.equal(R.planSave({ queue: [item], index: 0, source: crate, time: 60, userId: 6, ownerId: 5, now: NOW }), null);
+  assert.equal(R.planSave({ queue: [item], index: 0, time: 199, userId: 6, ownerId: 5, now: NOW }), null,
+    'never clears the new person\'s record either');
+}
+
+// planSave: in the tail of a track, move on to the next one (or clear at the end of the list).
+{
+  const b = { trackId: 8, playlistId: 3, video_id: 'bbbbbbbbbbb', start: 12, end: null, title: 'Next', channel: 'C2' };
+  const q = [item, b];
+  const mid = R.planSave({ queue: q, index: 0, source: src, time: 100, duration: 300, userId: 5, ownerId: 5, now: NOW });
+  assert.equal(mid.write.videoId, 'abcdefghijk');
+  assert.equal(mid.write.pos, 100);
+  const tail = R.planSave({ queue: q, index: 0, source: src, time: 198.5, duration: 300, userId: 5, ownerId: 5, now: NOW });
+  assert.equal(tail.write.videoId, 'bbbbbbbbbbb');
+  assert.equal(tail.write.index, 1);
+  assert.equal(tail.write.trackId, 8);
+  assert.equal(tail.write.pos, 12, 'the next track at its clip start');
+  const rep = R.planSave({ queue: q, index: 0, source: src, time: 198.5, duration: 300, repeat: true, userId: 5, ownerId: 5, now: NOW });
+  assert.equal(rep.write.videoId, 'abcdefghijk', 'repeating: the same track from its start');
+  assert.equal(rep.write.pos, 30);
+  assert.deepEqual(R.planSave({ queue: q, index: 1, source: src, time: 299, duration: 300, userId: 5, ownerId: 5, now: NOW }), { clear: true });
+  assert.equal(R.planSave({ queue: [], index: 0, userId: 5, now: NOW }), null);
+  assert.equal(R.inTail(item, 197.5, 0), true);
+  assert.equal(R.inTail(item, 196, 0), false);
+  assert.equal(R.inTail({ ...item, end: null }, 999, 0), false, 'unknown end: never the tail');
 }
 
 // --- wake-lock.js --------------------------------------------------------------------------------

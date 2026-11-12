@@ -966,16 +966,17 @@ YouTube embeds can't play in the background on phones, and YouTube expects a vis
 ### 12.3 Resume where you left off (`resume.js`)
 
 - **What is saved:** `localStorage["webjam.resume.u<user id>"]`, or `["webjam.resume.anon"]` when signed out. It holds `{ v, src: { kind, playlistId, title } | null, trackId, videoId, index, start, end, title, channel, pos, at }`. That is only the playing track and where it came from, never the queue or a crate's contents.
-- **Keying by user:** a second person on the same browser never sees the first person's spot. A crate source is never written under the anonymous key, and a crate is only rebuilt for the signed-in owner (`crateId` must match).
+- **Keying by user:** a second person on the same browser never sees the first person's spot. A crate source is never written under the anonymous key, and a crate is only saved and rebuilt for the signed-in owner (`crateId` must match). The player remembers who started the queue; after a demo persona switch (or a sign-in) mid-play, nothing more is saved until the new person starts something themselves. If a saved list no longer loads, the fallback queue of one carries no playlist or track id.
 - **When it is written:**
   - every ~5 s while playing;
   - on pause;
   - on `visibilitychange` to hidden;
   - on `pagehide`.
-- **When it is not written:** during a seam preview, or within 3 s of the clip's end. Finishing the last track clears it.
+- **When it is not written:** during a seam preview, or for a video YouTube refused. Within 3 s of the clip's end the record moves on to the next track at its start (the same track when repeating); on the last track it is cleared, as finishing the list does.
 - **Validation and expiry:** records older than 7 days, or from another version or malformed, are dropped and removed on read.
 - **On load:** with nothing playing, the player bar shows one quiet line: ▶ "Resume ‘Title’ at 2:31" and a ×. The time is relative to the clip, like the bar's clock.
   - Tapping it reloads the playlist and finds the track (by track id, then index, then video). If the list is gone, it falls back to a queue of one. Playback then starts at the saved position, kept inside the clip's start and end.
   - It never autoplays.
   - × forgets the spot.
-- **Back from the background:** if music was playing when the tab was hidden and the OS paused it, the bar's subline becomes "Resume at 2:31" until playback restarts. One tap seeks back if needed and plays.
+- **Back from the background:** if music was playing when the tab was hidden and the OS paused it, the bar's subline becomes "Resume at 2:31" until playback restarts. The time is read from YouTube when the tab comes back (background timers are throttled). One tap seeks forward to it if needed (never backwards) and plays.
+- **Lock screen while loading:** pause during a track's start holds it paused; play nudges a load the browser refused to start (iOS after an await).

@@ -6,7 +6,8 @@
 // never sees what the first was playing, and a crate never lands under the anonymous key.
 //
 //   resumeKey(userId)                          the storage key
-//   snapshot({ item, index, source, time, duration, userId, now })  -> record | null
+//   snapshot({ item, index, source, time, duration, userId, ownerId, crateId, now })  -> record | null
+//   planSave({ queue, index, ..., durationOf, repeat })  -> { write: record } | { clear: true } | null
 //   parse(raw, now)                            JSON string -> record | null (bad, old or expired)
 //   resumeAt(record)                           where to start, inside the clip
 //   readResume(storage, userId, now)  writeResume(storage, userId, record)  clearResume(storage, userId)
@@ -28,22 +29,42 @@ const num = (v) => (v == null || v === '' ? null : Number.isFinite(Number(v)) ? 
 const text = (v) => (typeof v === 'string' ? v.slice(0, MAX_TEXT) : '');
 const posInt = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
 
-/** The record to store for what is playing now, or null when there is nothing worth resuming. */
-export function snapshot({ item, index = 0, source = null, time = 0, duration = 0, userId = null, now = Date.now() } = {}) {
-  if (!item || !VID.test(String(item.video_id || ''))) return null;
-  const start = Math.max(0, num(item.start) || 0);
+/** True when `time` is in the last RESUME_TAIL seconds of the clip (only when its end is known). */
+export function inTail(item, time, duration = 0) {
+  if (!item) return false;
   const end = num(item.end);
   const stop = end != null ? end : num(duration) || null;
+  const pos = Math.max(Math.max(0, num(item.start) || 0), num(time) || 0);
+  return stop != null && pos >= stop - RESUME_TAIL;
+}
+
+/** Same person? `ownerId` is who started the queue; undefined skips the check. */
+function samePerson(ownerId, userId) {
+  return ownerId === undefined || posInt(ownerId) === posInt(userId);
+}
+
+/** The record to store for what is playing now, or null when there is nothing worth resuming.
+ *  `ownerId` is the user who started the queue: when someone else is here now (a demo persona
+ *  switch mid-play), nothing is saved. `crateId` is the current user's crate: a crate source that
+ *  isn't theirs is never saved. */
+export function snapshot({
+  item, index = 0, source = null, time = 0, duration = 0, userId = null, ownerId = undefined,
+  crateId = undefined, now = Date.now(),
+} = {}) {
+  if (!item || !VID.test(String(item.video_id || ''))) return null;
+  if (!samePerson(ownerId, userId)) return null;
+  const start = Math.max(0, num(item.start) || 0);
+  const end = num(item.end);
   let pos = num(time);
   if (pos == null) return null;
   pos = Math.max(start, pos);
-  if (stop != null && pos >= stop - RESUME_TAIL) return null;
+  if (inTail(item, pos, duration)) return null;
   let src = null;
   if (source && (source.kind || source.playlistId)) {
     const kind = source.kind === 'crate' ? 'crate' : 'playlist';
-    // A crate is private: only ever stored under its owner's key.
-    if (kind === 'crate' && !posInt(userId)) return null;
     const pid = posInt(source.playlistId);
+    // A crate is private: only ever stored under its owner's key.
+    if (kind === 'crate' && (!posInt(userId) || (crateId !== undefined && posInt(crateId) !== pid))) return null;
     if (pid) src = { kind, playlistId: pid, title: kind === 'crate' ? 'Crate' : text(source.title) };
   }
   return {
@@ -59,6 +80,28 @@ export function snapshot({ item, index = 0, source = null, time = 0, duration = 
     pos: Math.round(pos * 10) / 10,
     at: Math.round(num(now) || 0),
   };
+}
+
+/** What to do with the stored record now. In the tail of a track, move on: the next track at its
+ *  start (the same one when repeating), or clear when the list is done. Null means leave it be. */
+export function planSave({
+  queue, index = 0, source = null, time = 0, duration = 0, durationOf = () => 0, repeat = false,
+  userId = null, ownerId = undefined, crateId = undefined, now = Date.now(),
+} = {}) {
+  const items = Array.isArray(queue) ? queue : [];
+  const item = items[index];
+  if (!item || !samePerson(ownerId, userId)) return null;
+  const common = { source, userId, ownerId, crateId, now };
+  let rec;
+  if (inTail(item, time, duration)) {
+    const i = repeat ? index : index + 1;
+    const nxt = items[i];
+    if (!nxt) return { clear: true };
+    rec = snapshot({ ...common, item: nxt, index: i, time: num(nxt.start) || 0, duration: i === index ? duration : durationOf(nxt.video_id) || 0 });
+    return rec ? { write: rec } : { clear: true };
+  }
+  rec = snapshot({ ...common, item, index, time, duration });
+  return rec ? { write: rec } : null;
 }
 
 /** Validates a stored record. Returns null for junk, other versions and anything older than 7 days. */
@@ -101,11 +144,12 @@ export function resumeAt(record) {
   return t;
 }
 
-/** The record as a queue item (queue.js shape), for a queue of one when the list can't load. */
+/** The record as a queue item (queue.js shape), for a queue of one when the list can't load. It
+ *  carries no playlist or track id: the list is gone, private or someone else's. */
 export function itemFromRecord(record) {
   return {
-    trackId: record.src ? record.trackId : null,
-    playlistId: record.src ? record.src.playlistId : null,
+    trackId: null,
+    playlistId: null,
     video_id: record.videoId,
     start: record.start,
     end: record.end,
