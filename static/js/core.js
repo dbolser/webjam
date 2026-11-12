@@ -236,8 +236,11 @@ registerActions({
   'player-repeat': () => player.toggleRepeat(),
   'player-small-video': () => player.toggleSmallVideo(),
   'player-video': () => player.toggleVideo(),
+  'player-keep-awake': () => player.toggleKeepAwake(),
+  'player-resume': () => player.resumeSaved(),
+  'player-resume-dismiss': () => player.dismissResume(),
   'player-crate': () => playingToCrate(),
-  // Phones: the extra controls (like, crate, seam, repeat, video) live behind one quiet ⋯.
+  // Phones: the extra controls (like, crate, seam, repeat, video, keep awake) live behind one quiet ⋯.
   'player-more': (el) => {
     const p = state.player;
     const item = player.current();
@@ -252,6 +255,9 @@ registerActions({
       { label: player.isRepeating() ? 'Repeat this track: on' : 'Repeat this track', icon: 'repeat', run: () => player.toggleRepeat() },
       { label: player.isSmallVideo() ? 'Small video: on' : 'Small video, low data', icon: 'small-video', run: () => player.toggleSmallVideo() },
       { label: player.isVideoCollapsed() ? 'Show the video' : 'Hide the video (pauses)', icon: 'video-off', run: () => player.toggleVideo() },
+      player.keepAwakeSupported()
+        ? { label: player.keepAwake() ? 'Keep screen awake: on' : 'Keep screen awake while playing', icon: 'awake', run: () => player.toggleKeepAwake() }
+        : null,
     ];
     openMenu(el, items, { label: 'Player' });
   },

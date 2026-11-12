@@ -933,3 +933,49 @@ Written when the three lanes merged into `t3/phase1b-shell`. Where this differs 
   - `tests/test_frontend_safety.py` now also checks that the classic UI is gone, that every lane entry is imported, that routes point at the real views and that `href` literals keep a fixed origin.
   - It also checks `target=_blank` with `noopener`, and the owner's vocabulary (no "audition").
   - It runs `tests/js/wiring_smoke.mjs`, which loads every module and checks that each `data-action` used in a template has a handler.
+
+---
+
+## 12. Phone helpers in the player
+
+YouTube embeds can't play in the background on phones, and YouTube expects a visible player, so webjam does not try background playback. It makes the foreground better instead. Each helper is a small module in `static/js/player/` with no DOM access of its own, unit-tested by `tests/js/player_helpers.mjs` (run from `tests/test_player_helpers.py`). `player.js` wires them in.
+
+### 12.1 Keep the screen awake (`wake-lock.js`)
+
+- Uses the Screen Wake Lock API (`navigator.wakeLock.request('screen')`). The lock is wanted only when the API is supported, the setting is on, the player is playing and the page is visible.
+- It is acquired on `PLAYING` and released on pause, error, end of queue or hide. Browsers drop the lock when the tab is hidden, so on `visibilitychange` back to visible it is requested again if music is still playing.
+- A sentinel that arrives after the player has already paused is released straight away. Every `request()` rejection is swallowed.
+- **Setting:** "Keep screen awake while playing", in the phone ⋯ menu. On touch devices wider than a phone, where `.pbar-extra` is visible, it also appears as an icon toggle there, with the accent marking "on". It is hidden when the API is missing.
+- The default is on for touch devices (`pointer: coarse`) and off elsewhere. The choice is remembered in `localStorage["webjam.keepAwake"]`. Every storage call is wrapped in try/catch.
+
+### 12.2 Lock-screen and headphone controls (`media-session.js`)
+
+- **Metadata:** `navigator.mediaSession.metadata` holds:
+  - the title;
+  - the artist: the channel, or `@curator` when there is no channel;
+  - the album: the playlist title, "Your crate" or "webjam";
+  - artwork: `i.ytimg.com/vi/<id>/mqdefault.jpg` (320×180) and `hqdefault.jpg` (480×360). CSP `img-src` already allows `https://i.ytimg.com`.
+- **Handlers:**
+  - `play` and `pause` are idempotent (`player.play()` / `player.pause()`), so a headset button never flips twice;
+  - `previoustrack`, `nexttrack`;
+  - `seekto` and `seekbackward`/`seekforward` (10 s, or the offset the OS asks for). All of them go through `seek()`, which keeps clip bounds.
+- **`playbackState`** follows the YouTube state.
+- **`setPositionState`** works across the clip, so a clip from 0:30 to 3:20 shows as 2:50 long. It is set on play, pause, seek and every 5 s. It is cleared when the track changes. Invalid values are never sent, and the call is wrapped in try/catch.
+- **Caveat:** the `<video>` lives in YouTube's cross-origin iframe. Some browsers show YouTube's own session, or none, instead of ours. We set ours correctly and let it degrade quietly.
+
+### 12.3 Resume where you left off (`resume.js`)
+
+- **What is saved:** `localStorage["webjam.resume.u<user id>"]`, or `["webjam.resume.anon"]` when signed out. It holds `{ v, src: { kind, playlistId, title } | null, trackId, videoId, index, start, end, title, channel, pos, at }`. That is only the playing track and where it came from, never the queue or a crate's contents.
+- **Keying by user:** a second person on the same browser never sees the first person's spot. A crate source is never written under the anonymous key, and a crate is only rebuilt for the signed-in owner (`crateId` must match).
+- **When it is written:**
+  - every ~5 s while playing;
+  - on pause;
+  - on `visibilitychange` to hidden;
+  - on `pagehide`.
+- **When it is not written:** during a seam preview, or within 3 s of the clip's end. Finishing the last track clears it.
+- **Validation and expiry:** records older than 7 days, or from another version or malformed, are dropped and removed on read.
+- **On load:** with nothing playing, the player bar shows one quiet line: ▶ "Resume ‘Title’ at 2:31" and a ×. The time is relative to the clip, like the bar's clock.
+  - Tapping it reloads the playlist and finds the track (by track id, then index, then video). If the list is gone, it falls back to a queue of one. Playback then starts at the saved position, kept inside the clip's start and end.
+  - It never autoplays.
+  - × forgets the spot.
+- **Back from the background:** if music was playing when the tab was hidden and the OS paused it, the bar's subline becomes "Resume at 2:31" until playback restarts. One tap seeks back if needed and plays.
