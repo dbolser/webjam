@@ -1,0 +1,67 @@
+/* Lane C: phone polish. Loaded last; overrides only. New classes are prefixed .sh-.
+   The three-breakpoint layout lives in layout.css (F). Budget at phone width: dock strip 48px +
+   player bar 60px = 108px of fixed chrome (under 120px); the video tile shows only while playing. */
+
+/* Touch: every control is at least 40px to hit, without changing how it looks at rest. */
+@media (pointer: coarse) {
+  .btn { min-height: 40px; }
+  .icon-btn { width: 40px; height: 40px; }
+  .menu-item { min-height: 40px; }
+  .chip { min-height: 40px; }
+  .link-btn { min-height: 40px; display: inline-flex; align-items: center; }
+  .sh-pill { min-height: 40px; }
+  .sh-check, .sh-radio { min-height: 40px; }
+  .sh-fold { width: 40px; height: 40px; }
+}
+
+@media (max-width: 759px) {
+  /* Safe areas: only non-zero if the page ever goes edge to edge (viewport-fit=cover). */
+  .topbar { padding-left: max(var(--sp-4), env(safe-area-inset-left, 0px)); padding-right: max(var(--sp-4), env(safe-area-inset-right, 0px)); }
+
+  /* Top bar: the wordmark, a flexible omnibox, then Discover and the account pill. */
+  .topbar { gap: var(--sp-2); }
+  .omnibox { flex: 1 1 auto; min-width: 0; }
+  .omnibox input { width: 100%; min-width: 0; }
+  .topbar-nav { gap: var(--sp-2); flex: none; }
+  .sh-pill { padding: 0 2px; }
+  .sh-pill .sh-chev { display: none; }
+
+  /* Dock strip: chips scroll sideways inside the strip, never the page. */
+  .dock { overscroll-behavior-x: contain; scrollbar-width: none; }
+  .dock::-webkit-scrollbar { display: none; }
+  .dock-list > li { flex: none; }
+  .chip { height: 40px; padding-top: 0; padding-bottom: 0; }
+  .chip-form { width: 200px; }
+
+  /* Crate: a bottom sheet that folds to a one-line strip above the dock. */
+  .sh-fold { display: inline-grid; }
+  body.has-dock .crate-panel { bottom: 48px; }
+  body.has-dock.has-player .crate-panel { bottom: calc(48px + var(--player-h)); }
+  .crate-panel { height: min(70vh, 560px); }
+  .crate-panel.sh-folded { height: auto; }
+  .crate-panel.sh-folded .crate-actions,
+  .crate-panel.sh-folded .crate-body { display: none; }
+  .crate-head { position: sticky; top: 0; z-index: 1; }
+  .crate-head .sh-crate-page { display: none; }
+  .crate-head .count { margin-right: auto; }
+  .crate-actions { padding: var(--sp-3) var(--sp-4) 0; gap: var(--sp-1); }
+  .crate-body { padding-bottom: calc(var(--sp-5) + env(safe-area-inset-bottom, 0px)); }
+
+  /* Sheets: full width from the bottom (F), with room for the home indicator. */
+  .sheet { max-height: 88vh; }
+  .sheet-foot { padding-bottom: calc(var(--sp-5) + env(safe-area-inset-bottom, 0px)); }
+  .sheet-foot .btn { flex: 1 1 0; justify-content: center; }
+  .sh-import-list { max-height: 38vh; }
+  .sh-radio { grid-template-columns: auto auto; row-gap: 0; }
+  .sh-radio .sh-hint { grid-column: 2; }
+
+  /* Popovers never wider than the screen. */
+  .sh-share, .sh-unload { width: calc(100vw - 2 * var(--sp-4) - 2 * var(--sp-2) - 2px); }
+
+  /* The handle card stacks. */
+  .sh-handle { padding: var(--sp-4); margin-bottom: var(--sp-5); }
+  .sh-handle-form .input { flex: 1 1 10em; width: auto; }
+
+  /* Page actions wrap under the title without crowding. */
+  .page-actions { gap: var(--sp-1); }
+}

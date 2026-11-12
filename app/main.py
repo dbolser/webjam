@@ -43,6 +43,7 @@ from app.auth import (
 
 from app import ops
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
+from app import discovery
 from app.database import get_connection, get_db, init_db
 from app.errors import ApiError
 from app.invite import list_invites, seed_invites_from_env
@@ -66,8 +67,10 @@ from app.visibility import (
     is_listed,
     linkable,
     listed,
+    public_song_sql,
     require_visible_playlist,
     song_visible,
+    song_visible_sql,
     visible,
 )
 from app.youtube import (
@@ -114,6 +117,8 @@ RATE_LIMITS: Dict[str, Tuple[float, float]] = {
     "audit": (5, 5 / 60),
     # /api/ops, undo and redo (the "add" bucket is also charged when a batch needs YouTube lookups).
     "ops": (120, 2.0),
+    # /api/search and /api/discover (Phase 1b).
+    "find": (60, 1.0),
 }
 PLAY_DEDUPE_SECONDS = 30 * 60
 PLAY_BADGE_EVAL_INTERVAL = 60
@@ -372,12 +377,25 @@ class BodySizeLimitMiddleware:
         await self.app(scope, replay_receive, send)
 
 
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' https://www.youtube.com https://s.ytimg.com",
+    "frame-src https://www.youtube.com https://www.youtube-nocookie.com",
+    "img-src 'self' data: https://i.ytimg.com https://*.ytimg.com",
+    "style-src 'self'",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "media-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "X-Frame-Options": "DENY",
-    # Only anti-framing for now; a full CSP needs the inline handlers gone first (Phase 1).
-    "Content-Security-Policy": "frame-ancestors 'none'",
+    "Content-Security-Policy": CONTENT_SECURITY_POLICY,
     # Leave autoplay/fullscreen/encrypted-media alone: the YouTube iframe needs them.
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
@@ -397,6 +415,10 @@ class SecurityHeadersMiddleware:
                 for name, value in SECURITY_HEADERS.items():
                     if name not in headers:
                         headers[name] = value
+                # ES modules are imported without a version query, so make browsers revalidate
+                # them (a cheap 304 via ETag) instead of heuristically caching a stale module.
+                if (scope.get("path") or "").startswith("/static/") and "Cache-Control" not in headers:
+                    headers["Cache-Control"] = "no-cache"
                 if get_config().base_url.startswith("https://") and "Strict-Transport-Security" not in headers:
                     headers["Strict-Transport-Security"] = "max-age=15552000"
             await send(message)
@@ -832,6 +854,9 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
             "playlists": my_playlists,
             "crate_id": crate_id,
             "undo": undo_state(conn, actual_uid),
+            "needs_handle": discovery.needs_handle(
+                conn, actual_uid, auth_enabled() and bool(session_user_id(request))
+            ),
         },
         "badge_catalog": BADGE_CATALOG,
         "auth": {
@@ -887,8 +912,8 @@ def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_
     ts = now_str()
     cur.execute(
         """
-        INSERT INTO users (username, display_name, bio, avatar_color, password_hash, created_at)
-        VALUES (?, ?, ?, ?, '', ?)
+        INSERT INTO users (username, display_name, bio, avatar_color, password_hash, created_at, handle_chosen_at)
+        VALUES (?, ?, ?, ?, '', ?, ?)
         """,
         (
             clean_uname,
@@ -896,6 +921,7 @@ def login_or_register(req: LoginRequest, conn: sqlite3.Connection = Depends(get_
             (req.bio or "New crate digger on Webjam.").strip(),
             color,
             ts,
+            ts,  # the demo user typed this name: never prompt for a handle
         ),
     )
     new_uid = cur.lastrowid
@@ -918,7 +944,8 @@ def update_my_handle(req: UpdateHandleRequest, request: Request, conn: sqlite3.C
     try:
         if (me["username"] or "").lower() != handle:
             release_handle(cur, me["username"], uid, now_str())
-        cur.execute("UPDATE users SET username = ? WHERE id = ?", (handle, uid))
+        # Saving the same handle is how "Keep @x" confirms it.
+        cur.execute("UPDATE users SET username = ?, handle_chosen_at = ? WHERE id = ?", (handle, now_str(), uid))
         conn.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="That handle is taken.")
@@ -941,24 +968,16 @@ def update_user_profile(
 
 
 def _song_visible_sql(video_expr: str, viewer: int) -> str:
-    """song_visible() as SQL: in a LISTED playlist, or in one of the viewer's own.
-
-    Claims are sticky (badge counts keep them), but a song is only listed where its page exists.
-    """
-    return (
-        f"EXISTS (SELECT 1 FROM playlist_tracks vpt JOIN playlists vp ON vp.id = vpt.playlist_id "
-        f"WHERE vpt.video_id = {video_expr} AND ({listed('vp')} OR vp.user_id = {int(viewer or 0)}))"
-    )
+    """song_visible() as SQL (see app.visibility.song_visible_sql)."""
+    return song_visible_sql(video_expr, viewer)
 
 
 def _public_song_sql(video_expr: str) -> str:
-    """EXISTS a LISTED playlist containing the video (a song anyone may see named)."""
-    return (
-        f"EXISTS (SELECT 1 FROM playlist_tracks xpt JOIN playlists xp ON xp.id = xpt.playlist_id "
-        f"WHERE xpt.video_id = {video_expr} AND {listed('xp')})"
-    )
+    return public_song_sql(video_expr)
 
 
+# Deprecated (Phase 1b cutover): the classic UI was its only client; /api/me/home and
+# /api/discover replace it. Kept because tests and old scripts still call it.
 @app.get("/api/feed")
 def get_community_feed(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
     user_id = resolve_viewer(request, user_id)
@@ -1147,6 +1166,7 @@ def build_playlist_detail(conn: sqlite3.Connection, pl_row: sqlite3.Row, viewer:
     )
     playlist["liked_by_users"] = [dict(r) for r in cur.fetchall()]
     playlist["tracks"] = ops.render_track_rows(conn, pl_row, viewer)
+    playlist["related_count"] = discovery.related_count(conn, playlist_id)
     if pl_row["kind"] == "crate":
         playlist["comments"], playlist["comments_has_more"] = [], False
     else:
@@ -2044,15 +2064,44 @@ def get_song_page(
         (video_id, user_id),
     )
     song["appearances"] = [dict(r) for r in cur.fetchall()]
+    song.update(discovery.song_extras(conn, video_id, user_id))
     song["comments"], song["comments_has_more"] = fetch_comments_page(conn, "song", video_id)
     return song
 
 
+def _profile_viewer(request: Request, user_id: Optional[int], viewer_id: Optional[int]) -> int:
+    # `user_id` is the new client's name for the viewer; `viewer_id` keeps working.
+    claimed = user_id if user_id is not None else (viewer_id if viewer_id is not None else 1)
+    return resolve_viewer(request, claimed)
+
+
+@app.get("/api/users/by-handle/{handle}")
+def get_user_profile_by_handle(
+    handle: str,
+    request: Request,
+    user_id: Optional[int] = Query(None),
+    viewer_id: Optional[int] = Query(None),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """The /api/users/{id} payload for a handle; a handle the user gave up resolves to them."""
+    profile_user_id = discovery.user_id_for_handle(conn, handle)
+    if profile_user_id is None:
+        raise ApiError(404, "user_not_found", "User not found")
+    return build_user_profile(conn, profile_user_id, _profile_viewer(request, user_id, viewer_id))
+
+
 @app.get("/api/users/{profile_user_id}")
 def get_user_profile(
-    profile_user_id: int, request: Request, viewer_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)
+    profile_user_id: int,
+    request: Request,
+    user_id: Optional[int] = Query(None),
+    viewer_id: Optional[int] = Query(None),
+    conn: sqlite3.Connection = Depends(get_db),
 ):
-    viewer_id = resolve_viewer(request, viewer_id)
+    return build_user_profile(conn, profile_user_id, _profile_viewer(request, user_id, viewer_id))
+
+
+def build_user_profile(conn: sqlite3.Connection, profile_user_id: int, viewer_id: int) -> Dict[str, Any]:
     is_self = bool(viewer_id) and viewer_id == profile_user_id
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id = ?", (profile_user_id,))
@@ -2063,6 +2112,7 @@ def get_user_profile(
     user = dict(urow)
     user.pop("password_hash", None)
     user.pop("session_epoch", None)
+    user.pop("handle_chosen_at", None)
 
     badge_data = get_user_badge_progress(conn, profile_user_id)
 
@@ -2118,6 +2168,10 @@ def get_user_profile(
             tracks.append(td)
         pl["tracks"] = tracks
         playlists.append(pl)
+    card_fields = {c["id"]: c for c in discovery.playlist_cards(conn, [pl["id"] for pl in playlists])}
+    for pl in playlists:
+        pl["related_count"] = card_fields[pl["id"]]["related_count"]
+        pl["preview"] = card_fields[pl["id"]]["preview"]
 
     # Songs first discovered on Webjam by this user (claims only come from public placements)
     cur.execute(
@@ -2254,6 +2308,7 @@ def get_user_profile(
         "grabs_by_user": grabs_by_user,
         "comments": profile_comments,
         "comments_has_more": profile_comments_more,
+        **discovery.profile_extras(conn, profile_user_id, viewer_id),
     }
 
 
@@ -2365,13 +2420,103 @@ async def search_youtube_embeddable(
 # anonymous callers send unvalidated ids to YouTube.
 
 
+# --- Discovery (Phase 1b, docs/phase1b-shell.md §3; queries live in app/discovery.py) ---
+
+@app.get("/api/me/home")
+def get_my_home(request: Request, user_id: Optional[int] = Query(None), conn: sqlite3.Connection = Depends(get_db)):
+    if auth_enabled():
+        uid = session_user_id(request)
+        if not uid:
+            raise ApiError(401, "signed_out", "Sign in to see your page.")
+    else:
+        uid = resolve_actor(request, user_id)
+    return discovery.home(conn, uid, google_mode=auth_enabled())
+
+
+@app.get("/api/discover", dependencies=[rate_limit("find")])
+def get_discover(
+    request: Request,
+    tab: Literal["playlists", "tracks", "people"] = Query("playlists"),
+    sort: Literal["fresh", "popular"] = Query("fresh"),
+    offset: int = Query(0, ge=0, le=1_000_000),
+    limit: int = Query(20, ge=1, le=50),
+    user_id: int = Query(1),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    if tab == "playlists":
+        return discovery.discover_playlists(conn, sort, offset, limit)
+    if tab == "tracks":
+        return discovery.discover_tracks(conn, resolve_viewer(request, user_id), offset, limit)
+    return discovery.discover_people(conn, offset, limit)
+
+
+@app.get("/api/search", dependencies=[rate_limit("find")])
+def get_search(
+    request: Request,
+    q: str = Query(..., max_length=1000),
+    type: Literal["all", "playlists", "tracks", "people"] = Query("all"),
+    limit: int = Query(10, ge=1, le=25),
+    user_id: int = Query(1),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    query = discovery.normalize_query(q)
+    if not 1 <= len(query) <= discovery.SEARCH_MAX_QUERY:
+        raise ApiError(422, "bad_query", f"Search for 1-{discovery.SEARCH_MAX_QUERY} characters.")
+    return discovery.search(conn, resolve_viewer(request, user_id), query, type, limit)
+
+
+@app.get("/api/playlists/{playlist_id}/related")
+def get_related_playlists(
+    playlist_id: int,
+    request: Request,
+    limit: int = Query(12, ge=1, le=50),
+    offset: int = Query(0, ge=0, le=1_000_000),
+    user_id: int = Query(1),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    # The source may be the viewer's private playlist or crate: the output only names LISTED playlists.
+    pl = require_visible_playlist(conn, playlist_id, resolve_viewer(request, user_id))
+    return discovery.related_playlists(conn, int(pl["id"]), limit, offset)
+
+
 # Serve static files
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+def serve_shell() -> FileResponse:
+    """The SPA shell. no-cache so a deploy is picked up on the next navigation."""
+    return FileResponse(str(STATIC_DIR / "index.html"), headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/")
 def serve_index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return serve_shell()
+
+
+@app.get("/discover")
+def serve_discover_page():
+    return serve_shell()
+
+
+@app.get("/search")
+def serve_search_page():
+    return serve_shell()
+
+
+@app.get("/crate")
+def serve_crate_page():
+    return serve_shell()
+
+
+_HANDLE_ROUTE = re.compile(r"^[a-z0-9_]{3,20}$")
+
+
+@app.get("/u/{handle}")
+def serve_profile_page(handle: str):
+    # Case is folded like the API does; the router replaces the URL with the current handle.
+    if not _HANDLE_ROUTE.match(handle.lower()):
+        raise HTTPException(status_code=404, detail="Not found")
+    return serve_shell()
 
 
 # Page routes for the plain-text clipboard links (§5.2): the SPA maps the path onto its hash routes.
@@ -2382,11 +2527,11 @@ _P_ROUTE = re.compile(r"^\d{1,18}(?:-[A-Za-z0-9_-]{0,200})?$")
 def serve_playlist_page(ref: str):
     if not _P_ROUTE.match(ref):
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return serve_shell()
 
 
 @app.get("/t/{video_id}")
 def serve_track_page(video_id: str):
     if not VIDEO_ID_PATTERN.match(video_id):
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return serve_shell()
