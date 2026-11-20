@@ -2,16 +2,20 @@
    The three-breakpoint layout lives in layout.css (F). Budget at phone width: dock strip 48px +
    player bar 60px = 108px of fixed chrome (under 120px); the video tile shows only while playing. */
 
-/* Touch: every control is at least 40px to hit, without changing how it looks at rest. */
+/* Touch: every control is at least --tap (44px) to hit, without changing how it looks at rest. */
 @media (pointer: coarse) {
-  .btn { min-height: 40px; }
-  .icon-btn { width: 40px; height: 40px; }
-  .menu-item { min-height: 40px; }
-  .chip { min-height: 40px; }
-  .link-btn { min-height: 40px; display: inline-flex; align-items: center; }
-  .sh-pill { min-height: 40px; }
-  .sh-check, .sh-radio { min-height: 40px; }
-  .sh-fold { width: 40px; height: 40px; }
+  .btn { min-height: var(--tap); }
+  .icon-btn, .pbar-controls .icon-btn { width: var(--tap); height: var(--tap); }
+  .menu-item { min-height: var(--tap); }
+  .chip { min-height: var(--tap); }
+  .topbar-nav > a, .dc-sort a, .dc-tab { display: inline-flex; align-items: center; min-height: var(--tap); }
+  .topbar-nav > a { padding: 0 8px; }
+  .trow { min-height: 56px; }
+  .crow { min-height: var(--tap); }
+  .link-btn { min-height: var(--tap); display: inline-flex; align-items: center; }
+  .sh-pill { min-height: var(--tap); }
+  .sh-check, .sh-radio { min-height: var(--tap); }
+  .sh-fold { width: var(--tap); height: var(--tap); }
 }
 
 @media (max-width: 759px) {
@@ -23,6 +27,18 @@
   .omnibox { flex: 1 1 auto; min-width: 0; }
   .omnibox input { width: 100%; min-width: 0; }
   .topbar-nav { gap: var(--sp-2); flex: none; }
+  /* 16px in every field stops iOS zooming on focus. */
+  .omnibox input, .chip-form .input, .ed-time .input, .sh-handle-form .input { font-size: var(--fs-base); }
+
+  /* Track rows: title on line 1 (up to two lines), italic meta on line 2. */
+  .trow-main { display: block; }
+  .trow-title {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .sh-pill { padding: 0 2px; }
   .sh-pill .sh-chev { display: none; }
 
@@ -30,7 +46,10 @@
   .dock { overscroll-behavior-x: contain; scrollbar-width: none; }
   .dock::-webkit-scrollbar { display: none; }
   .dock-list > li { flex: none; }
-  .chip { height: 40px; padding-top: 0; padding-bottom: 0; }
+  /* Strip chips are tabs: framed boxes; the current one is filled with the page colour and bold. */
+  .chip { height: 40px; min-height: 40px; padding-top: 0; padding-bottom: 0; background: var(--surface); border: 1px solid var(--line-strong); }
+  .chip:hover { background: var(--surface); }
+  .chip[aria-current="page"] { background: var(--bg); }
   .chip-form { width: 200px; }
 
   /* Crate: a bottom sheet that folds to a one-line strip above the dock. */
@@ -55,6 +74,18 @@
   .sh-radio { grid-template-columns: auto auto; row-gap: 0; }
   .sh-radio .sh-hint { grid-column: 2; }
 
+  /* Menus open as full-width sheets along the bottom. */
+  .popover:has(> .menu) {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-width: none;
+    padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom, 0px));
+    border-width: 1px 0 0;
+  }
+  .popover:has(> .menu) .menu-item { min-height: var(--tap); }
+
   /* Popovers never wider than the screen. */
   .sh-share, .sh-unload { width: calc(100vw - 2 * var(--sp-4) - 2 * var(--sp-2) - 2px); }
 
@@ -64,4 +95,10 @@
 
   /* Page actions wrap under the title without crowding. */
   .page-actions { gap: var(--sp-1); }
+}
+
+/* The narrowest phones: Verdana is wide, so the top bar tightens to leave the omnibox room. */
+@media (max-width: 400px) {
+  .topbar, .topbar-nav { gap: var(--sp-1); }
+  .topbar-nav > a { padding: 0 6px; }
 }

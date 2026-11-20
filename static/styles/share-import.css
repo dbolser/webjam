@@ -11,20 +11,21 @@
   align-items: center;
   gap: var(--sp-2);
   height: 30px;
-  padding: 0 var(--sp-2) 0 3px;
+  padding: 0 var(--sp-2);
   font-size: var(--fs-sm);
   color: var(--ink-2);
-  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
   transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 .sh-pill:hover, .sh-pill[aria-expanded="true"] { background: var(--surface-2); color: var(--ink); }
 .sh-pill .sh-chev { width: 12px; height: 12px; color: var(--ink-3); }
-.sh-pill.btn { padding: 0 var(--sp-3); border-radius: var(--r-s); }
-.sh-signin { color: var(--ink-2); font-weight: 500; }
-.sh-signin:hover { color: var(--ink); text-decoration: none; }
+.sh-pill.btn { padding: 0 var(--sp-3); border-radius: 0; }
+.sh-signin { color: var(--ink-2); font-weight: 700; }
+.sh-signin:hover { color: var(--ink); }
 
 /* --- forms inside sheets ------------------------------------------------- */
-.sh-form { display: flex; flex-direction: column; gap: var(--sp-4); }
+.sh-form { display: flex; flex-direction: column; gap: var(--sp-4); padding: 5px; border: 1px dotted var(--line-strong); }
 .sh-field { display: flex; flex-direction: column; }
 .sh-field .label { margin-bottom: var(--sp-2); }
 .sh-field .input { width: 100%; }
@@ -70,7 +71,7 @@
   padding: var(--sp-4) var(--sp-5);
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: var(--r);
+  border-radius: 0;
 }
 .sh-handle-text { color: var(--ink-2); font-size: var(--fs-sm); max-width: 56ch; }
 .sh-handle-form {
@@ -80,21 +81,19 @@
   gap: var(--sp-2);
   margin-top: var(--sp-3);
 }
-.sh-handle-form .input { width: 14em; max-width: 100%; font-family: var(--f-mono); font-size: var(--fs-sm); }
+.sh-handle-form .input { width: 14em; max-width: 100%; font-size: var(--fs-sm); }
 .sh-handle-form .input[aria-invalid="true"] { border-color: var(--danger); }
 .sh-handle-form .sh-err { flex-basis: 100%; }
-.sh-at { font-family: var(--f-mono); color: var(--ink-3); margin-right: -4px; }
+.sh-at { color: var(--ink-3); margin-right: -4px; }
 
 /* --- popovers: share, unload --------------------------------------------- */
 .sh-share { width: 296px; max-width: 100%; padding: var(--sp-1); }
-.sh-share-status { font-size: var(--fs-sm); font-weight: 500; margin-bottom: var(--sp-2); }
+.sh-share-status { font-size: var(--fs-sm); font-weight: 700; margin-bottom: var(--sp-2); }
 .sh-share-url {
   width: 100%;
   height: 30px;
-  font-family: var(--f-mono);
   font-size: var(--fs-xs);
   color: var(--ink-2);
-  background: var(--surface-2);
 }
 .sh-share .sh-hint { margin-top: var(--sp-2); }
 .sh-share-actions { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: var(--sp-3); }
@@ -108,7 +107,7 @@
 
 /* --- import sheet -------------------------------------------------------- */
 .sh-import-sum { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); }
-.sh-import-src-title { font-weight: 500; overflow-wrap: anywhere; }
+.sh-import-src-title { font-weight: 700; overflow-wrap: anywhere; }
 .sh-import-sum .mono { flex: none; font-size: var(--fs-xs); }
 .sh-import-tools { display: flex; gap: var(--sp-4); font-size: var(--fs-sm); margin-top: calc(-1 * var(--sp-2)); }
 .sh-import-list {
@@ -117,7 +116,7 @@
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
 }
-.sh-import-item + .sh-import-item { border-top: 1px solid var(--line); }
+:where(.sh-import-item:nth-child(even)) { background: var(--zebra); }
 .sh-import-item label {
   display: grid;
   grid-template-columns: auto 32px minmax(0, 1fr);
@@ -127,12 +126,12 @@
   padding: 6px var(--sp-1);
   cursor: pointer;
 }
-.sh-import-item label:hover { background: var(--surface-2); }
+.sh-import-item label:hover { background: var(--accent-soft); }
 .sh-import-item input { margin: 0; accent-color: var(--accent); }
 .sh-thumb { width: 32px; height: 32px; }
 .sh-import-text { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
 .sh-import-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--fs-sm); }
-.sh-import-meta { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--fs-xs); color: var(--ink-3); }
+.sh-import-meta { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--fs-xs); font-style: italic; color: var(--ink-3); }
 .sh-import-item.is-off .sh-import-title { color: var(--ink-3); }
 .sh-why { color: var(--ink-2); }
 .sh-dest .sh-radio { padding: 4px 0; }
@@ -144,10 +143,11 @@
   width: 28px;
   height: 28px;
   margin-left: -6px;
-  color: var(--ink-2);
-  border-radius: var(--r-s);
+  color: var(--accent);
+  border-radius: 0;
 }
-.sh-fold .i { transition: transform var(--dur-2) var(--ease); }
+.sh-fold:hover { color: var(--hot); }
+.sh-fold .i { transition: transform var(--dur-1) var(--ease); }
 .crate-panel.sh-folded .sh-fold .i { transform: rotate(180deg); }
 .crate-head .sh-crate-page { margin-left: auto; }
 .crate-head .sh-crate-page + .icon-btn { margin-left: 0; }

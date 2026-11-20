@@ -20,9 +20,9 @@
   font-size: var(--fs-sm);
   color: var(--ink);
   background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  box-shadow: var(--shadow-pop);
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  box-shadow: none;
   pointer-events: none;
   transform: translate(var(--x, -999px), var(--y, -999px));
 }
@@ -32,7 +32,7 @@
   height: 24px;
   flex: none;
   object-fit: cover;
-  border-radius: 50%;
+  border-radius: 0;
   background: var(--surface-2);
 }
 .ed-ghost-text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -130,12 +130,13 @@ h1.ed-title { cursor: text; border-radius: var(--r-xs); }
 h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
 
 /* --- playlist details form (replaces the title block while open) --------- */
-.ed-meta { display: flex; flex-direction: column; gap: var(--sp-4); max-width: 560px; }
+/* The inline edit form: a dotted box, a nod to Webjay's dotted play box. */
+.ed-meta { display: flex; flex-direction: column; gap: var(--sp-4); max-width: 560px; padding: 4px; border: 1px dotted var(--line-strong); }
 .ed-meta-title {
   height: 44px;
   font-family: var(--f-title);
   font-size: var(--fs-xl);
-  font-weight: 400;
+  font-weight: 700;
   line-height: var(--lh-tight);
 }
 .ed-vis { border: 0; margin: 0; padding: 0; gap: var(--sp-2); }
@@ -149,14 +150,14 @@ h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
   cursor: pointer;
 }
 .ed-vis-opt input { accent-color: var(--accent); }
-.ed-vis-name { font-weight: 500; color: var(--ink); }
+.ed-vis-name { font-weight: 700; color: var(--ink); }
 .ed-vis-help { color: var(--ink-3); }
 .ed-meta-actions, .ed-clip-actions { display: flex; gap: var(--sp-2); }
 
 /* --- note & clip, swap (popovers anchored to a row) ----------------------- */
 .ed-clip, .ed-swap { display: flex; flex-direction: column; gap: var(--sp-3); width: 300px; max-width: calc(100vw - 48px); padding: var(--sp-1); }
 .ed-clip-title {
-  font-weight: 500;
+  font-weight: 700;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -176,8 +177,8 @@ h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
 
 /* --- undo / redo in the playlist actions ----------------------------------- */
 .ed-undo { display: inline-flex; gap: 2px; margin-left: auto; }
-.ed-undo .icon-btn[disabled] { opacity: .35; cursor: default; }
-.ed-undo .icon-btn[disabled]:hover { background: transparent; color: var(--ink-2); }
+.ed-undo .icon-btn[disabled] { color: var(--line-strong); cursor: default; }
+.ed-undo .icon-btn[disabled]:hover { background: transparent; color: var(--line-strong); box-shadow: none; }
 
 /* --- an empty playlist of mine: still a focusable drop / paste target ------- */
 .ed-empty-list { border: 1px dashed var(--line-strong); border-radius: var(--r-s); }
@@ -204,7 +205,7 @@ h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
 
 @media (max-width: 759px) {
   .ed-keys-row { grid-template-columns: 110px minmax(0, 1fr); }
-  .ed-meta-title { font-size: 26px; }
+  .ed-meta-title { font-size: var(--fs-xl); }
 }
 
 @media (prefers-reduced-motion: reduce) {

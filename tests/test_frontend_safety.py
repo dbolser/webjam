@@ -345,11 +345,13 @@ def test_vendored_lit_html_is_pinned():
             assert (f.parent / spec).resolve().is_file(), f"{f}: {spec} does not resolve"
 
 
-def test_fonts_are_vendored_with_licences():
-    fonts = STATIC / "vendor" / "fonts"
-    for name in ("instrument-sans.woff2", "instrument-serif.woff2", "jetbrains-mono.woff2"):
-        assert (fonts / name).stat().st_size > 10_000, name
-    assert len(list(fonts.glob("OFL*.txt"))) == 3
+def test_no_web_fonts():
+    """System fonts only (Verdana, Georgia): nothing to declare, preload or ship."""
+    for css in sorted((STATIC / "styles").glob("*.css")):
+        assert "@font-face" not in _read(css), _rel(css)
+    assert not re.search(r'<link\b[^>]*\bas="font"', _read(INDEX_HTML)), "index.html still preloads a font"
+    shipped = [p for p in STATIC.rglob("*") if p.suffix.lower() in (".woff", ".woff2", ".ttf", ".otf")]
+    assert not shipped, [_rel(p) for p in shipped]
 
 
 # 8. href bindings go through a URL helper (or a literal same-origin path).

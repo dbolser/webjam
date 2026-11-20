@@ -1,79 +1,99 @@
-/* Design tokens (docs/phase1b-shell.md §1.2). Components use tokens, never raw colours.
-   New tokens are added here only, in a commit titled "shared: …". */
+/* Design tokens: "Webjam Classic", a readable Webjay homage. Components use tokens, never raw colours.
+   New tokens are added here only, in a commit titled "shared: …".
+   System fonts only, no web fonts, so CSP style-src/font-src 'self' holds with nothing to load.
+   NEW in this palette: --zebra, --visited, --hot, --f-code, --fs-wordmark, --tap.
+   Contrast was computed from hex values (WCAG 2.x), light / dark. Text: ink-3 on bg 7.0 / 7.5, on --surface-2 5.9 / 6.1, on --zebra 6.4 / 7.0, on --new-soft 6.6 / 5.1.
+   accent on bg 9.4 / 8.7, on accent-soft 7.4 / 6.7. visited 11.0 / 8.9. hot 5.9 / 6.0. play 6.3 / 9.0. accent-ink on accent 9.4 / 9.1.
+   Non-text: line-strong on bg 3.9 / 4.1, on --surface-2 3.3 / 3.4. Re-check any pair you change. */
 :root {
   color-scheme: light;
+  accent-color: #0000ee;
   /* surfaces */
-  --bg: #faf9f6;          /* page */
-  --surface: #ffffff;     /* popovers, sheets, hovered row */
-  --surface-2: #f3f1ec;   /* rails, crate panel, input wells */
-  --line: #e8e4db;        /* hairlines between rows */
-  --line-strong: #d4cec1; /* inputs, chip outlines */
+  --bg: #ffffff;           /* page: plain white */
+  --surface: #ffffff;      /* popovers, sheets, inputs, active tab */
+  --surface-2: #e8ebf0;    /* the period tint: inactive tabs, module header strips, player bar, sheet head */
+  --zebra: #f0f2f6;        /* NEW: every other row (tracks, crate, lines, import list) */
+  --line: #cccccc;         /* 1px boxes, frames, rules */
+  --line-strong: #808080;  /* control borders: 3.9:1 white, 3.3:1 tint */
   /* ink */
-  --ink: #1d1c1a;
-  --ink-2: #55524b;       /* secondary: channel, byline */
-  --ink-3: #75716a;       /* tertiary: hop links, counts, labels (4.6:1 on --bg) */
-  /* the one accent: links, focus, selection, drop */
-  --accent: #3552b8;
+  --ink: #111111;
+  --ink-2: #3d3d3d;        /* descriptions, bylines */
+  --ink-3: #595959;        /* meta, counts, timestamps, placeholders */
+  /* links */
+  --accent: #0000ee;       /* classic unvisited blue; also focus ring and selection */
+  --visited: #551a8b;      /* NEW: classic visited purple */
   --accent-ink: #ffffff;
-  --accent-soft: #edf0fa;  /* selected row */
-  --accent-line: #b9c4ea;  /* selected row hairline */
-  /* state colours, used sparingly and never as decoration */
-  --play: #2c7a5b;   --play-soft: #e6f2ec;   /* now playing */
-  --crate: #946a22;  --crate-soft: #f6efe1;  /* crate chip dot, crate panel header */
-  --new-soft: #fbf4d9;                       /* "just landed" wash, fades out */
-  --danger: #b3261e;
-  /* elevation: only popovers, sheets and toasts */
-  --shadow-pop: 0 1px 2px rgba(29,28,26,.06), 0 8px 28px -10px rgba(29,28,26,.22);
-  /* type */
-  --f-ui: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --f-title: "Instrument Serif", ui-serif, Georgia, "Times New Roman", serif;
-  --f-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --fs-xs: 11.5px;  /* mono labels, keycaps, section labels */
-  --fs-sm: 12.5px;  /* meta lines, buttons, chips */
-  --fs-base: 14px;  /* body, track titles */
-  --fs-md: 16px;    /* card titles, section headings */
-  --fs-lg: 20px;    /* sheet titles */
-  --fs-xl: 32px;    /* page titles (serif); 26px under 760px */
-  --lh-tight: 1.25; --lh: 1.5;
-  /* spacing (4px grid) */
+  --accent-soft: #dde4ff;  /* selected row, row hover */
+  --accent-line: #8f9fe0;  /* selection hairline, ed-armed outline */
+  --hot: #cc0000;          /* NEW: tab hover, link :active, liked state (period #f00 fails AA) */
+  /* state */
+  --play: #007000;   --play-soft: #e3f2e3;   /* Webjay green, darkened for AA */
+  --crate: #805300;  --crate-soft: #fff4d6;
+  --new-soft: #ffffcc;                       /* period yellow notice */
+  --danger: #c00000;
+  --shadow-pop: none;      /* no shadows; overlays get a 1px --line-strong frame */
+  /* type: system stacks only, no web fonts */
+  --f-ui: Verdana, Geneva, "DejaVu Sans", "Bitstream Vera Sans", Tahoma, sans-serif;
+  --f-title: Georgia, "DejaVu Serif", "Noto Serif", "Bitstream Charter", "Times New Roman", serif;
+  --f-mono: var(--f-ui);   /* retired role: the ~25 mono rules become Verdana + tabular-nums */
+  --f-code: "Courier New", Courier, ui-monospace, monospace;  /* NEW: kbd/code only */
+  --fs-xs: 13px;           /* meta, counts, durations, timestamps (floor: nothing smaller anywhere) */
+  --fs-sm: 14px;           /* buttons, chips, tabs, secondary lines */
+  --fs-base: 16px;         /* body, track titles, inputs */
+  --fs-md: 18px;           /* section h2/h3, card titles */
+  --fs-lg: 21px;           /* sheet titles */
+  --fs-xl: 30px;           /* page h1 (Georgia bold) */
+  --fs-wordmark: 24px;     /* NEW: replaces hardcoded 24px */
+  --lh-tight: 1.25; --lh: 1.55;
+  /* spacing: unchanged 4px grid */
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
-  /* radii */
-  --r-xs: 3px;  /* thumbnails, clip chip */
-  --r-s: 5px;   /* buttons, inputs, chips */
-  --r: 8px;     /* popovers, sheets, cards */
+  /* radii: square, as in the original (its CSS has no border-radius) */
+  --r-xs: 0; --r-s: 0; --r: 0;
   /* layout */
-  --topbar-h: 56px; --player-h: 60px; --rail-l: 232px; --rail-r: 340px; --content-max: 720px;
-  --row-h: 60px; --thumb: 48px;
-  /* motion */
+  --topbar-h: 56px; --player-h: 60px; --rail-l: 232px; --rail-r: 320px;
+  --content-max: 860px;    /* Verdana 16px runs about 15% wider */
+  --row-h: 48px;           /* was 60 */
+  --thumb: 36px;           /* was 48 */
+  --tap: 44px;             /* NEW: touch target under pointer:coarse */
+  /* motion: unchanged */
   --ease: cubic-bezier(.2, 0, 0, 1);
-  --dur-1: 120ms;  /* hover, press */
-  --dur-2: 200ms;  /* popovers, panels */
-  --dur-land: 1600ms; /* the "just landed" wash */
+  --dur-1: 120ms; --dur-2: 160ms; --dur-land: 1600ms;
+}
+
+/* Phone type and size. These are size tokens only, so they compose with either theme. */
+@media (max-width: 759px) {
+  :root { --fs-xl: 24px; --fs-wordmark: 21px; --fs-lg: 19px; --thumb: 40px; --topbar-h: 52px; }
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --bg: #141413; --surface: #1c1c1a; --surface-2: #222220;
-    --line: #2b2a27; --line-strong: #3b3a36;
-    --ink: #ecebe7; --ink-2: #b4b1a9; --ink-3: #8b887f;
-    --accent: #93a8ff; --accent-ink: #0e1430; --accent-soft: #1d2340; --accent-line: #34407a;
-    --play: #6fc7a1; --play-soft: #152a21;
-    --crate: #e0b360; --crate-soft: #2c2414;
-    --new-soft: #2e2913;
-    --danger: #f2867d;
-    --shadow-pop: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -10px rgba(0,0,0,.7);
+    accent-color: #8cb4ff;
+    --bg: #14161a; --surface: #1c1f24; --surface-2: #262b33; --zebra: #1a1d22;
+    --line: #363b44; --line-strong: #7a818c;
+    --ink: #eeeeee; --ink-2: #c4c4c4; --ink-3: #a3a7ae;
+    --accent: #8cb4ff; --visited: #c8a2ff; --accent-ink: #0b1020;
+    --accent-soft: #1f2a4d; --accent-line: #3d5294;
+    --hot: #ff6b6b;
+    --play: #5cd65c; --play-soft: #16301a;
+    --crate: #e6b45a; --crate-soft: #2e2512;
+    --new-soft: #3a3512;
+    --danger: #ff7b72;
+    --shadow-pop: none;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #141413; --surface: #1c1c1a; --surface-2: #222220;
-  --line: #2b2a27; --line-strong: #3b3a36;
-  --ink: #ecebe7; --ink-2: #b4b1a9; --ink-3: #8b887f;
-  --accent: #93a8ff; --accent-ink: #0e1430; --accent-soft: #1d2340; --accent-line: #34407a;
-  --play: #6fc7a1; --play-soft: #152a21;
-  --crate: #e0b360; --crate-soft: #2c2414;
-  --new-soft: #2e2913;
-  --danger: #f2867d;
-  --shadow-pop: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -10px rgba(0,0,0,.7);
+  accent-color: #8cb4ff;
+  --bg: #14161a; --surface: #1c1f24; --surface-2: #262b33; --zebra: #1a1d22;
+  --line: #363b44; --line-strong: #7a818c;
+  --ink: #eeeeee; --ink-2: #c4c4c4; --ink-3: #a3a7ae;
+  --accent: #8cb4ff; --visited: #c8a2ff; --accent-ink: #0b1020;
+  --accent-soft: #1f2a4d; --accent-line: #3d5294;
+  --hot: #ff6b6b;
+  --play: #5cd65c; --play-soft: #16301a;
+  --crate: #e6b45a; --crate-soft: #2e2512;
+  --new-soft: #3a3512;
+  --danger: #ff7b72;
+  --shadow-pop: none;
 }
