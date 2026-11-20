@@ -159,7 +159,7 @@ def test_invite_env_var_is_authoritative_on_restart(google):
     assert other.post("/api/playlists", json={"title": "y"}).status_code == 401
     FakeGoogle.userinfo = {"sub": "g-2", "email": "other@example.com", "email_verified": True, "name": "Other"}
     cb, _ = google_sign_in(other)
-    assert cb.headers["location"] == "/#not-invited"
+    assert cb.headers["location"] == "/request-access"  # uninvited now: they may ask to join
 
 
 def test_google_mode_warns_when_nobody_is_invited(db_path, fakes, monkeypatch, caplog):

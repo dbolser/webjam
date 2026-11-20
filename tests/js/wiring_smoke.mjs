@@ -47,7 +47,7 @@ await mod('editing/index.js');
 await mod('discovery/index.js');
 await mod('share/index.js');
 await mod('shell.js');
-for (const v of ['home', 'playlist', 'track', 'profile', 'discover', 'search', 'not-found']) {
+for (const v of ['home', 'playlist', 'track', 'profile', 'discover', 'search', 'not-found', 'request-access', 'admin']) {
   await mod(`views/${v}.js`);
 }
 const slots = await mod('slots.js');

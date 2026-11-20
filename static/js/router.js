@@ -231,7 +231,7 @@ function onLinkClick(e) {
 // --- old # links (§2.2) ------------------------------------------------------------------------
 
 const NOTICES = {
-  'not-invited': "That Google account isn't on the invite list.",
+  'not-invited': "Google couldn't confirm that account's email address, so it can't be used here.",
   'auth-error': "Sign-in didn't complete. Try again.",
 };
 

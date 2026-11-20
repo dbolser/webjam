@@ -9,6 +9,7 @@ when the app starts (it is never re-read per request):
   user_id the client sends is ignored. Only Google accounts whose *verified*
   email is in the ``invites`` table can sign in (seed it with
   WEBJAM_INVITE_EMAILS=a@x.com,b@y.com or ``python -m app.invite add a@x.com``).
+  A verified but uninvited account can ask to join at /request-access (app/access.py).
 * ``demo`` -- the original persona switcher for local development. The client
   chooses the user and the password field is ignored entirely: anyone can act
   as anyone. Demo mode is only the default when WEBJAM_AUTH_MODE is unset AND no
@@ -40,6 +41,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from app.access import remember_identity
 from app.database import get_connection, get_db
 from app.invite import is_invited
 from app.ops import ensure_crate
@@ -583,10 +585,16 @@ async def google_callback(
 
     email = (info.get("email") or "").strip().lower()
     verified = info.get("email_verified") in (True, "true")
-    if not info.get("sub") or not email or not verified or not is_invited(conn, email):
-        logger.info("Rejected sign-in from an uninvited or unverified Google account")
+    if not info.get("sub") or not email or not verified:
+        logger.info("Rejected sign-in from an unverified Google account")
         request.session.clear()
         return RedirectResponse("/#not-invited", status_code=303)
+    if not is_invited(conn, email):
+        # No user is created. Remember who Google says this is (briefly) so they can ask to join.
+        logger.info("Uninvited Google account: offering an access request")
+        request.session.clear()
+        remember_identity(request, email, str(info["sub"]), str(info.get("name") or ""))
+        return RedirectResponse("/request-access", status_code=303)
 
     uid = upsert_google_user(conn, info, str(tokens.get("scope", "") or ""))
     start_session(request, conn, uid)

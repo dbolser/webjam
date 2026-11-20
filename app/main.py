@@ -14,7 +14,7 @@ import sqlite3
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import httpx
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -41,12 +41,12 @@ from app.auth import (
     validate_handle,
 )
 
-from app import ops
+from app import access, ops
 from app.badges import BADGE_BY_KEY, BADGE_CATALOG, evaluate_and_award_badges, get_user_badge_progress
 from app import discovery
 from app.database import get_connection, get_db, init_db
 from app.errors import ApiError
-from app.invite import list_invites, seed_invites_from_env
+from app.invite import is_invited, list_invites, seed_invites_from_env
 from app.ops import (
     Actor,
     DbId,
@@ -119,6 +119,9 @@ RATE_LIMITS: Dict[str, Tuple[float, float]] = {
     "ops": (120, 2.0),
     # /api/search and /api/discover (Phase 1b).
     "find": (60, 1.0),
+    # Access requests are asked by people who are not signed in (keyed by IP), so keep it small.
+    "access": (5, 5 / 600),
+    "admin": (60, 1.0),
 }
 PLAY_DEDUPE_SECONDS = 30 * 60
 PLAY_BADGE_EVAL_INTERVAL = 60
@@ -520,6 +523,10 @@ class LoginRequest(BaseModel):
     bio: Optional[LongText] = ""
 
 
+class AccessRequestBody(BaseModel):
+    note: Annotated[str, Field(max_length=MAX_TEXT)] = ""  # trimmed, then capped at access.MAX_NOTE
+
+
 class UpdateProfileRequest(BaseModel):
     display_name: Title
     bio: LongText
@@ -843,6 +850,7 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
         (actual_uid,),
     )
     my_playlists = [dict(r) for r in cur.fetchall()]
+    admin = auth_enabled() and access.is_admin(conn, actual_uid)
 
     return {
         "users": users,
@@ -871,8 +879,90 @@ def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Conne
                     cur.execute("SELECT * FROM google_accounts WHERE user_id = ?", (current_user["id"],)).fetchone()
                 )
             ),
+            "is_admin": admin,
+            "pending_requests": access.pending_count(conn) if admin else 0,
         },
     }
+
+
+# --- Access requests (Google mode): ask to join, admins approve -------------------------------
+
+def _require_google_mode() -> None:
+    if not auth_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _require_admin(request: Request, conn: sqlite3.Connection) -> int:
+    _require_google_mode()
+    uid = session_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Sign in with Google to do that.")
+    if not access.is_admin(conn, uid):
+        raise HTTPException(status_code=403, detail="Only admins can see access requests.")
+    return uid
+
+
+@app.get("/api/access-request")
+def get_access_request(request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    _require_google_mode()
+    ident = access.session_identity(request)
+    if not ident:
+        return {"identity": None}
+    row = access.get_request(conn, ident["email"])
+    return {
+        "identity": {"email": ident["email"], "name": ident["name"]},
+        "invited": is_invited(conn, ident["email"]),
+        "status": row["status"] if row else None,
+        "note": row["note"] if row and row["status"] == "pending" else "",
+    }
+
+
+@app.post("/api/access-request")
+def post_access_request(
+    req: AccessRequestBody,
+    request: Request,
+    background: BackgroundTasks,
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    _require_google_mode()
+    enforce_rate_limit(request, "access")
+    ident = access.session_identity(request)
+    if not ident:
+        raise HTTPException(status_code=401, detail="Sign in with Google first, then ask to join.")
+    result = access.submit_request(conn, ident, req.note)
+    if result["notify_admins"]:
+        background.add_task(
+            access.notify_admins, get_config().base_url, ident["email"], ident["name"], access.clean_note(req.note)
+        )
+    if result["status"] == "invited":
+        return {"status": "invited", "detail": "You're already on the invite list. Sign in with Google."}
+    return {"status": "pending"}
+
+
+@app.get("/api/admin/access-requests")
+def admin_access_requests(request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    _require_admin(request, conn)
+    return access.list_requests(conn)
+
+
+@app.post("/api/admin/access-requests/{email:path}/approve")
+async def admin_approve_request(email: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = _require_admin(request, conn)
+    enforce_rate_limit(request, "admin")
+    row, newly = access.approve(conn, email, uid)
+    if newly:
+        status = await asyncio.to_thread(access.welcome_mail, get_config().base_url, row)
+        access.record_notify(conn, row["email"], status)
+        row["notify_status"] = status
+    return {"request": {k: row[k] for k in ("email", "status", "decided_at", "notify_status")}}
+
+
+@app.post("/api/admin/access-requests/{email:path}/decline")
+def admin_decline_request(email: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    uid = _require_admin(request, conn)
+    enforce_rate_limit(request, "admin")
+    row = access.decline(conn, email, uid)
+    return {"request": {k: row[k] for k in ("email", "status", "decided_at", "notify_status")}}
 
 
 def normalize_demo_username(raw: str) -> str:
@@ -2505,6 +2595,16 @@ def serve_search_page():
 
 @app.get("/crate")
 def serve_crate_page():
+    return serve_shell()
+
+
+@app.get("/request-access")
+def serve_request_access_page():
+    return serve_shell()
+
+
+@app.get("/admin")
+def serve_admin_page():
     return serve_shell()
 
 
