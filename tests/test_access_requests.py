@@ -490,3 +490,15 @@ def test_a_late_failure_cannot_overwrite_sent(site):
     access.record_notify(conn, "stranger@example.com", "failed")
     conn.close()
     assert _row()["notify_status"] == "sent"
+
+
+def test_a_send_cut_off_by_a_restart_can_be_resent_later(site, mail):
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    admin = _admin_client()
+    admin.post("/api/admin/access-requests/stranger@example.com/approve")
+    _set("stranger@example.com", notify_status="sending", notify_claimed_at="2000-01-01 00:00:00")
+    mail.clear()
+    res = admin.post("/api/admin/access-requests/stranger@example.com/resend")
+    assert res.status_code == 200 and res.json()["request"]["notify_status"] == "sent"
+    assert mail and mail[-1]["to"] == "stranger@example.com"

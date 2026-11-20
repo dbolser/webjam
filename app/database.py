@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS access_requests (
     admins_notice_tried_at TEXT,  -- the last attempt at that email; retries wait RENOTIFY_AFTER
     decided_at TEXT,
     decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    notify_status TEXT  -- the approval email: 'sending' | 'sent' | 'failed' | 'not configured'
+    notify_status TEXT,  -- the approval email: 'sending' | 'sent' | 'failed' | 'not configured'
+    notify_claimed_at TEXT  -- when 'sending' was claimed; a claim older than STALE_SEND can be retried
 );
 
 CREATE TABLE IF NOT EXISTS google_accounts (

@@ -26,6 +26,8 @@ MAX_PENDING = 200
 DECLINE_COOLDOWN = timedelta(days=7)
 # If the "new request" email to admins failed, a later visit by the requester retries it, at most this often.
 RENOTIFY_AFTER = timedelta(minutes=10)
+# A "you're in" email still marked sending after this long was cut off (e.g. a restart): Resend may retry it.
+STALE_SEND = timedelta(minutes=2)
 RECENT_DECIDED = 50
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -248,8 +250,8 @@ def approve(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Tuple[D
         )
         conn.execute(
             "UPDATE access_requests SET status = 'approved', decided_at = ?, decided_by_user_id = ?, "
-            "notify_status = 'sending' WHERE email = ?",
-            (_ts(_now()), admin_uid, email),
+            "notify_status = 'sending', notify_claimed_at = ? WHERE email = ?",
+            (_ts(_now()), admin_uid, _ts(_now()), email),
         )
         conn.commit()
     except BaseException:
@@ -266,11 +268,14 @@ def resend(conn: sqlite3.Connection, raw_email: str) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="Only people who are approved and still invited can be emailed.")
     # Eligibility is re-checked in the same write that claims the send: an invite removed a moment
     # ago means no email.
+    now = _now()
     cur = conn.execute(
-        "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? AND status = 'approved' "
+        "UPDATE access_requests SET notify_status = 'sending', notify_claimed_at = ? "
+        "WHERE email = ? AND status = 'approved' "
         "AND EXISTS (SELECT 1 FROM invites WHERE email = access_requests.email) "
-        "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending'))",
-        (row["email"],),
+        "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending') "
+        "     OR (notify_status = 'sending' AND (notify_claimed_at IS NULL OR notify_claimed_at < ?)))",
+        (_ts(now), row["email"], _ts(now - STALE_SEND)),
     )
     conn.commit()
     if cur.rowcount == 0:
