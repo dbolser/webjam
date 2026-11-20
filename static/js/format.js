@@ -127,8 +127,10 @@ export function isoTs(ts) {
 /** Two-letter initials for avatars. */
 export function initials(user) {
   const name = String((user && (user.display_name || user.username)) || '?').trim();
-  const parts = name.split(/\s+/).filter(Boolean);
-  const out = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : name.slice(0, 2);
+  // Letters and digits only, so "Dan (You)" gives "DY", not "D(".
+  const parts = name.split(/\s+/).map((w) => w.replace(/[^\p{L}\p{N}]/gu, '')).filter(Boolean);
+  if (!parts.length) return name.slice(0, 2).toUpperCase();
+  const out = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : parts[0].slice(0, 2);
   return out.toUpperCase();
 }
 
