@@ -16,8 +16,10 @@ lit-html on the front end.
   awake, lock-screen controls, resume where you left off.
 - **Also merged:** a Google sign-in site starts empty, with no sample people
   (#9), and request access with an admin page at /admin (#10).
-- **Design:** Dan rejected the Webjay restyle (#8). Three colourful CSS-only
-  directions are waiting for his pick (Sunny pop, Mixtape pastel, Bold blocks).
+- **Design:** "Sunny pop" (#11): white page, five bright accents, tinted
+  playlist cards, pill buttons, system font. Dan picked it over Mixtape pastel
+  and Bold blocks, after rejecting the dark serif look and the Webjay restyle
+  (#8, still open, now obsolete).
 
 ## Running
 
@@ -38,7 +40,7 @@ TODO).
   is `webjam`.
 - The app lives in `/opt/webjam/app` (a copied tree, not a git checkout). The
   database is `/var/lib/webjam/webjam.db`.
-- Runs main (c5d6e20) in Google sign-in mode, with no site password.
+- Runs main (fea2a09) in Google sign-in mode, with no site password.
   Settings are in `/etc/webjam/env` (root-only), loaded by the drop-in
   `/etc/systemd/system/webjam.service.d/google.conf`: the OAuth client, the
   session secret, `WEBJAM_ADMIN_EMAILS` and the Gmail SMTP settings (an app
