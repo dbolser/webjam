@@ -227,6 +227,16 @@ function forgetResume() {
   if (store) clearResume(store, userId());
 }
 
+/** A saved spot on a track YouTube now rejects would be offered again on every reload. */
+function forgetDeadResume(videoId) {
+  const store = safeStorage();
+  if (!store || !state.auth || !state.auth.mode) return;
+  const r = readResume(store, userId());
+  if (!r || r.videoId !== videoId) return;
+  clearResume(store, userId());
+  if (offer) offer = { key: offer.key, record: null };
+}
+
 /** The saved spot for whoever is here now (re-read when the person changes). */
 function currentOffer() {
   if (!state.auth || !state.auth.mode) return null; // bootstrap not back yet
@@ -425,6 +435,7 @@ function onError(code) {
   if (DEAD_CODES.has(Number(code))) {
     const token = loadToken;
     update((s) => { s.dead.add(item.video_id); s.player.status = 'paused'; }, 'player');
+    forgetDeadResume(item.video_id);
     wake.setPlaying(false);
     ms.setPlaybackState(nav, 'paused');
     toast.show('Unavailable on YouTube; skipped');
@@ -456,7 +467,9 @@ function handleEnd() {
     setBody('player-paused', true);
     wake.setPlaying(false);
     ms.setPlaybackState(nav, 'paused');
-    forgetResume(); // finished the list: nothing to come back to
+    // Finished the list: nothing to come back to. Only for the person who started it, so a
+    // persona switch mid-queue doesn't wipe the new person's saved spot.
+    if (userId() === queueOwner) forgetResume();
     try { yt && yt.pauseVideo(); } catch { /* ignore */ }
   }
 }
