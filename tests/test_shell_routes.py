@@ -85,9 +85,18 @@ def test_callback_accepts_a_pending_login_in_the_old_bare_verifier_form():
 def test_failed_sign_in_still_goes_to_the_hash_routes(google):
     import test_security_backend as sb
 
-    sb.FakeGoogle.userinfo = {"sub": "g-x", "email": "stranger@example.com", "email_verified": True, "name": "X"}
+    sb.FakeGoogle.userinfo = {"sub": "g-x", "email": "stranger@example.com", "email_verified": False, "name": "X"}
     res = _sign_in_with_next(google, "/p/12")
     assert res.headers["location"] == "/#not-invited"
+
+
+def test_uninvited_sign_in_goes_to_request_access_not_next(google):
+    import test_security_backend as sb
+
+    sb.FakeGoogle.userinfo = {"sub": "g-x", "email": "stranger@example.com", "email_verified": True, "name": "X"}
+    res = _sign_in_with_next(google, "/p/12")
+    assert res.headers["location"] == "/request-access"
+    assert google.get("/request-access").status_code == 200
 
 
 # --- handle confirmation ----------------------------------------------------------------------

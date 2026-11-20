@@ -12,4 +12,6 @@ register('playlist', '/p/:ref', () => import('./views/playlist.js'));
 register('track', /^\/t\/(?<vid>[A-Za-z0-9_-]{11})\/?$/, () => import('./views/track.js'));
 register('profile', /^\/u\/(?<handle>[A-Za-z0-9_]{3,20})\/?$/, () => import('./views/profile.js'));
 register('crate', '/crate', () => import('./views/playlist.js'));
+register('request-access', '/request-access', () => import('./views/request-access.js'));
+register('admin', '/admin', () => import('./views/admin.js'));
 register('not-found', null, () => import('./views/not-found.js'));

@@ -2,7 +2,8 @@
 //
 // Signed out (Google mode): a plain "Sign in" link with no ?next=, so a deliberate sign-in lands
 // on my own page. Signed in: a small pill (avatar + @handle) that opens the account menu: my page,
-// profile, crate, theme, handle (Google), personas (demo only), sign out (Google only).
+// profile, crate, theme, handle (Google), access requests (Google admins), personas (demo only),
+// sign out (Google only).
 
 import { html } from '../lit.js';
 import { state, update } from '../store.js';
@@ -54,6 +55,9 @@ function menuItems() {
   }
   items.push(themeItem());
   if (u && a.mode === 'google') items.push({ label: 'Change handle…', run: () => openHandleSheet() });
+  if (u && a.mode === 'google' && a.isAdmin) {
+    items.push({ label: `Access requests (${a.pendingRequests || 0})`, href: '/admin' });
+  }
   if (isDemo()) items.push('sep', ...personaItems());
   if (u && a.mode === 'google') items.push('sep', { label: 'Sign out', run: () => signOut() });
   return items;

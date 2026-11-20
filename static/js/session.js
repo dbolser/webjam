@@ -20,6 +20,8 @@ export async function loadSession() {
       crateId: signedIn ? user.crate_id || null : null,
       users: boot.users || [],
       youtubeConnected: !!(boot.auth && boot.auth.youtube_connected),
+      isAdmin: !!(signedIn && boot.auth && boot.auth.is_admin),
+      pendingRequests: Number(boot.auth && boot.auth.pending_requests) || 0,
       badgeCatalog: boot.badge_catalog || [],
     };
     s.undo = signedIn ? user.undo || null : null;

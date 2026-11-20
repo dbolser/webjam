@@ -423,7 +423,7 @@ def test_main_imports_core_before_lanes():
 
 def test_routes_point_at_the_real_views():
     routes = _read(JS_DIR / "routes.js")
-    for view in ("home", "discover", "search", "playlist", "track", "profile", "not-found"):
+    for view in ("home", "discover", "search", "playlist", "track", "profile", "not-found", "request-access", "admin"):
         assert f"import('./views/{view}.js')" in routes, view
 
 

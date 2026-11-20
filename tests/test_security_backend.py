@@ -304,7 +304,7 @@ def test_uninvited_google_account_is_rejected_without_creating_a_user(google):
     before = _user_count()
     FakeGoogle.userinfo = {"sub": "g-x", "email": "stranger@example.com", "email_verified": True, "name": "S"}
     cb, _ = google_sign_in(google)
-    assert cb.status_code == 303 and cb.headers["location"] == "/#not-invited"
+    assert cb.status_code == 303 and cb.headers["location"] == "/request-access"
     assert _user_count() == before
     assert google.get("/api/bootstrap").json()["auth"]["signed_in"] is False
 

@@ -12,8 +12,11 @@ Removing an invite blocks future sign-ins for that address and signs that
 person out everywhere (their open sessions stop working on the next request).
 
 When WEBJAM_INVITE_EMAILS is set it is the complete invite list: at startup,
-addresses that are not in it are removed (and signed out). Leave it unset to
-manage invites only with ``python -m app.invite``.
+addresses that are not in it are removed (and signed out), and the admin page
+refuses to approve access requests (the next restart would undo them). Leave it
+unset to make this table the source of truth, managed with ``python -m app.invite``
+and by admins (WEBJAM_ADMIN_EMAILS) approving access requests at /admin
+(see app/access.py).
 """
 
 import logging

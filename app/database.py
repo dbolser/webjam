@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS invites (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS access_requests (
+    email TEXT PRIMARY KEY,  -- a verified Google email, lowercased
+    google_sub TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',  -- at most 500 characters
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'declined')),
+    created_at TEXT NOT NULL,
+    admins_notified_at TEXT,  -- when the admins were emailed about this request (once, when it opens)
+    admins_notice_tried_at TEXT,  -- the last attempt at that email; retries wait RENOTIFY_AFTER
+    decided_at TEXT,
+    decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    notify_status TEXT,  -- the approval email: 'sending' | 'sent' | 'failed' | 'not configured'
+    notify_claimed_at TEXT  -- when 'sending' was claimed; a claim older than STALE_SEND can be retried
+);
+
 CREATE TABLE IF NOT EXISTS google_accounts (
     google_sub TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
