@@ -429,7 +429,7 @@ class SecurityHeadersMiddleware:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = configure_from_env()  # raises AuthConfigError: refuse to start on bad config
-    init_db()
+    init_db(seed_samples=cfg.mode == "demo")
     conn = get_connection()
     try:
         check_demo_mode_allowed(conn)
@@ -814,7 +814,7 @@ def ordinal_sql(alias: str = "pt") -> str:
 @app.get("/api/bootstrap")
 def get_bootstrap(request: Request, user_id: int = Query(1), conn: sqlite3.Connection = Depends(get_db)):
     users = fetch_all_users_summary(conn)
-    if not users:
+    if not users and not auth_enabled():  # demo mode needs a persona; a Google site may start empty
         raise HTTPException(status_code=404, detail="No users found")
 
     viewer_id = resolve_viewer(request, user_id)

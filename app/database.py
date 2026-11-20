@@ -334,7 +334,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN handle_chosen_at TEXT")
 
 
-def init_db() -> None:
+def init_db(seed_samples: bool = False) -> None:
+    """Create or check the schema. seed_samples fills an empty database with the demo people and
+    playlists: only the app in demo mode asks for them (they are personas to act as). A Google
+    sign-in site, the invite CLI and other scripts never seed."""
     conn = get_connection()
     try:
         _check_schema_version(conn)
@@ -352,7 +355,7 @@ def init_db() -> None:
         tighten_db_permissions(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS cnt FROM users")
-        if cur.fetchone()["cnt"] == 0:
+        if seed_samples and cur.fetchone()["cnt"] == 0:
             seed_initial_data(conn)
     finally:
         conn.close()

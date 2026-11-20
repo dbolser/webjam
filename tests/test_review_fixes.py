@@ -26,6 +26,7 @@ from test_security_backend import (  # noqa: F401  (fixtures are used by name)
     fakes,
     google,
     google_sign_in,
+    seed_samples,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -176,6 +177,7 @@ def test_old_cookie_is_rejected_after_db_wipe(google, db_path):
     for p in db_path.parent.glob(db_path.name + "*"):
         p.unlink()
     with new_client() as fresh:
+        seed_samples()  # same starting rows as the first database, so the ids line up
         new_uid = sign_in_as(fresh, "g-new", "friend@example.com", "New Person")
     assert new_uid == first_uid  # same id in the fresh database...
     replay = new_client().get("/api/bootstrap", headers={"Cookie": f"webjam_session={cookie}"}).json()

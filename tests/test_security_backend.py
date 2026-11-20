@@ -124,13 +124,59 @@ def demo(db_path, fakes, monkeypatch):
         yield c
 
 
+def seed_samples():
+    """A Google-mode site starts empty; these tests want the demo people and playlists."""
+    from app.database import get_connection, seed_initial_data
+
+    conn = get_connection()
+    try:
+        seed_initial_data(conn)
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def google(db_path, fakes, monkeypatch):
     _google_env(monkeypatch)
     from app.main import app
 
     with TestClient(app, base_url="https://testserver", headers=OK_HEADERS) as c:
+        seed_samples()
         yield c
+
+
+def test_google_mode_starts_empty_and_bootstraps(db_path, fakes, monkeypatch):
+    _google_env(monkeypatch)
+    from app.main import app
+
+    with TestClient(app, base_url="https://testserver", headers=OK_HEADERS) as c:
+        assert db().execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        boot = c.get("/api/bootstrap")
+        assert boot.status_code == 200, boot.text
+        assert boot.json()["auth"]["signed_in"] is False
+        # The first person to sign in is the only user, with their own crate.
+        google_sign_in(c)
+        boot = c.get("/api/bootstrap").json()
+        assert boot["auth"]["signed_in"] is True
+        assert [u["id"] for u in boot["users"]] == [boot["current_user"]["id"]]
+        assert boot["current_user"]["crate_id"]
+
+
+def test_google_config_without_explicit_mode_does_not_seed(db_path, fakes, monkeypatch):
+    _google_env(monkeypatch)
+    monkeypatch.delenv("WEBJAM_AUTH_MODE")  # complete Google settings resolve to google mode
+    from app.main import app
+
+    with TestClient(app, base_url="https://testserver", headers=OK_HEADERS):
+        assert db().execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+
+
+def test_invite_cli_never_seeds(db_path, monkeypatch, capsys):
+    _clear_auth_env(monkeypatch)  # an operator shell without the service's environment
+    from app.invite import main
+
+    assert main(["add", "friend@example.com"]) == 0
+    assert db().execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
 
 
 def db():
@@ -221,7 +267,7 @@ def test_demo_mode_refuses_db_with_google_accounts(db_path, fakes, monkeypatch):
     from app.database import init_db
     from app.main import app
 
-    init_db()
+    init_db(seed_samples=True)  # user 1 must exist for the google_accounts row
     conn = db()
     conn.execute("INSERT INTO google_accounts (google_sub, user_id, email, updated_at) VALUES ('s', 1, 'a@b.c', 'now')")
     conn.commit()
@@ -311,7 +357,7 @@ def test_handle_collision_gets_random_suffix(db_path):
     from app.auth import unique_handle
     from app.database import init_db
 
-    init_db()
+    init_db(seed_samples=True)
     conn = db()
     cur = conn.cursor()
     assert unique_handle(cur, "Lucas") != "lucas"  # seeded user 'lucas' exists
