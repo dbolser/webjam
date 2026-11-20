@@ -429,7 +429,7 @@ class SecurityHeadersMiddleware:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = configure_from_env()  # raises AuthConfigError: refuse to start on bad config
-    init_db()
+    init_db(seed_samples=cfg.mode == "demo")
     conn = get_connection()
     try:
         check_demo_mode_allowed(conn)
