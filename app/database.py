@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS users (
     avatar_color TEXT DEFAULT '#2b5b84',
     password_hash TEXT DEFAULT '',
     session_epoch INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    handle_chosen_at TEXT NULL  -- NULL until the user confirms or picks a handle (Google sign-ups)
 );
 
 -- Handles a user gave up. Only that user can take one back: old activity lines
@@ -237,6 +238,7 @@ CREATE TABLE IF NOT EXISTS comments (
     body TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_comments_target ON comments(target_type, target_id, id);
 
 CREATE TABLE IF NOT EXISTS user_badges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,6 +261,7 @@ CREATE TABLE IF NOT EXISTS activity_log (
     op_group_id TEXT NULL  -- set by apply_ops so that undo can remove the lines
 );
 CREATE INDEX IF NOT EXISTS idx_activity_group ON activity_log(actor_user_id, op_group_id);
+CREATE INDEX IF NOT EXISTS idx_activity_recent ON activity_log(created_at, id);
 """
 
 SCHEMA_VERSION = 3
@@ -324,12 +327,20 @@ def _check_schema_version(conn: sqlite3.Connection) -> None:
         raise RuntimeError(SCHEMA_CHANGED_MESSAGE)
 
 
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Additive Phase 1b migration (schema_version stays 3): guarded so it is idempotent."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "handle_chosen_at" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN handle_chosen_at TEXT")
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
         _check_schema_version(conn)
         conn.execute("PRAGMA journal_mode = WAL;")  # persistent; concurrent readers + one writer
         conn.executescript(SCHEMA_SQL)
+        _add_missing_columns(conn)
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
         )
@@ -392,10 +403,10 @@ def seed_initial_data(conn: sqlite3.Connection) -> None:
     ]
     cur.executemany(
         """
-        INSERT INTO users (id, username, display_name, bio, avatar_color, password_hash, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO users (id, username, display_name, bio, avatar_color, password_hash, created_at, handle_chosen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        users,
+        [(*u, u[-1]) for u in users],
     )
 
     # Playlists

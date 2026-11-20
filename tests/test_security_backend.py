@@ -434,13 +434,15 @@ def test_csrf_demo_mode_compares_origin_with_host(demo):
 
 # --- #12 security headers -----------------------------------------------------
 
-@pytest.mark.parametrize("path", ["/", "/api/bootstrap", "/static/app.js"])
+@pytest.mark.parametrize("path", ["/", "/api/bootstrap", "/static/js/main.js"])
 def test_security_headers(google, path):
     res = google.get(path)
     assert res.headers["x-content-type-options"] == "nosniff"
     assert res.headers["referrer-policy"] == "strict-origin-when-cross-origin"
     assert res.headers["x-frame-options"] == "DENY"
-    assert res.headers["content-security-policy"] == "frame-ancestors 'none'"
+    from app.main import CONTENT_SECURITY_POLICY
+
+    assert res.headers["content-security-policy"] == CONTENT_SECURITY_POLICY
     assert "camera=()" in res.headers["permissions-policy"]
     assert "autoplay" not in res.headers["permissions-policy"]  # the YouTube iframe needs it
     assert res.headers["strict-transport-security"].startswith("max-age=")

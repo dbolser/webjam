@@ -78,3 +78,19 @@ def song_visible(conn: sqlite3.Connection, video_id: str, viewer: int) -> bool:
         (video_id, int(viewer or 0)),
     ).fetchone()
     return row is not None
+
+
+def song_visible_sql(video_expr: str, viewer: int) -> str:
+    """song_visible() as SQL: in a LISTED playlist, or in one of the viewer's own (crate included)."""
+    return (
+        f"EXISTS (SELECT 1 FROM playlist_tracks vpt JOIN playlists vp ON vp.id = vpt.playlist_id "
+        f"WHERE vpt.video_id = {video_expr} AND ({listed('vp')} OR vp.user_id = {int(viewer or 0)}))"
+    )
+
+
+def public_song_sql(video_expr: str) -> str:
+    """EXISTS a LISTED playlist containing the video (a song anyone may see named)."""
+    return (
+        f"EXISTS (SELECT 1 FROM playlist_tracks xpt JOIN playlists xp ON xp.id = xpt.playlist_id "
+        f"WHERE xpt.video_id = {video_expr} AND {listed('xp')})"
+    )

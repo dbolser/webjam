@@ -34,7 +34,7 @@ import time
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -489,14 +489,36 @@ def _pkce_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+# Where to return after sign-in: a same-origin path only (no "//host", no "/\\host", no API/auth paths).
+_NEXT_PATTERN = re.compile(r"^/(?![/\\])[A-Za-z0-9/_\-.?=&%#]{0,511}$")
+
+
+def safe_next(raw: Optional[str]) -> Optional[str]:
+    if not raw or not _NEXT_PATTERN.match(raw):
+        return None
+    if raw.startswith("/auth/") or raw.startswith("/api/"):
+        return None
+    return raw
+
+
+def _pending_parts(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(verifier, next) from a pending-login entry: {"v", "next"} now, a bare verifier before Phase 1b."""
+    if isinstance(value, str):
+        return value, None
+    if isinstance(value, dict) and isinstance(value.get("v"), str):
+        nxt = value.get("next")
+        return value["v"], safe_next(nxt) if isinstance(nxt, str) else None
+    return None, None
+
+
 @router.get("/auth/google/login")
-def google_login(request: Request):
+def google_login(request: Request, next: str = ""):
     if not auth_enabled():
         raise HTTPException(status_code=404, detail="Google sign-in is not configured")
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
     pending = dict(request.session.get("oauth") or {})
-    pending[state] = verifier
+    pending[state] = {"v": verifier, "next": safe_next(next)}
     # Keep only the newest few in-flight logins (several tabs) so the cookie stays small.
     request.session["oauth"] = dict(list(pending.items())[-_MAX_PENDING_LOGINS:])
     params = {
@@ -523,7 +545,7 @@ async def google_callback(
     if not auth_enabled():
         raise HTTPException(status_code=404, detail="Google sign-in is not configured")
     pending = dict(request.session.get("oauth") or {})
-    verifier = pending.pop(state, None) if state else None
+    verifier, next_path = _pending_parts(pending.pop(state, None) if state else None)
     request.session["oauth"] = pending
     if error:
         return RedirectResponse("/#auth-error", status_code=303)
@@ -568,7 +590,7 @@ async def google_callback(
 
     uid = upsert_google_user(conn, info, str(tokens.get("scope", "") or ""))
     start_session(request, conn, uid)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(next_path or "/", status_code=303)
 
 
 @router.post("/auth/logout")
