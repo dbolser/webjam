@@ -15,10 +15,9 @@ lit-html on the front end.
   front end with discovery (#6), and phone playback (#7): keep the screen
   awake, lock-screen controls, resume where you left off.
 - **Also merged:** a Google sign-in site starts empty, with no sample people
-  (#9).
-- **In review:** a Webjay-style restyle (#8): white page, Verdana, underlined
-  blue links, zebra lists, 16px text, system fonts only. Waiting on Dan's
-  verdict on the look.
+  (#9), and request access with an admin page at /admin (#10).
+- **Design:** Dan rejected the Webjay restyle (#8). Three colourful CSS-only
+  directions are waiting for his pick (Sunny pop, Mixtape pastel, Bold blocks).
 
 ## Running
 
@@ -39,12 +38,13 @@ TODO).
   is `webjam`.
 - The app lives in `/opt/webjam/app` (a copied tree, not a git checkout). The
   database is `/var/lib/webjam/webjam.db`.
-- Since 2026-11-20 it runs main (0fa7d04) in Google sign-in mode, with no
-  site password. Settings, including the OAuth client and invite list, are in
-  `/etc/webjam/env` (root-only), loaded by the drop-in
-  `/etc/systemd/system/webjam.service.d/google.conf`. Invites:
-  `WEBJAM_INVITE_EMAILS` in that file is the complete list; edit it and
-  `systemctl restart webjam`.
+- Runs main (c5d6e20) in Google sign-in mode, with no site password.
+  Settings are in `/etc/webjam/env` (root-only), loaded by the drop-in
+  `/etc/systemd/system/webjam.service.d/google.conf`: the OAuth client, the
+  session secret, `WEBJAM_ADMIN_EMAILS` and the Gmail SMTP settings (an app
+  password for dan.bolser@gmail.com). Invites live in the database: people ask
+  at /request-access and the admin approves at /admin. `WEBJAM_INVITE_EMAILS`
+  is deliberately unset, because it would overwrite the database list at startup.
 - Deploy: `git archive` main, unpack into a new folder, swap it in for
   `/opt/webjam/app`, then run `uv sync --frozen --no-dev` *in place* as the
   webjam user (a venv breaks if its folder is renamed). The previous tree is

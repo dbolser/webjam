@@ -2,10 +2,10 @@
 
 ## Next
 
-- Invite Dan's friend: add their Google address to `WEBJAM_INVITE_EMAILS` in
-  `/etc/webjam/env` on the server, and as a test user on the OAuth consent
-  screen.
-- Decide on the Webjay restyle (#8), merge it and redeploy.
+- Invite Dan's friend: they sign in, press Request access, and Dan approves at
+  /admin. While the OAuth consent screen is in Testing, they must also be added
+  there as a test user, or Google blocks the sign-in before webjam sees it.
+- Pick a colourful design direction and build it. Close #8 if Dan agrees.
 
 ## Bugs
 
