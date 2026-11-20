@@ -202,6 +202,8 @@
 .dc-tab:nth-child(4) { --hue: var(--leaf); --hue-soft: var(--leaf-soft); }
 .dc-tab:hover { border-color: var(--hue); text-decoration: none; }
 .dc-tab[aria-current="page"] { color: #1a1a2e; background: var(--hue); border-color: var(--hue); }
+/* Violet is too dark for dark text: use the accent pair (AA in light and dark). */
+.dc-tab:nth-child(3)[aria-current="page"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
 .dc-sort { display: flex; gap: var(--sp-1); padding: 3px; font-size: var(--fs-sm); font-weight: 700; background: var(--surface-2); border-radius: var(--r-pill); }
 .dc-sort a { display: inline-flex; align-items: center; height: 30px; padding: 0 var(--sp-3); color: var(--ink-2); border-radius: var(--r-pill); }
 .dc-sort a:hover { color: var(--ink); text-decoration: none; }

@@ -751,3 +751,4 @@ body.video-small .video-tile {
 .pbar-resume:hover .pbar-resume-label, .pbar-resume:focus-visible .pbar-resume-label { color: var(--ink); }
 .pbar-resume .t { color: var(--ink); font-weight: 700; }
 .pbar-now .pbar-resume .pbar-time { color: var(--ink-2); }
+.access-card .btn { white-space: normal; text-align: center; } /* long labels wrap on narrow phones */
