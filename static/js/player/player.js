@@ -687,7 +687,8 @@ function wireMediaSession() {
       const item = current();
       if (item) seek((item.start || 0) + clipSeconds);
     },
-    seekBy: (delta) => seek(state.player.time + delta),
+    // From the iframe's own clock: on a locked phone the tick is throttled and state.player.time is stale.
+    seekBy: (delta) => seek(ytTime() + delta),
   });
 }
 
