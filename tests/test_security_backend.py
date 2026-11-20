@@ -124,13 +124,36 @@ def demo(db_path, fakes, monkeypatch):
         yield c
 
 
+def seed_samples():
+    """A Google-mode site starts empty; these tests want the demo people and playlists."""
+    from app.database import get_connection, seed_initial_data
+
+    conn = get_connection()
+    try:
+        seed_initial_data(conn)
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def google(db_path, fakes, monkeypatch):
     _google_env(monkeypatch)
     from app.main import app
 
     with TestClient(app, base_url="https://testserver", headers=OK_HEADERS) as c:
+        seed_samples()
         yield c
+
+
+def test_google_mode_starts_empty_and_bootstraps(db_path, fakes, monkeypatch):
+    _google_env(monkeypatch)
+    from app.main import app
+
+    with TestClient(app, base_url="https://testserver", headers=OK_HEADERS) as c:
+        assert db().execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        boot = c.get("/api/bootstrap")
+        assert boot.status_code == 200, boot.text
+        assert boot.json()["auth"]["signed_in"] is False
 
 
 def db():

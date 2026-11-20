@@ -4,6 +4,7 @@ import urllib.parse
 
 import pytest
 from fastapi.testclient import TestClient
+from test_security_backend import seed_samples
 
 
 class FakeResponse:
@@ -62,6 +63,7 @@ def client(tmp_path, monkeypatch):
 
     # https: the session cookie is Secure in google mode. X-Webjam: the CSRF header the SPA sends.
     with TestClient(fastapi_app, base_url="https://testserver", headers={"X-Webjam": "1"}) as c:
+        seed_samples()  # a Google-mode site starts empty; these tests want the demo people
         yield c
 
 

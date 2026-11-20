@@ -334,6 +334,10 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN handle_chosen_at TEXT")
 
 
+def _google_mode() -> bool:
+    return os.environ.get("WEBJAM_AUTH_MODE", "").strip().lower() == "google"
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
@@ -352,7 +356,9 @@ def init_db() -> None:
         tighten_db_permissions(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS cnt FROM users")
-        if cur.fetchone()["cnt"] == 0:
+        # The sample people and playlists are personas to act as in demo mode. A Google
+        # sign-in site is for real people only, so it starts empty.
+        if cur.fetchone()["cnt"] == 0 and not _google_mode():
             seed_initial_data(conn)
     finally:
         conn.close()
