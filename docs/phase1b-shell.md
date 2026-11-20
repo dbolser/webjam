@@ -34,17 +34,9 @@ F-back and F-front touch disjoint files and share only this document, so they ca
 
 ## 1. Visual system
 
-### 1.1 Fonts (self-hosted, CSP-strict)
+### 1.1 Fonts (system fonts only)
 
-No Google Fonts. Fonts are vendored in `static/vendor/fonts/` with their OFL licence files, so `font-src 'self'` and `style-src 'self'` hold.
-
-| Family | Use | Source file (copy byte-for-byte from jsDelivr) |
-|---|---|---|
-| Instrument Sans (variable, wght 400–700) | all UI text | `https://cdn.jsdelivr.net/npm/@fontsource-variable/instrument-sans@5.1.0/files/instrument-sans-latin-wght-normal.woff2` → `instrument-sans.woff2` |
-| Instrument Serif 400 | page titles only (`h1` of a playlist, profile, track, and the home greeting) | `https://cdn.jsdelivr.net/npm/@fontsource/instrument-serif@5.1.0/files/instrument-serif-latin-400-normal.woff2` → `instrument-serif.woff2` |
-| JetBrains Mono (variable) | positions, durations, clip ranges, counts, keycaps | `https://cdn.jsdelivr.net/npm/@fontsource-variable/jetbrains-mono@5.1.1/files/jetbrains-mono-latin-wght-normal.woff2` → `jetbrains-mono.woff2` |
-
-These URLs were checked and return 200 (30 KB, 21 KB and 40 KB). `@font-face` uses `font-display: swap`. Each family falls back to a system stack, so the page works if the files fail to load.
+No web fonts. Since the "Sunny pop" restyle all text uses the system UI stack (`--f-ui`), with `ui-monospace` for keycaps only; numbers use `font-variant-numeric: tabular-nums`. Nothing is vendored or preloaded, so `font-src 'self'` holds trivially. `tests/test_frontend_safety.py` checks there is no `@font-face`, no font preload and no font file under `static/`. (The first shell vendored Instrument Sans, Instrument Serif and JetBrains Mono; they were removed with the restyle.)
 
 ### 1.2 Tokens (`static/styles/tokens.css`)
 
@@ -550,7 +542,6 @@ static/
   vendor/
     lit-html/  (VERSION, LICENSE, lit-html.js, directive.js, directive-helpers.js, async-directive.js,
                 directives/repeat.js, directives/class-map.js, directives/live.js, directives/ref.js)   F
-    fonts/     (instrument-sans.woff2, instrument-serif.woff2, jetbrains-mono.woff2, OFL.txt ×3)        F
   js/
     main.js                           F   boot: bootstrap fetch, theme, router start, register core actions/keys
     lit.js                            F   the only importer of vendor/lit-html; re-exports html, svg, render, nothing, repeat, classMap, live, ref, createRef
@@ -797,7 +788,7 @@ Each lane's PR must tick its list, run `python -m pytest -q` green, and run `nod
 - [ ] All tests in §3.11 written and passing; every pre-existing test passing.
 
 ### F-front
-- [ ] lit-html 3.2.1 vendored (8 files, VERSION, LICENSE); fonts vendored with licences; no third-party requests from the page except YouTube.
+- [ ] lit-html 3.2.1 vendored (8 files, VERSION, LICENSE); system fonts only, no web fonts; no third-party requests from the page except YouTube.
 - [ ] Tokens exactly as §1.2; light, dark (system) and both `data-theme` overrides work; theme cycle persists.
 - [ ] Signed-in `/` shows **my playlists first**, then crate, neighbours, fresh tracks, about-you and activity; anonymous `/` shows Discover (a minimal F version: listed playlist cards from `/api/discover`, which B then replaces).
 - [ ] Track rows match §1.4 anatomy and states; hop links present (`via`, `in N playlists`, `from`).
