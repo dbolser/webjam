@@ -232,30 +232,47 @@ def approve(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Tuple[D
             status_code=409,
             detail="Invites are managed by WEBJAM_INVITE_EMAILS; remove it to approve from the admin page.",
         )
-    row = _require_row(conn, raw_email)
-    if row["status"] == "approved" and is_invited(conn, row["email"]):
-        # A second click sends no second email, unless the first one didn't go out. Claiming
-        # 'sending' first means only one attempt runs at a time.
-        cur = conn.execute(
-            "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? "
-            "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending'))",
-            (row["email"],),
-        )
-        conn.commit()
-        return get_request(conn, row["email"]), cur.rowcount == 1
-    # The invite and the decision land together or not at all. Approving a declined request is
-    # allowed on purpose: it is how an admin changes their mind.
-    with conn:
+    email = _require_row(conn, raw_email)["email"]
+    # Read and write under one write lock: of two overlapping approvals, only the first sends.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = get_request(conn, email)
+        if row["status"] == "approved" and is_invited(conn, email):
+            conn.rollback()
+            return row, False  # already approved (to resend a failed email, use resend())
+        # The invite and the decision land together. Approving a declined request is allowed on
+        # purpose: it is how an admin changes their mind.
         conn.execute(
             "INSERT OR IGNORE INTO invites (email, invited_by_user_id, created_at) VALUES (?, ?, ?)",
-            (row["email"], admin_uid, _ts(_now())),
+            (email, admin_uid, _ts(_now())),
         )
         conn.execute(
             "UPDATE access_requests SET status = 'approved', decided_at = ?, decided_by_user_id = ?, "
             "notify_status = 'sending' WHERE email = ?",
-            (_ts(_now()), admin_uid, row["email"]),
+            (_ts(_now()), admin_uid, email),
         )
-    return get_request(conn, row["email"]), True
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return get_request(conn, email), True
+
+
+def resend(conn: sqlite3.Connection, raw_email: str) -> Dict[str, Any]:
+    """Claim a resend of a "you're in" email that didn't go out. Never touches the invite list:
+    someone whose invite was removed since is not emailed (and not let back in)."""
+    row = _require_row(conn, raw_email)
+    if row["status"] != "approved" or not is_invited(conn, row["email"]):
+        raise HTTPException(status_code=409, detail="Only people who are approved and still invited can be emailed.")
+    cur = conn.execute(
+        "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? "
+        "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending'))",
+        (row["email"],),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=409, detail="That email was already sent, or is being sent now.")
+    return get_request(conn, row["email"])
 
 
 def welcome_mail(base_url: str, row: Dict[str, Any]) -> str:
@@ -269,7 +286,10 @@ def welcome_mail(base_url: str, row: Dict[str, Any]) -> str:
 
 
 def record_notify(conn: sqlite3.Connection, email: str, status: str) -> None:
-    conn.execute("UPDATE access_requests SET notify_status = ? WHERE email = ?", (status, email))
+    # Only the attempt that claimed 'sending' records its outcome.
+    conn.execute(
+        "UPDATE access_requests SET notify_status = ? WHERE email = ? AND notify_status = 'sending'", (status, email)
+    )
     conn.commit()
 
 

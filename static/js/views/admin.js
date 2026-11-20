@@ -61,7 +61,8 @@ const MAIL_LABEL = { sending: 'email sending', sent: 'email sent', failed: 'emai
 
 function decidedCard(r) {
   // Approving again resends a "you're in" email that didn't go out.
-  const resend = r.status === 'approved' && (r.notify_status === 'failed' || r.notify_status === 'not configured');
+  const resend = r.status === 'approved' && data.invites.includes(r.email)
+    && (r.notify_status === 'failed' || r.notify_status === 'not configured');
   return html`<article class="card" data-email=${r.email}>
     <div class="card-head"><span class="card-title">${who(r)}</span></div>
     <div class="card-meta">
@@ -69,7 +70,7 @@ function decidedCard(r) {
       ${r.status === 'approved' && r.notify_status ? html`<span>${MAIL_LABEL[r.notify_status] || r.notify_status}</span>` : nothing}
     </div>
     ${resend
-      ? html`<p class="page-actions"><button type="button" class="btn" data-action="access-approve"
+      ? html`<p class="page-actions"><button type="button" class="btn" data-action="access-resend"
           ?disabled=${busy.has(r.email)}>Resend email</button></p>`
       : nothing}
   </article>`;
@@ -118,6 +119,7 @@ async function decide(el, verb) {
     const res = await api.post(`/api/admin/access-requests/${encodeURIComponent(email)}/${verb}`, {}, { quiet: true });
     const mail = res.request && res.request.notify_status;
     if (verb === 'decline') toast.show(`Declined ${email}`);
+    else if (verb === 'resend') toast.show(mail === 'sent' ? `Emailed ${email}` : `Couldn't email ${email} (${MAIL_LABEL[mail] || 'no email'})`);
     else toast.show(mail === 'sent' ? `Approved ${email} and emailed them` : `Approved ${email} (${MAIL_LABEL[mail] || 'no email'})`);
     await fetchListing();
   } catch (err) {
@@ -131,4 +133,5 @@ async function decide(el, verb) {
 registerActions({
   'access-approve': (el) => decide(el, 'approve'),
   'access-decline': (el) => decide(el, 'decline'),
+  'access-resend': (el) => decide(el, 'resend'),
 });

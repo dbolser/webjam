@@ -419,10 +419,12 @@ def test_failed_welcome_email_is_resent_on_a_second_approve(site, mail, monkeypa
 
     monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: mail.append(to) or "sent")
     mail.clear()
-    assert admin.post("/api/admin/access-requests/stranger@example.com/approve").json()["request"]["notify_status"] == "sent"
-    assert mail == ["stranger@example.com"]
     admin.post("/api/admin/access-requests/stranger@example.com/approve")
-    assert mail == ["stranger@example.com"]  # sent: a third click stays quiet
+    assert mail == []  # approving again doesn't resend: that's what Resend is for
+    assert admin.post("/api/admin/access-requests/stranger@example.com/resend").json()["request"]["notify_status"] == "sent"
+    assert mail == ["stranger@example.com"]
+    assert admin.post("/api/admin/access-requests/stranger@example.com/resend").status_code == 409
+    assert mail == ["stranger@example.com"]  # sent: no second copy
 
 
 def test_decline_only_changes_a_pending_request(site, mail):
@@ -455,5 +457,36 @@ def test_a_welcome_email_in_flight_is_not_sent_twice(site, mail):
     admin.post("/api/admin/access-requests/stranger@example.com/approve")
     _set("stranger@example.com", notify_status="sending")  # as if the first send were still running
     mail.clear()
-    res = admin.post("/api/admin/access-requests/stranger@example.com/approve")
-    assert res.status_code == 200 and mail == []
+    assert admin.post("/api/admin/access-requests/stranger@example.com/approve").status_code == 200
+    assert admin.post("/api/admin/access-requests/stranger@example.com/resend").status_code == 409
+    assert mail == []
+
+
+def test_resend_never_restores_a_removed_invite(site, mail, monkeypatch):
+    import app.mailer
+    from app.invite import is_invited, remove_invite
+
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: "failed")
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    admin = _admin_client()
+    admin.post("/api/admin/access-requests/stranger@example.com/approve")
+    conn = db()
+    remove_invite(conn, "stranger@example.com")
+    conn.close()
+    assert admin.post("/api/admin/access-requests/stranger@example.com/resend").status_code == 409
+    conn = db()
+    assert not is_invited(conn, "stranger@example.com")
+    conn.close()
+
+
+def test_a_late_failure_cannot_overwrite_sent(site):
+    from app import access
+
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    _set("stranger@example.com", status="approved", notify_status="sent")
+    conn = db()
+    access.record_notify(conn, "stranger@example.com", "failed")
+    conn.close()
+    assert _row()["notify_status"] == "sent"

@@ -957,6 +957,17 @@ async def admin_approve_request(email: str, request: Request, conn: sqlite3.Conn
     return {"request": {k: row[k] for k in ("email", "status", "decided_at", "notify_status")}}
 
 
+@app.post("/api/admin/access-requests/{email:path}/resend")
+async def admin_resend_welcome(email: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+    _require_admin(request, conn)
+    enforce_rate_limit(request, "admin")
+    row = access.resend(conn, email)
+    status = await asyncio.to_thread(access.welcome_mail, get_config().base_url, row)
+    access.record_notify(conn, row["email"], status)
+    row["notify_status"] = status
+    return {"request": {k: row[k] for k in ("email", "status", "decided_at", "notify_status")}}
+
+
 @app.post("/api/admin/access-requests/{email:path}/decline")
 def admin_decline_request(email: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
     uid = _require_admin(request, conn)
