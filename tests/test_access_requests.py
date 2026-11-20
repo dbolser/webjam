@@ -401,7 +401,7 @@ def test_failed_admin_notice_is_retried_on_a_later_visit(site, mail, monkeypatch
     monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: mail.append(to) or "sent")
     c.post("/api/access-request", json={"note": "hi again"})
     assert mail == []  # too soon to retry
-    _set("stranger@example.com", created_at="2000-01-01 00:00:00")
+    _set("stranger@example.com", admins_notice_tried_at="2000-01-01 00:00:00")
     c.post("/api/access-request", json={"note": "hi again"})
     assert mail == [ADMIN] and _row()["admins_notified_at"] is not None
     c.post("/api/access-request", json={"note": "and again"})
@@ -433,3 +433,27 @@ def test_decline_only_changes_a_pending_request(site, mail):
     res = admin.post("/api/admin/access-requests/stranger@example.com/decline")
     assert res.status_code == 409 and "approved" in res.json()["detail"]
     assert _row()["status"] == "approved"
+
+
+def test_a_retry_is_claimed_once_per_interval(site, mail, monkeypatch):
+    import app.mailer
+
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: mail.append(to) or "failed")
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    assert mail == [ADMIN]
+    _set("stranger@example.com", admins_notice_tried_at="2000-01-01 00:00:00")
+    c.post("/api/access-request", json={"note": "a"})
+    c.post("/api/access-request", json={"note": "b"})  # still failing, but the interval was just claimed
+    assert mail == [ADMIN, ADMIN]
+
+
+def test_a_welcome_email_in_flight_is_not_sent_twice(site, mail):
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    admin = _admin_client()
+    admin.post("/api/admin/access-requests/stranger@example.com/approve")
+    _set("stranger@example.com", notify_status="sending")  # as if the first send were still running
+    mail.clear()
+    res = admin.post("/api/admin/access-requests/stranger@example.com/approve")
+    assert res.status_code == 200 and mail == []

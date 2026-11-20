@@ -57,15 +57,21 @@ function pendingCard(r) {
   </article>`;
 }
 
-const MAIL_LABEL = { sent: 'email sent', failed: 'email failed', 'not configured': 'email not configured' };
+const MAIL_LABEL = { sending: 'email sending', sent: 'email sent', failed: 'email failed', 'not configured': 'email not configured' };
 
 function decidedCard(r) {
-  return html`<article class="card">
+  // Approving again resends a "you're in" email that didn't go out.
+  const resend = r.status === 'approved' && (r.notify_status === 'failed' || r.notify_status === 'not configured');
+  return html`<article class="card" data-email=${r.email}>
     <div class="card-head"><span class="card-title">${who(r)}</span></div>
     <div class="card-meta">
       <span>${r.status} ${when(r.decided_at)}</span>
       ${r.status === 'approved' && r.notify_status ? html`<span>${MAIL_LABEL[r.notify_status] || r.notify_status}</span>` : nothing}
     </div>
+    ${resend
+      ? html`<p class="page-actions"><button type="button" class="btn" data-action="access-approve"
+          ?disabled=${busy.has(r.email)}>Resend email</button></p>`
+      : nothing}
   </article>`;
 }
 

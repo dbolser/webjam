@@ -135,13 +135,14 @@ def _submit(conn: sqlite3.Connection, ident: Dict[str, str], email: str, note: s
         # Editing the note of an open request updates it quietly: admins are emailed only when a
         # request opens (or, if that email failed, again after RENOTIFY_AFTER), so a requester
         # cannot use the site's mail account to repeat themselves.
+        tried = _parse(row["admins_notice_tried_at"] or row["created_at"]) or now
+        retry = row["admins_notified_at"] is None and now - tried >= RENOTIFY_AFTER
         conn.execute(
-            "UPDATE access_requests SET note = ?, name = ?, google_sub = ? WHERE email = ?",
-            (note, ident["name"], ident["sub"], email),
+            "UPDATE access_requests SET note = ?, name = ?, google_sub = ?, "
+            "admins_notice_tried_at = CASE WHEN ? THEN ? ELSE admins_notice_tried_at END WHERE email = ?",
+            (note, ident["name"], ident["sub"], retry, _ts(now), email),
         )
-        conn.commit()
-        created = _parse(row["created_at"]) or now
-        retry = row["admins_notified_at"] is None and now - created >= RENOTIFY_AFTER
+        conn.commit()  # the retry is claimed in the same transaction: one notice per interval
         return {"status": "pending", "notify_admins": retry}
     if row and row["status"] == "declined":
         decided = _parse(row["decided_at"]) or now
@@ -157,15 +158,16 @@ def _submit(conn: sqlite3.Connection, ident: Dict[str, str], email: str, note: s
     # New, or a fresh start after a decline cooldown (or an approval whose invite was removed since).
     conn.execute(
         """
-        INSERT INTO access_requests (email, google_sub, name, note, status, created_at, admins_notified_at)
-        VALUES (?, ?, ?, ?, 'pending', ?, NULL)
+        INSERT INTO access_requests
+            (email, google_sub, name, note, status, created_at, admins_notified_at, admins_notice_tried_at)
+        VALUES (?, ?, ?, ?, 'pending', ?, NULL, ?)
         ON CONFLICT(email) DO UPDATE SET
             google_sub = excluded.google_sub, name = excluded.name, note = excluded.note,
             status = 'pending', created_at = excluded.created_at,
-            admins_notified_at = excluded.admins_notified_at,
+            admins_notified_at = NULL, admins_notice_tried_at = excluded.admins_notice_tried_at,
             decided_at = NULL, decided_by_user_id = NULL, notify_status = NULL
         """,
-        (email, ident["sub"], ident["name"], note, _ts(now)),
+        (email, ident["sub"], ident["name"], note, _ts(now), _ts(now)),
     )
     conn.commit()
     return {"status": "pending", "notify_admins": True}
@@ -232,8 +234,15 @@ def approve(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Tuple[D
         )
     row = _require_row(conn, raw_email)
     if row["status"] == "approved" and is_invited(conn, row["email"]):
-        # A second click sends no second email, unless the first one didn't go out.
-        return row, row["notify_status"] != "sent"
+        # A second click sends no second email, unless the first one didn't go out. Claiming
+        # 'sending' first means only one attempt runs at a time.
+        cur = conn.execute(
+            "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? "
+            "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending'))",
+            (row["email"],),
+        )
+        conn.commit()
+        return get_request(conn, row["email"]), cur.rowcount == 1
     # The invite and the decision land together or not at all. Approving a declined request is
     # allowed on purpose: it is how an admin changes their mind.
     with conn:
@@ -243,7 +252,7 @@ def approve(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Tuple[D
         )
         conn.execute(
             "UPDATE access_requests SET status = 'approved', decided_at = ?, decided_by_user_id = ?, "
-            "notify_status = NULL WHERE email = ?",
+            "notify_status = 'sending' WHERE email = ?",
             (_ts(_now()), admin_uid, row["email"]),
         )
     return get_request(conn, row["email"]), True

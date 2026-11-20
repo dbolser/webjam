@@ -115,9 +115,10 @@ CREATE TABLE IF NOT EXISTS access_requests (
     status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'declined')),
     created_at TEXT NOT NULL,
     admins_notified_at TEXT,  -- when the admins were emailed about this request (once, when it opens)
+    admins_notice_tried_at TEXT,  -- the last attempt at that email; retries wait RENOTIFY_AFTER
     decided_at TEXT,
     decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    notify_status TEXT  -- the approval email: 'sent' | 'failed' | 'not configured'
+    notify_status TEXT  -- the approval email: 'sending' | 'sent' | 'failed' | 'not configured'
 );
 
 CREATE TABLE IF NOT EXISTS google_accounts (
