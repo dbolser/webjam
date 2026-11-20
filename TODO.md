@@ -2,14 +2,10 @@
 
 ## Next
 
-- Google sign-in on the Hetzner server. Needs a Google OAuth client from Dan
-  (redirect URI `https://46-62-228-124.sslip.io/auth/google/callback`), then:
-  deploy current main, set `WEBJAM_AUTH_MODE=google` plus the client ID,
-  secret, `WEBJAM_SESSION_SECRET` and `WEBJAM_BASE_URL` in a root-only env
-  file, drop the Caddy password, invite Dan and friends with
-  `WEBJAM_INVITE_EMAILS`. The server database is pre-Phase-1, so it must be
-  backed up and reseeded.
-- Decide on the Webjay restyle (#8) and merge it.
+- Invite Dan's friend: add their Google address to `WEBJAM_INVITE_EMAILS` in
+  `/etc/webjam/env` on the server, and as a test user on the OAuth consent
+  screen.
+- Decide on the Webjay restyle (#8), merge it and redeploy.
 
 ## Bugs
 

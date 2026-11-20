@@ -14,6 +14,8 @@ lit-html on the front end.
   server undo, crate, dock and paste resolver (#5), and the playlist-first
   front end with discovery (#6), and phone playback (#7): keep the screen
   awake, lock-screen controls, resume where you left off.
+- **Also merged:** a Google sign-in site starts empty, with no sample people
+  (#9).
 - **In review:** a Webjay-style restyle (#8): white page, Verdana, underlined
   blue links, zebra lists, 16px text, system fonts only. Waiting on Dan's
   verdict on the look.
@@ -37,8 +39,16 @@ TODO).
   is `webjam`.
 - The app lives in `/opt/webjam/app` (a copied tree, not a git checkout). The
   database is `/var/lib/webjam/webjam.db`.
-- Today it runs the pre-#6 code in demo mode behind a Caddy password. The next
-  step is Google sign-in mode (needs an OAuth client) so friends can sign in.
+- Since 2026-11-20 it runs main (0fa7d04) in Google sign-in mode, with no
+  site password. Settings, including the OAuth client and invite list, are in
+  `/etc/webjam/env` (root-only), loaded by the drop-in
+  `/etc/systemd/system/webjam.service.d/google.conf`. Invites:
+  `WEBJAM_INVITE_EMAILS` in that file is the complete list; edit it and
+  `systemctl restart webjam`.
+- Deploy: `git archive` main, unpack into a new folder, swap it in for
+  `/opt/webjam/app`, then run `uv sync --frozen --no-dev` *in place* as the
+  webjam user (a venv breaks if its folder is renamed). The previous tree is
+  kept as `/opt/webjam/app.prev`; backups are in `/root/webjam-backups`.
 - The Hetzner Cloud API token that was saved on chaz on 2026-11-10 is gone.
   Changing the server, firewall or DNS through Hetzner needs a new token. SSH
   still works from chaz and lenny.
