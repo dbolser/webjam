@@ -8,18 +8,17 @@
   gap: 5px;
   height: 30px;
   padding: 0 var(--sp-2);
-  color: var(--ink-2);
-  border-radius: var(--r-s);
-  font-family: var(--f-mono);
-  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  border-radius: 0;
+  font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 .dc-like:hover { background: var(--surface-2); color: var(--ink); }
-.dc-like.is-on { color: var(--accent); }
+.dc-like.is-on, .dc-like[aria-pressed="true"] { color: var(--hot); }
 .dc-like-n { color: var(--ink-3); }
-.dc-like.is-on .dc-like-n { color: var(--ink-2); }
-.dc-like-x { color: var(--accent); }
+.dc-like.is-on .dc-like-n { color: var(--hot); }
+.dc-like-x { color: var(--hot); }
 .pbar-extra .dc-like { height: 28px; padding: 0 6px; }
 
 /* --- the "shares these tracks" line and panel ------------------------------ */
@@ -30,11 +29,14 @@
 @media (min-width: 1100px) {
   .dc-related-inline { display: none; }
 }
-.dc-rail-head { display: flex; align-items: center; justify-content: space-between; }
-.dc-rail-head .label { margin: 0; }
-.dc-related-rail .dc-rel-list { margin-top: var(--sp-2); }
+/* In the rail the whole head row is the module's header strip. */
+.dc-rail-head { display: flex; align-items: center; justify-content: space-between; background: var(--surface-2); border-bottom: 1px solid var(--line); }
+.dc-rail-head .label { margin: 0; border: 0; background: none; }
 .dc-rel-list { border-top: 1px solid var(--line); }
-.dc-rel-item { padding: var(--sp-3) 0; border-bottom: 1px solid var(--line); }
+.dc-related-rail .dc-rel-list { border-top: 0; }
+/* Related, activity, playlist and people lists: no bullets, zebra rows. */
+.dc-rel-item, .dc-in, .dc-person { padding: var(--sp-2); }
+:where(.dc-rel-item:nth-child(even), .dc-in:nth-child(even), .dc-person:nth-child(even)) { background: var(--zebra); }
 .dc-rel-head { display: flex; align-items: baseline; gap: var(--sp-3); }
 .dc-rel-title {
   flex: 1 1 auto;
@@ -42,51 +44,49 @@
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--ink);
-  font-weight: 500;
+  color: var(--accent);
+  font-weight: 700;
   font-size: var(--fs-sm);
 }
-.dc-rel-title:hover { color: var(--ink); }
 .dc-rel-count {
   flex: none;
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  font-family: var(--f-mono);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   color: var(--ink-3);
-  border-radius: var(--r-xs);
+  border-radius: 0;
   transition: color var(--dur-1) var(--ease);
 }
 .dc-rel-count:hover { color: var(--accent); }
 .dc-chev { width: 12px; height: 12px; }
 .dc-rel-count[aria-expanded="true"] .dc-chev { transform: rotate(180deg); }
-.dc-rel-meta { font-size: var(--fs-xs); color: var(--ink-3); font-family: var(--f-mono); }
-.dc-rel-meta > * + *::before { content: "·"; margin: 0 .45em; }
+.dc-rel-meta { font-size: var(--fs-xs); font-style: italic; color: var(--ink-3); }
+.dc-rel-meta > * + *::before { content: "|"; display: inline-block; margin: 0 .5em; color: var(--line-strong); }
 .dc-rel-item .card-preview { margin-top: var(--sp-2); }
 .dc-rel-more { margin-top: var(--sp-1); font-size: var(--fs-xs); }
 
 /* --- comments ------------------------------------------------------------- */
 .dc-older { margin-bottom: var(--sp-2); font-size: var(--fs-sm); }
-.dc-comment-list { border-top: 1px solid var(--line); }
+.dc-comment-list { border-top: 1px solid var(--surface-2); }
+/* Comments read like a <dl>: avatar and "handle:", then the Georgia body indented beneath. */
 .dc-comment {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
-  gap: var(--sp-3);
-  padding: var(--sp-3) 0;
-  border-bottom: 1px solid var(--line);
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--surface-2);
 }
 .dc-comment .av { margin-top: 1px; }
 .dc-comment-by { display: flex; align-items: baseline; gap: var(--sp-2); font-size: var(--fs-sm); }
-.dc-comment-by a { color: var(--ink); font-weight: 500; }
-.dc-comment-by time { font-size: var(--fs-xs); color: var(--ink-3); }
+.dc-comment-by a { color: var(--ink); font-weight: 700; }
+.dc-comment-by a::after { content: ":"; display: inline-block; }
+.dc-comment-by time { font-size: var(--fs-xs); font-style: italic; color: var(--ink-3); }
 .dc-comment-body {
-  margin-top: 2px;
-  color: var(--ink-2);
+  margin: 4px 0 4px 20px;
   white-space: pre-line;
   overflow-wrap: anywhere;
-  max-width: 64ch;
 }
 .dc-comments > .quiet-line { padding: var(--sp-2) 0; }
 .dc-comment-form { margin-top: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -110,24 +110,23 @@
 .dc-lovers .num { font-size: var(--fs-xs); }
 .dc-yt { margin-left: auto; color: var(--ink-3); }
 
-.dc-in-list { border-top: 1px solid var(--line); }
+.dc-in-list { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .dc-in {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-2);
-  border-bottom: 1px solid var(--line);
   transition: background-color var(--dur-1) var(--ease);
 }
-.dc-in:hover { background: var(--surface); }
+.dc-in:hover { background: var(--accent-soft); }
 .dc-in-main { flex: 1 1 auto; min-width: 0; }
-.dc-in-title { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
-.dc-in-title:hover { color: var(--ink); }
-.dc-in-meta { margin-top: 1px; font-size: var(--fs-sm); color: var(--ink-3); }
-.dc-in-meta > * + *::before { content: "·"; margin: 0 .45em; color: var(--ink-3); }
+.dc-in-title { color: var(--accent); font-weight: 700; overflow-wrap: anywhere; }
+.dc-in-meta { margin-top: 1px; font-size: var(--fs-xs); font-style: italic; color: var(--ink-3); }
+.dc-in-meta > * + *::before { content: "|"; display: inline-block; margin: 0 .5em; color: var(--line-strong); }
 .dc-in-meta .num { font-size: var(--fs-xs); }
 .dc-in-note {
   margin-top: var(--sp-1);
+  font-family: var(--f-title);
+  font-style: italic;
   font-size: var(--fs-sm);
   color: var(--ink-2);
   display: -webkit-box;
@@ -165,7 +164,7 @@
 }
 .dc-badge-btn:hover { color: var(--ink); }
 .dc-badge .dc-badge-desc { font-size: var(--fs-xs); }
-.dc-badge-glyph { font-size: 14px; line-height: 1; color: var(--ink-2); font-variant-emoji: text; }
+.dc-badge-glyph { font-size: var(--fs-md); line-height: 1; color: var(--ink-2); font-variant-emoji: text; }
 .dc-badge-more { margin-top: var(--sp-3); font-size: var(--fs-sm); }
 .dc-badge-locked { margin-top: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); max-width: 60ch; }
 .dc-badge-locked li { display: flex; flex-wrap: wrap; gap: 0 var(--sp-2); font-size: var(--fs-sm); }
@@ -181,38 +180,31 @@
   margin-top: var(--sp-6);
   border-bottom: 1px solid var(--line);
 }
-.dc-tabs { display: flex; gap: var(--sp-5); }
-.dc-tab {
-  padding: var(--sp-2) 0;
-  margin-bottom: -1px;
-  font-size: var(--fs-sm);
-  font-weight: 500;
-  color: var(--ink-3);
-  border-bottom: 2px solid transparent;
-  transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+/* Tabs and sort: inline lists, "Playlists | Tracks | People", the current item bold and plain. */
+.dc-tabs, .dc-sort { display: flex; flex-wrap: wrap; align-items: baseline; padding-bottom: var(--sp-2); font-size: var(--fs-sm); }
+.dc-tab, .dc-sort a {
+  padding: 0 var(--sp-2);
+  color: var(--accent);
+  border-left: 1px solid var(--line);
+  transition: color var(--dur-1) var(--ease);
 }
-.dc-tab:hover { color: var(--ink); text-decoration: none; }
-.dc-tab[aria-current="page"] { color: var(--ink); border-bottom-color: var(--ink); }
-.dc-sort { display: flex; gap: var(--sp-3); padding-bottom: var(--sp-2); font-size: var(--fs-xs); font-family: var(--f-mono); }
-.dc-sort a { color: var(--ink-3); }
-.dc-sort a.is-on { color: var(--ink); }
+.dc-tab:first-child, .dc-sort a:first-child { padding-left: 0; border-left: 0; }
+.dc-tab:hover, .dc-sort a:hover { color: var(--hot); }
+.dc-tab[aria-current="page"], .dc-sort a.is-on { font-weight: 700; color: var(--ink); text-decoration: none; }
 .dc-tabpanel { margin-top: var(--sp-5); }
 .dc-tabpanel > .cards { border-top: 0; }
 .dc-tabpanel > .cards > .card:first-child { padding-top: 0; }
 
-.dc-people { border-top: 1px solid var(--line); }
+.dc-people { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .dc-person {
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr) auto;
   gap: var(--sp-3);
   align-items: baseline;
-  padding: var(--sp-3) 0;
-  border-bottom: 1px solid var(--line);
 }
 .dc-person .av { align-self: center; }
 .dc-person-main p:first-child { display: flex; align-items: baseline; gap: var(--sp-2); }
-.dc-person-name { color: var(--ink); font-weight: 500; }
-.dc-person-name:hover { color: var(--ink); }
+.dc-person-name { color: var(--accent); font-weight: 700; }
 .dc-person-bio {
   margin-top: 1px;
   font-size: var(--fs-sm);
@@ -221,7 +213,7 @@
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.dc-person-meta { font-family: var(--f-mono); font-size: var(--fs-xs); color: var(--ink-3); white-space: nowrap; }
+.dc-person-meta { font-size: var(--fs-xs); font-style: italic; font-variant-numeric: tabular-nums; color: var(--ink-3); white-space: nowrap; }
 
 .dc-mine-people { margin-top: var(--sp-4); }
 .dc-mine .line-text .muted { font-size: var(--fs-sm); }
@@ -229,7 +221,6 @@
 
 /* recent activity: right rail when there is one, foot of the page otherwise */
 .dc-activity-rail { margin-top: 0; }
-.dc-activity .lines .line:first-child { border-top: 0; }
 @media (min-width: 1100px) {
   .dc-activity-inline { display: none; }
 }
