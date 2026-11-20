@@ -16,13 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException, Request
 
 from app import mailer
-from app.invite import add_invite, is_invited, list_invites, normalize_email
+from app.database import get_connection
+from app.invite import is_invited, list_invites, normalize_email
 
 IDENTITY_KEY = "access_request"
 IDENTITY_TTL = 30 * 60
 MAX_NOTE = 500
 MAX_PENDING = 200
 DECLINE_COOLDOWN = timedelta(days=7)
+# If the "new request" email to admins failed, a later visit by the requester retries it, at most this often.
+RENOTIFY_AFTER = timedelta(minutes=10)
 RECENT_DECIDED = 50
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -113,19 +116,33 @@ def submit_request(conn: sqlite3.Connection, ident: Dict[str, str], note: str) -
     """
     email = ident["email"]
     note = clean_note(note)
+    # One write transaction for read, cap check and write: two quick submissions can't both open it.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        return _submit(conn, ident, email, note)
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _submit(conn: sqlite3.Connection, ident: Dict[str, str], email: str, note: str) -> Dict[str, Any]:
     if is_invited(conn, email):
+        conn.rollback()
         return {"status": "invited", "notify_admins": False}
     now = _now()
     row = get_request(conn, email)
     if row and row["status"] == "pending":
         # Editing the note of an open request updates it quietly: admins are emailed only when a
-        # request opens, so a requester cannot use the site's mail account to repeat themselves.
+        # request opens (or, if that email failed, again after RENOTIFY_AFTER), so a requester
+        # cannot use the site's mail account to repeat themselves.
         conn.execute(
             "UPDATE access_requests SET note = ?, name = ?, google_sub = ? WHERE email = ?",
             (note, ident["name"], ident["sub"], email),
         )
         conn.commit()
-        return {"status": "pending", "notify_admins": False}
+        created = _parse(row["created_at"]) or now
+        retry = row["admins_notified_at"] is None and now - created >= RENOTIFY_AFTER
+        return {"status": "pending", "notify_admins": retry}
     if row and row["status"] == "declined":
         decided = _parse(row["decided_at"]) or now
         if now - decided < DECLINE_COOLDOWN:
@@ -141,14 +158,14 @@ def submit_request(conn: sqlite3.Connection, ident: Dict[str, str], note: str) -
     conn.execute(
         """
         INSERT INTO access_requests (email, google_sub, name, note, status, created_at, admins_notified_at)
-        VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        VALUES (?, ?, ?, ?, 'pending', ?, NULL)
         ON CONFLICT(email) DO UPDATE SET
             google_sub = excluded.google_sub, name = excluded.name, note = excluded.note,
             status = 'pending', created_at = excluded.created_at,
             admins_notified_at = excluded.admins_notified_at,
             decided_at = NULL, decided_by_user_id = NULL, notify_status = NULL
         """,
-        (email, ident["sub"], ident["name"], note, _ts(now), _ts(now)),
+        (email, ident["sub"], ident["name"], note, _ts(now)),
     )
     conn.commit()
     return {"status": "pending", "notify_admins": True}
@@ -165,8 +182,14 @@ def notify_admins(base_url: str, email: str, name: str, note: str) -> None:
     )
     if note:
         body += f"\nTheir note:\n{note}\n"
-    for admin in admin_emails():
-        mailer.send_mail(admin, "webjam: new access request", body)
+    sent = [mailer.send_mail(admin, "webjam: new access request", body) for admin in admin_emails()]
+    if "sent" in sent:  # left empty on failure, so the requester's next visit retries the notice
+        conn = get_connection()
+        try:
+            conn.execute("UPDATE access_requests SET admins_notified_at = ? WHERE email = ?", (_ts(_now()), email))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def list_requests(conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -209,14 +232,20 @@ def approve(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Tuple[D
         )
     row = _require_row(conn, raw_email)
     if row["status"] == "approved" and is_invited(conn, row["email"]):
-        return row, False  # a second click: no second email
-    add_invite(conn, row["email"], admin_uid)
-    conn.execute(
-        "UPDATE access_requests SET status = 'approved', decided_at = ?, decided_by_user_id = ?, "
-        "notify_status = NULL WHERE email = ?",
-        (_ts(_now()), admin_uid, row["email"]),
-    )
-    conn.commit()
+        # A second click sends no second email, unless the first one didn't go out.
+        return row, row["notify_status"] != "sent"
+    # The invite and the decision land together or not at all. Approving a declined request is
+    # allowed on purpose: it is how an admin changes their mind.
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO invites (email, invited_by_user_id, created_at) VALUES (?, ?, ?)",
+            (row["email"], admin_uid, _ts(_now())),
+        )
+        conn.execute(
+            "UPDATE access_requests SET status = 'approved', decided_at = ?, decided_by_user_id = ?, "
+            "notify_status = NULL WHERE email = ?",
+            (_ts(_now()), admin_uid, row["email"]),
+        )
     return get_request(conn, row["email"]), True
 
 
@@ -237,11 +266,12 @@ def record_notify(conn: sqlite3.Connection, email: str, status: str) -> None:
 
 def decline(conn: sqlite3.Connection, raw_email: str, admin_uid: int) -> Dict[str, Any]:
     row = _require_row(conn, raw_email)
-    if row["status"] != "pending":
-        raise HTTPException(status_code=409, detail=f"That request is already {row['status']}.")
-    conn.execute(
-        "UPDATE access_requests SET status = 'declined', decided_at = ?, decided_by_user_id = ? WHERE email = ?",
+    cur = conn.execute(
+        "UPDATE access_requests SET status = 'declined', decided_at = ?, decided_by_user_id = ? "
+        "WHERE email = ? AND status = 'pending'",
         (_ts(_now()), admin_uid, row["email"]),
     )
     conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=409, detail=f"That request is already {get_request(conn, row['email'])['status']}.")
     return get_request(conn, row["email"])

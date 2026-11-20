@@ -386,3 +386,50 @@ def test_mailer_strips_header_injection(monkeypatch):
     msg = sent[0]
     assert msg["Bcc"] is None and "\n" not in msg["To"] and "\n" not in msg["Subject"]
     assert msg["From"] == "bot@gmail.com"
+
+
+# --- delivery failures are retried, decisions don't race ----------------------------------------
+
+def test_failed_admin_notice_is_retried_on_a_later_visit(site, mail, monkeypatch):
+    import app.mailer
+
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: "failed")
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": "hi"})
+    assert _row()["admins_notified_at"] is None  # not recorded as sent
+
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: mail.append(to) or "sent")
+    c.post("/api/access-request", json={"note": "hi again"})
+    assert mail == []  # too soon to retry
+    _set("stranger@example.com", created_at="2000-01-01 00:00:00")
+    c.post("/api/access-request", json={"note": "hi again"})
+    assert mail == [ADMIN] and _row()["admins_notified_at"] is not None
+    c.post("/api/access-request", json={"note": "and again"})
+    assert mail == [ADMIN]  # sent once: no more notices
+
+
+def test_failed_welcome_email_is_resent_on_a_second_approve(site, mail, monkeypatch):
+    import app.mailer
+
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    admin = _admin_client()
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: "failed")
+    assert admin.post("/api/admin/access-requests/stranger@example.com/approve").json()["request"]["notify_status"] == "failed"
+
+    monkeypatch.setattr(app.mailer, "send_mail", lambda to, subject, body: mail.append(to) or "sent")
+    mail.clear()
+    assert admin.post("/api/admin/access-requests/stranger@example.com/approve").json()["request"]["notify_status"] == "sent"
+    assert mail == ["stranger@example.com"]
+    admin.post("/api/admin/access-requests/stranger@example.com/approve")
+    assert mail == ["stranger@example.com"]  # sent: a third click stays quiet
+
+
+def test_decline_only_changes_a_pending_request(site, mail):
+    c = _stranger_client()
+    c.post("/api/access-request", json={"note": ""})
+    admin = _admin_client()
+    assert admin.post("/api/admin/access-requests/stranger@example.com/approve").status_code == 200
+    res = admin.post("/api/admin/access-requests/stranger@example.com/decline")
+    assert res.status_code == 409 and "approved" in res.json()["detail"]
+    assert _row()["status"] == "approved"
