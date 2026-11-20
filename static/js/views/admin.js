@@ -78,10 +78,12 @@ function decidedCard(r) {
 
 export function render() {
   if (!data) {
-    return html`<div class="page not-found">
-      <h1 tabindex="-1">Access requests</h1>
-      <p>${denied}</p>
-      <p><a href="/">Go to the front page</a></p>
+    return html`<div class="page">
+      <div class="page-head"><h1 tabindex="-1">Access requests</h1></div>
+      <div class="access-card">
+        <p class="desc">${denied}</p>
+        <p><a href="/">Go to the front page</a></p>
+      </div>
     </div>`;
   }
   return html`<div class="page">

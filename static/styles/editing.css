@@ -132,10 +132,12 @@ h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
 /* --- playlist details form (replaces the title block while open) --------- */
 .ed-meta { display: flex; flex-direction: column; gap: var(--sp-4); max-width: 560px; }
 .ed-meta-title {
-  height: 44px;
+  height: 56px;
   font-family: var(--f-title);
   font-size: var(--fs-xl);
-  font-weight: 400;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  border-radius: var(--r-s);
   line-height: var(--lh-tight);
 }
 .ed-vis { border: 0; margin: 0; padding: 0; gap: var(--sp-2); }
@@ -204,7 +206,7 @@ h1.ed-title:hover { box-shadow: 0 1px 0 var(--line-strong); }
 
 @media (max-width: 759px) {
   .ed-keys-row { grid-template-columns: 110px minmax(0, 1fr); }
-  .ed-meta-title { font-size: 26px; }
+  .ed-meta-title { font-size: 30px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

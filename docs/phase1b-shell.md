@@ -9,7 +9,7 @@ Binding inputs: `docs/phase1-ops-api.md` (ops, undo, crate, dock, paste, privacy
 
 ## 0. Decisions in one page
 
-1. **Look: "tasteful".** Quiet paper-and-ink neutrals, one restrained accent, hairline rows, 48px thumbnails, generous margins around dense lists, a real dark mode. No halftone, handwriting, rotations, particles, confetti, bounce or glow. Colour only signals state (selected, playing, crate, drop, just landed).
+1. **Look: "Sunny pop".** A white page with five bright accents (coral, sunflower, teal, violet, leaf green): each playlist card is tinted in its own colour with a thick coloured edge, section headings are coloured, buttons, tabs and search are pills, and a five-colour stripe runs under the top bar and along the player. Simple and readable: system UI font, 16px body text, nothing under 13px, AA contrast, a real dark mode. No halftone, handwriting, rotations, particles, confetti, bounce or glow. (Replaced the first "tasteful" paper-and-ink look, which used a serif and monospace labels.)
 2. **After sign-in you land on your own page (`/`) and see your playlists first.** Anonymous `/` is Discover. Listening never needs an account.
 3. **Discovery is a chain of quiet links.** Every track row links to "in N playlists". Every track page lists those playlists and their curators. Every playlist says "N playlists share these tracks". Every profile lists taste neighbours with overlap counts. Every hop is one click, set in the tertiary ink colour, never a button.
 4. **Curation is one key or one drag.** Click selects, ⌘/Ctrl-C copies, V or ⌘V pastes after the selection (three presses give three copies), digits 0–9 send to dock slots, `G` + number + Enter moves to a position, `B`/`N` preview the seam before or after the focused track, `E` jumps to 10 s before the end.
@@ -34,94 +34,17 @@ F-back and F-front touch disjoint files and share only this document, so they ca
 
 ## 1. Visual system
 
-### 1.1 Fonts (self-hosted, CSP-strict)
+### 1.1 Fonts (system fonts only)
 
-No Google Fonts. Fonts are vendored in `static/vendor/fonts/` with their OFL licence files, so `font-src 'self'` and `style-src 'self'` hold.
-
-| Family | Use | Source file (copy byte-for-byte from jsDelivr) |
-|---|---|---|
-| Instrument Sans (variable, wght 400–700) | all UI text | `https://cdn.jsdelivr.net/npm/@fontsource-variable/instrument-sans@5.1.0/files/instrument-sans-latin-wght-normal.woff2` → `instrument-sans.woff2` |
-| Instrument Serif 400 | page titles only (`h1` of a playlist, profile, track, and the home greeting) | `https://cdn.jsdelivr.net/npm/@fontsource/instrument-serif@5.1.0/files/instrument-serif-latin-400-normal.woff2` → `instrument-serif.woff2` |
-| JetBrains Mono (variable) | positions, durations, clip ranges, counts, keycaps | `https://cdn.jsdelivr.net/npm/@fontsource-variable/jetbrains-mono@5.1.1/files/jetbrains-mono-latin-wght-normal.woff2` → `jetbrains-mono.woff2` |
-
-These URLs were checked and return 200 (30 KB, 21 KB and 40 KB). `@font-face` uses `font-display: swap`. Each family falls back to a system stack, so the page works if the files fail to load.
+No web fonts. Since the "Sunny pop" restyle all text uses the system UI stack (`--f-ui`), with `ui-monospace` for keycaps only; numbers use `font-variant-numeric: tabular-nums`. Nothing is vendored or preloaded, so `font-src 'self'` holds trivially. `tests/test_frontend_safety.py` checks there is no `@font-face`, no font preload and no font file under `static/`. (The first shell vendored Instrument Sans, Instrument Serif and JetBrains Mono; they were removed with the restyle.)
 
 ### 1.2 Tokens (`static/styles/tokens.css`)
 
-Copy this block as written. Components must use tokens, never raw colours.
-
-```css
-:root {
-  color-scheme: light;
-  /* surfaces */
-  --bg: #faf9f6;          /* page */
-  --surface: #ffffff;     /* popovers, sheets, hovered row */
-  --surface-2: #f3f1ec;   /* rails, crate panel, input wells */
-  --line: #e8e4db;        /* hairlines between rows */
-  --line-strong: #d4cec1; /* inputs, chip outlines */
-  /* ink */
-  --ink: #1d1c1a;
-  --ink-2: #55524b;       /* secondary: channel, byline */
-  --ink-3: #75716a;       /* tertiary: hop links, counts, labels (4.6:1 on --bg) */
-  /* the one accent: links, focus, selection, drop */
-  --accent: #3552b8;
-  --accent-ink: #ffffff;
-  --accent-soft: #edf0fa;  /* selected row */
-  --accent-line: #b9c4ea;  /* selected row hairline */
-  /* state colours, used sparingly and never as decoration */
-  --play: #2c7a5b;   --play-soft: #e6f2ec;   /* now playing */
-  --crate: #946a22;  --crate-soft: #f6efe1;  /* crate chip dot, crate panel header */
-  --new-soft: #fbf4d9;                       /* "just landed" wash, fades out */
-  --danger: #b3261e;
-  /* elevation: only popovers, sheets and toasts */
-  --shadow-pop: 0 1px 2px rgba(29,28,26,.06), 0 8px 28px -10px rgba(29,28,26,.22);
-  /* type */
-  --f-ui: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --f-title: "Instrument Serif", ui-serif, Georgia, "Times New Roman", serif;
-  --f-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --fs-xs: 11.5px;  /* mono labels, keycaps, section labels */
-  --fs-sm: 12.5px;  /* meta lines, buttons, chips */
-  --fs-base: 14px;  /* body, track titles */
-  --fs-md: 16px;    /* card titles, section headings */
-  --fs-lg: 20px;    /* sheet titles */
-  --fs-xl: 32px;    /* page titles (serif); 26px under 760px */
-  --lh-tight: 1.25; --lh: 1.5;
-  /* spacing (4px grid) */
-  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 64px;
-  /* radii */
-  --r-xs: 3px;  /* thumbnails, clip chip */
-  --r-s: 5px;   /* buttons, inputs, chips */
-  --r: 8px;     /* popovers, sheets, cards */
-  /* layout */
-  --topbar-h: 56px; --player-h: 60px; --rail-l: 232px; --rail-r: 340px; --content-max: 720px;
-  --row-h: 60px; --thumb: 48px;
-  /* motion */
-  --ease: cubic-bezier(.2, 0, 0, 1);
-  --dur-1: 120ms;  /* hover, press */
-  --dur-2: 200ms;  /* popovers, panels */
-  --dur-land: 1600ms; /* the "just landed" wash */
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #141413; --surface: #1c1c1a; --surface-2: #222220;
-    --line: #2b2a27; --line-strong: #3b3a36;
-    --ink: #ecebe7; --ink-2: #b4b1a9; --ink-3: #8b887f;
-    --accent: #93a8ff; --accent-ink: #0e1430; --accent-soft: #1d2340; --accent-line: #34407a;
-    --play: #6fc7a1; --play-soft: #152a21;
-    --crate: #e0b360; --crate-soft: #2c2414;
-    --new-soft: #2e2913;
-    --danger: #f2867d;
-    --shadow-pop: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -10px rgba(0,0,0,.7);
-  }
-}
-:root[data-theme="dark"] { /* the same dark values, repeated verbatim */ }
-```
+`static/styles/tokens.css` is the single source of truth for every colour, font stack, size, spacing step, radius and layout size, in light mode and in dark mode (`@media (prefers-color-scheme: dark)` plus `:root[data-theme="dark"]`, kept identical). Read it there rather than copying values into other docs. Components must use tokens, never raw colours. The five accents each have a solid colour, a soft tint for card backgrounds and a darker ink shade for text, so coloured text keeps AA contrast.
 
 - The theme toggle (account menu) cycles system → light → dark and writes `data-theme` on `<html>`; the choice is kept in `localStorage["webjam.theme"]` (wrapped in try/catch).
-- `body { background: var(--bg); color: var(--ink); font: var(--fs-base)/var(--lh) var(--f-ui); }`. Numbers in mono use `font-variant-numeric: tabular-nums`.
-- Links: `--accent` in body copy, no underline until hover. Hop links inside rows and cards are `--ink-3` and turn `--accent` on hover.
+- `body { background: var(--bg); color: var(--ink); font: var(--fs-base)/var(--lh) var(--f-ui); }`. Counts and times use `font-variant-numeric: tabular-nums`.
+- Links: the accent colour in body copy. Hop links inside rows and cards are quieter and take the accent on hover.
 - Focus: `:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }`. Never remove focus outlines.
 
 ### 1.3 Layout
@@ -134,7 +57,7 @@ Copy this block as written. Components must use tokens, never raw colours.
 
 YouTube requires a visible player of at least 200×200 CSS pixels while playing, and no overlay on top of it. Hiding the video pauses playback; there is no "audio only" mode that hides a playing player.
 
-Whitespace rule: a list never touches the edge of its column. Sections are separated by `--sp-7` (48px) on desktop and `--sp-6` on phones. Section headings are `--fs-xs` mono, uppercase, letter-spacing .06em, `--ink-3`, with `--sp-3` below. This is the only uppercase in the UI.
+Whitespace rule: a list never touches the edge of its column. Sections are separated by `--sp-7` (48px) on desktop and `--sp-6` on phones. Section headings are bold, sentence case, in their section's accent colour with a small coloured square in front.
 
 ### 1.4 Track row anatomy (`components/track-row.js`, the only place a row is built)
 
@@ -550,7 +473,6 @@ static/
   vendor/
     lit-html/  (VERSION, LICENSE, lit-html.js, directive.js, directive-helpers.js, async-directive.js,
                 directives/repeat.js, directives/class-map.js, directives/live.js, directives/ref.js)   F
-    fonts/     (instrument-sans.woff2, instrument-serif.woff2, jetbrains-mono.woff2, OFL.txt ×3)        F
   js/
     main.js                           F   boot: bootstrap fetch, theme, router start, register core actions/keys
     lit.js                            F   the only importer of vendor/lit-html; re-exports html, svg, render, nothing, repeat, classMap, live, ref, createRef
@@ -797,7 +719,7 @@ Each lane's PR must tick its list, run `python -m pytest -q` green, and run `nod
 - [ ] All tests in §3.11 written and passing; every pre-existing test passing.
 
 ### F-front
-- [ ] lit-html 3.2.1 vendored (8 files, VERSION, LICENSE); fonts vendored with licences; no third-party requests from the page except YouTube.
+- [ ] lit-html 3.2.1 vendored (8 files, VERSION, LICENSE); system fonts only, no web fonts; no third-party requests from the page except YouTube.
 - [ ] Tokens exactly as §1.2; light, dark (system) and both `data-theme` overrides work; theme cycle persists.
 - [ ] Signed-in `/` shows **my playlists first**, then crate, neighbours, fresh tracks, about-you and activity; anonymous `/` shows Discover (a minimal F version: listed playlist cards from `/api/discover`, which B then replaces).
 - [ ] Track rows match §1.4 anatomy and states; hop links present (`via`, `in N playlists`, `from`).

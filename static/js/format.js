@@ -125,10 +125,18 @@ export function isoTs(ts) {
 }
 
 /** Two-letter initials for avatars. */
+const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+function graphemes(s) {
+  return segmenter ? Array.from(segmenter.segment(s), (x) => x.segment) : Array.from(s);
+}
+
 export function initials(user) {
   const name = String((user && (user.display_name || user.username)) || '?').trim();
-  const parts = name.split(/\s+/).filter(Boolean);
-  const out = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : name.slice(0, 2);
+  // Whole characters (graphemes) that start with a letter or digit, so "Dan (You)" gives "DY",
+  // a combining mark stays with its letter, and characters outside the BMP aren't split.
+  const parts = name.split(/\s+/).map((w) => graphemes(w).filter((g) => /^[\p{L}\p{N}]/u.test(g))).filter((p) => p.length);
+  if (!parts.length) return graphemes(name).slice(0, 2).join('').toUpperCase();
+  const out = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : parts[0].slice(0, 2).join('');
   return out.toUpperCase();
 }
 

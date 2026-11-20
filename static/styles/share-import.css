@@ -10,17 +10,17 @@
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
-  height: 30px;
+  height: 36px;
   padding: 0 var(--sp-2) 0 3px;
   font-size: var(--fs-sm);
   color: var(--ink-2);
   border-radius: 999px;
   transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
-.sh-pill:hover, .sh-pill[aria-expanded="true"] { background: var(--surface-2); color: var(--ink); }
+.sh-pill:hover, .sh-pill[aria-expanded="true"] { background: var(--sun-soft); color: var(--ink); }
 .sh-pill .sh-chev { width: 12px; height: 12px; color: var(--ink-3); }
-.sh-pill.btn { padding: 0 var(--sp-3); border-radius: var(--r-s); }
-.sh-signin { color: var(--ink-2); font-weight: 500; }
+.sh-pill.btn { padding: 0 var(--sp-4); border-radius: var(--r-pill); }
+.sh-signin { color: var(--ink-2); font-weight: 700; }
 .sh-signin:hover { color: var(--ink); text-decoration: none; }
 
 /* --- forms inside sheets ------------------------------------------------- */

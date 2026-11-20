@@ -28,15 +28,26 @@ body.has-player { padding-bottom: var(--player-h); }
   height: var(--topbar-h);
   padding: 0 var(--sp-5);
   background: var(--bg);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
+}
+/* the sunny signature: a five-colour stripe under the top bar */
+.topbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 4px;
+  background: var(--rainbow);
+  pointer-events: none;
 }
 .demo-strip {
   padding: 3px var(--sp-5);
   font-size: var(--fs-xs);
-  font-family: var(--f-mono);
-  color: var(--ink-2);
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--line);
+  font-weight: 700;
+  color: var(--sun-ink);
+  background: var(--sun-soft);
+  border-bottom: 0;
   text-align: center;
 }
 
@@ -49,7 +60,7 @@ body.has-player { padding-bottom: var(--player-h); }
   height: calc(100vh - var(--topbar-h));
   overflow-y: auto;
   padding: var(--sp-5) var(--sp-3) var(--sp-5) var(--sp-4);
-  border-right: 1px solid var(--line);
+  border-right: 0;
 }
 body.has-player .dock { height: calc(100vh - var(--topbar-h) - var(--player-h)); }
 
@@ -66,6 +77,7 @@ body.has-player .dock { height: calc(100vh - var(--topbar-h) - var(--player-h));
 }
 .section { margin-top: var(--sp-7); }
 .section:first-child { margin-top: 0; }
+.playlist > header + .section { margin-top: var(--sp-5); }  /* tracks follow the header closely */
 
 /* --- right rail ---------------------------------------------------------- */
 .rail {
@@ -121,7 +133,18 @@ body.has-player .crate-panel { bottom: var(--player-h); }
   bottom: 0;
   height: var(--player-h);
   background: var(--bg);
-  border-top: 1px solid var(--line);
+  border-top: 0;
+  box-shadow: 0 -6px 20px -12px rgba(26, 26, 46, .25);
+}
+.player-bar::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 4px;
+  background: var(--rainbow);
+  pointer-events: none;
 }
 
 /* --- overlays ------------------------------------------------------------ */
@@ -178,7 +201,7 @@ body:not(.has-player) .toasts { bottom: var(--sp-5); }
 
 /* --- <760px: single column, dock strip above the player bar -------------- */
 @media (max-width: 759px) {
-  :root { --fs-xl: 26px; }
+  :root { --fs-xl: 30px; }
   .app, .app.no-dock {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:

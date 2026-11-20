@@ -12,6 +12,9 @@
   .sh-pill { min-height: 40px; }
   .sh-check, .sh-radio { min-height: 40px; }
   .sh-fold { width: 40px; height: 40px; }
+  .dc-tab { height: 40px; }
+  .dc-sort a { height: 34px; padding-inline: var(--sp-4); }
+  .dc-badge-btn { min-height: 40px; align-items: center; }
 }
 
 @media (max-width: 759px) {
@@ -21,14 +24,19 @@
   /* Top bar: the wordmark, a flexible omnibox, then Discover and the account pill. */
   .topbar { gap: var(--sp-2); }
   .omnibox { flex: 1 1 auto; min-width: 0; }
-  .omnibox input { width: 100%; min-width: 0; }
-  .topbar-nav { gap: var(--sp-2); flex: none; }
+  .omnibox input { width: 100%; min-width: 0; padding-right: var(--sp-3); }  /* the "/" hint is hidden here */
+  .topbar-nav { gap: var(--sp-1); flex: none; }
+  .topbar-nav a { padding: 6px var(--sp-2); }
+  .wordmark { font-size: 22px; }
+  .wordmark::after { display: none; }
+  .card { padding: var(--sp-3) var(--sp-4); border-left-width: 6px; }
   .sh-pill { padding: 0 2px; }
   .sh-pill .sh-chev { display: none; }
 
   /* Dock strip: chips scroll sideways inside the strip, never the page. */
   .dock { overscroll-behavior-x: contain; scrollbar-width: none; }
   .dock::-webkit-scrollbar { display: none; }
+  .dock { mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
   .dock-list > li { flex: none; }
   .chip { height: 40px; padding-top: 0; padding-bottom: 0; }
   .chip-form { width: 200px; }
@@ -64,4 +72,10 @@
 
   /* Page actions wrap under the title without crowding. */
   .page-actions { gap: var(--sp-1); }
+}
+
+/* Signed out on a small phone the theme button would squeeze the search box under Discover;
+   the theme follows the system by default, so it goes. */
+@media (max-width: 399px) {
+  .topbar-nav .theme-anon { display: none; }
 }
