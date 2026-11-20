@@ -1,26 +1,4 @@
-/* Fonts, reset, type, links, focus, motion (docs/phase1b-shell.md §1.1, §1.2, §1.6). */
-
-@font-face {
-  font-family: "Instrument Sans";
-  src: url("/static/vendor/fonts/instrument-sans.woff2") format("woff2");
-  font-weight: 400 700;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Instrument Serif";
-  src: url("/static/vendor/fonts/instrument-serif.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "JetBrains Mono";
-  src: url("/static/vendor/fonts/jetbrains-mono.woff2") format("woff2");
-  font-weight: 100 800;
-  font-style: normal;
-  font-display: swap;
-}
+/* Reset, type, links, focus, motion (docs/phase1b-shell.md §1.1, §1.2, §1.6). */
 
 *, *::before, *::after { box-sizing: border-box; }
 
@@ -51,23 +29,24 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 
 h1 {
   font-family: var(--f-title);
-  font-weight: 400;
+  font-weight: 800;
   font-size: var(--fs-xl);
   line-height: 1.1;
-  letter-spacing: -0.005em;
+  letter-spacing: -0.025em;
   overflow-wrap: anywhere;
 }
 h1:focus { outline: none; }
 h1:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-h2, h3 { font-size: var(--fs-md); font-weight: 500; line-height: var(--lh-tight); }
+h2, h3 { font-size: var(--fs-md); font-weight: 700; line-height: var(--lh-tight); }
 
 .mono, time, kbd, .num {
   font-family: var(--f-mono);
   font-variant-numeric: tabular-nums;
 }
 kbd {
+  font-family: var(--f-kbd);
   font-size: var(--fs-xs);
-  padding: 0 5px;
+  padding: 0 6px;
   border: 1px solid var(--line-strong);
   border-bottom-width: 2px;
   border-radius: var(--r-xs);
@@ -76,13 +55,13 @@ kbd {
 }
 
 a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 2px; }
 
 /* Hop links: the discovery chain. Quiet until hovered. */
 .hop { color: var(--ink-3); }
 .hop:hover { color: var(--accent); }
 
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 
 ::selection { background: var(--accent-soft); color: var(--ink); }
 
@@ -120,16 +99,42 @@ a:hover { text-decoration: underline; text-underline-offset: 2px; text-decoratio
 }
 .skip-link:focus { top: var(--sp-2); }
 
-/* Section labels: the only uppercase in the UI. */
+/* Section headings: bold, coloured, with a short colour bar. The hue cycles per section. */
 .label {
-  font-family: var(--f-mono);
-  font-size: var(--fs-xs);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  color: var(--ink-3);
-  margin-bottom: var(--sp-3);
+  font-family: var(--f-ui);
+  font-size: var(--fs-md);
+  font-weight: 800;
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+  color: var(--hue-ink);
+  margin-bottom: var(--sp-4);
 }
+.label::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: var(--sp-2);
+  vertical-align: -1px;
+  border-radius: 4px;
+  background: var(--hue);
+  transform: rotate(-8deg);
+}
+.label .num { font-weight: 600; color: var(--ink-3); }
+/* Form field labels and labels inside sheets and popovers stay small and plain. */
+.label:is(legend, span), .sheet .label, .popover .label, .dock-label {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--ink-2);
+}
+.label:is(legend, span)::before, .sheet .label::before, .popover .label::before { content: none; }
+.dock-label::before { width: 10px; height: 10px; background: var(--rainbow); }
+.section:nth-of-type(5n+1) { --hue: var(--coral);  --hue-ink: var(--coral-ink);  --hue-soft: var(--coral-soft); }
+.section:nth-of-type(5n+2) { --hue: var(--teal);   --hue-ink: var(--teal-ink);   --hue-soft: var(--teal-soft); }
+.section:nth-of-type(5n+3) { --hue: var(--violet); --hue-ink: var(--violet-ink); --hue-soft: var(--violet-soft); }
+.section:nth-of-type(5n+4) { --hue: var(--sun);    --hue-ink: var(--sun-ink);    --hue-soft: var(--sun-soft); }
+.section:nth-of-type(5n+5) { --hue: var(--leaf);   --hue-ink: var(--leaf-ink);   --hue-soft: var(--leaf-soft); }
 
 .muted { color: var(--ink-3); }
 .ink-2 { color: var(--ink-2); }

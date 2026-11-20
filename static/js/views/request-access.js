@@ -62,7 +62,7 @@ function form() {
 export function render() {
   return html`<div class="page">
     <div class="page-head"><h1 tabindex="-1">Request access</h1></div>
-    ${body()}
+    <div class="access-card">${body()}</div>
   </div>`;
 }
 
