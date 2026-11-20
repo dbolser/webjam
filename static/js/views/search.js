@@ -19,12 +19,14 @@ const FIRST = 10;
 const MAX = 25;
 
 let s = null; // { q, playlists, tracks, people, full: Set, more: Set, error, yt: { state, results, error } }
+let loadSeq = 0; // a slower, superseded search must not overwrite the newer one
 
 function cleanQuery(q) {
   return String(q || '').replace(/\s+/g, ' ').trim();
 }
 
 export async function load(ctx) {
+  const seq = ++loadSeq;
   const q = cleanQuery(ctx.query.q);
   const next = { q, playlists: [], tracks: [], people: [], full: new Set(), more: new Set(), error: '', yt: { state: 'idle', results: [], error: '' } };
   if (!q) {
@@ -44,7 +46,7 @@ export async function load(ctx) {
   } catch (err) {
     next.error = err.status === 429 ? 'Searching a lot. Wait a moment and try again.' : err.detail || 'Search failed.';
   }
-  s = next;
+  if (seq === loadSeq) s = next;
 }
 
 export function title(ctx) {

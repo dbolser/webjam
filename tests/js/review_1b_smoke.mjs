@@ -129,4 +129,20 @@ assert.notEqual(badgesSection({ badge_catalog: catalog, earned_badges: [] }, { o
 const escLabels = new Set(keys.listKeys().filter((k) => k.combo === 'escape').map((k) => k.label));
 assert.equal(escLabels.size, 1, `escape labels: ${[...escLabels].join(' | ')}`);
 
+// 7. A slower, superseded search does not overwrite the newer one's results.
+const search = await mod('views/search.js');
+const waiting = new Map();
+globalThis.fetch = (url) => new Promise((resolve) => {
+  const q = new URL(url, 'http://x').searchParams.get('q');
+  waiting.set(q, () => resolve({ ok: true, status: 200, text: async () => JSON.stringify({ playlists: [], tracks: [], people: [] }) }));
+});
+const older = search.load({ query: { q: 'old' } });
+const newer = search.load({ query: { q: 'new' } });
+waiting.get('new')();
+await newer;
+waiting.get('old')();
+await older;
+const view = search.render({ query: { q: 'new' } });
+assert.ok(!view.strings.join('').includes('Loading'), 'the newer search still shows its results');
+
 console.log('review 1b smoke ok');

@@ -61,37 +61,41 @@ function myYouTubeTpl() {
 }
 
 async function loadMyYouTube() {
-  if (!st || !st.yt) return;
+  const cur = st;
+  if (!cur || !cur.yt) return;
   try {
     const res = await api.get('/api/youtube/my-playlists', undefined, { quiet: true });
-    if (st && st.yt) st.yt = { status: 'ready', items: res.playlists || [], error: '' };
+    if (st !== cur) return;
+    cur.yt = { status: 'ready', items: res.playlists || [], error: '' };
   } catch (err) {
-    if (st && st.yt) st.yt = { status: 'error', items: [], error: err.detail || 'YouTube did not return your playlists.' };
+    if (st !== cur) return;
+    cur.yt = { status: 'error', items: [], error: err.detail || 'YouTube did not return your playlists.' };
   }
   rerenderSheet();
 }
 
 async function useMyYouTube(id) {
-  if (!st || !id || st.busy) return;
-  const pick = (st.yt && st.yt.items.find((p) => p.id === id)) || null;
-  st.busy = true;
-  st.error = '';
+  const cur = st;
+  if (!cur || !id || cur.busy) return;
+  const pick = (cur.yt && cur.yt.items.find((p) => p.id === id)) || null;
+  cur.busy = true;
+  cur.error = '';
   rerenderSheet();
   try {
     const res = await api.get(`/api/youtube/my-playlists/${encodeURIComponent(id)}/videos`, { limit: MAX_TRACKS });
-    if (!st) return;
+    if (st !== cur) return;
     const ids = res.video_ids || [];
     if (!ids.length) {
-      st.error = 'That playlist has no videos.';
+      cur.error = 'That playlist has no videos.';
       return;
     }
-    st.source = ids.map((v) => `https://www.youtube.com/watch?v=${v}`).join('\n');
-    st.pendingTitle = pick ? pick.title : '';
+    cur.source = ids.map((v) => `https://www.youtube.com/watch?v=${v}`).join('\n');
+    cur.pendingTitle = pick ? pick.title : '';
   } catch (err) {
-    if (st) st.error = err.detail || 'YouTube did not return that playlist.';
+    if (st === cur) cur.error = err.detail || 'YouTube did not return that playlist.';
   } finally {
-    if (st) {
-      st.busy = false;
+    if (st === cur) {
+      cur.busy = false;
       rerenderSheet();
     }
   }
@@ -190,30 +194,31 @@ function start({ source, target, autoInspect }) {
 }
 
 async function inspect() {
-  if (!st || st.busy) return;
-  const source = st.source.trim();
+  const cur = st; // a reply for a closed sheet must not fill a newer one
+  if (!cur || cur.busy) return;
+  const source = cur.source.trim();
   if (!source) {
-    st.error = 'Paste a YouTube link first.';
+    cur.error = 'Paste a YouTube link first.';
     rerenderSheet();
     return;
   }
-  st.busy = true;
-  st.error = '';
+  cur.busy = true;
+  cur.error = '';
   rerenderSheet();
   try {
     const report = await api.post('/api/playlists/import/inspect', { source_input: source, max_tracks: MAX_TRACKS });
-    if (!st) return;
+    if (st !== cur) return;
     const tracks = report.tracks || [];
-    st.report = report;
-    st.picked = new Set(tracks.map((t, i) => (t.embeddable ? i : -1)).filter((i) => i >= 0));
-    st.title = report.source_type === 'youtube_playlist' && report.title ? report.title : (st.pendingTitle || '');
-    if (st.pendingTitle && !report.title) report.title = st.pendingTitle;
-    st.step = 'review';
+    cur.report = report;
+    cur.picked = new Set(tracks.map((t, i) => (t.embeddable ? i : -1)).filter((i) => i >= 0));
+    cur.title = report.source_type === 'youtube_playlist' && report.title ? report.title : (cur.pendingTitle || '');
+    if (cur.pendingTitle && !report.title) report.title = cur.pendingTitle;
+    cur.step = 'review';
   } catch (err) {
-    if (st) st.error = err.detail || 'Could not read that link.';
+    if (st === cur) cur.error = err.detail || 'Could not read that link.';
   } finally {
-    if (st) {
-      st.busy = false;
+    if (st === cur) {
+      cur.busy = false;
       rerenderSheet();
     }
   }
