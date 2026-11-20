@@ -408,7 +408,7 @@ def test_failed_admin_notice_is_retried_on_a_later_visit(site, mail, monkeypatch
     assert mail == [ADMIN]  # sent once: no more notices
 
 
-def test_failed_welcome_email_is_resent_on_a_second_approve(site, mail, monkeypatch):
+def test_failed_welcome_email_is_resent_with_resend(site, mail, monkeypatch):
     import app.mailer
 
     c = _stranger_client()

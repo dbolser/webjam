@@ -60,7 +60,7 @@ function pendingCard(r) {
 const MAIL_LABEL = { sending: 'email sending', sent: 'email sent', failed: 'email failed', 'not configured': 'email not configured' };
 
 function decidedCard(r) {
-  // Approving again resends a "you're in" email that didn't go out.
+  // Resend a "you're in" email that didn't go out (only to people who are still invited).
   const resend = r.status === 'approved' && data.invites.includes(r.email)
     && (r.notify_status === 'failed' || r.notify_status === 'not configured');
   return html`<article class="card" data-email=${r.email}>

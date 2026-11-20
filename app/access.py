@@ -264,14 +264,17 @@ def resend(conn: sqlite3.Connection, raw_email: str) -> Dict[str, Any]:
     row = _require_row(conn, raw_email)
     if row["status"] != "approved" or not is_invited(conn, row["email"]):
         raise HTTPException(status_code=409, detail="Only people who are approved and still invited can be emailed.")
+    # Eligibility is re-checked in the same write that claims the send: an invite removed a moment
+    # ago means no email.
     cur = conn.execute(
-        "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? "
+        "UPDATE access_requests SET notify_status = 'sending' WHERE email = ? AND status = 'approved' "
+        "AND EXISTS (SELECT 1 FROM invites WHERE email = access_requests.email) "
         "AND (notify_status IS NULL OR notify_status NOT IN ('sent', 'sending'))",
         (row["email"],),
     )
     conn.commit()
     if cur.rowcount == 0:
-        raise HTTPException(status_code=409, detail="That email was already sent, or is being sent now.")
+        raise HTTPException(status_code=409, detail="That email was already sent, is being sent now, or they're no longer invited.")
     return get_request(conn, row["email"])
 
 
